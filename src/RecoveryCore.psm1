@@ -212,6 +212,58 @@ function Write-LocalJsonAtomic {
     }
 }
 
+function Resolve-CoverageProgress {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][long]$ReportedTested,
+        [object]$CandidateTotal = $null,
+        [ValidateSet('Absolute', 'Relative')][string]$Mode = 'Absolute',
+        [long]$ResumeBase = 0
+    )
+
+    [long]$resolvedTested = if ($Mode -eq 'Relative') {
+        $ResumeBase + $ReportedTested
+    }
+    else {
+        $ReportedTested
+    }
+
+    $hasKnownTotal = $null -ne $CandidateTotal
+    [long]$knownTotal = 0
+    if ($hasKnownTotal) {
+        $knownTotal = [long]$CandidateTotal
+    }
+    $violation = ($ReportedTested -lt 0) -or ($ResumeBase -lt 0) -or ($resolvedTested -lt 0) -or ($hasKnownTotal -and ($knownTotal -lt 0 -or $resolvedTested -gt $knownTotal))
+
+    return [pscustomobject]@{
+        Mode                       = $Mode
+        ResumeBase                = $ResumeBase
+        ReportedTested            = $ReportedTested
+        ResolvedTested            = $resolvedTested
+        CandidateTotal            = if ($hasKnownTotal) { $knownTotal } else { $null }
+        ProgressInvariantViolation = [bool]$violation
+    }
+}
+
+function Get-CoverageEtaSeconds {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][string]$Activity,
+        [object]$CandidateTotal = $null,
+        [long]$Tested = 0,
+        [double]$SpeedPerSecond = 0,
+        [bool]$ProgressInvariantViolation = $false
+    )
+
+    if ($Activity -ne 'RunningCoverage' -or $ProgressInvariantViolation -or
+        $null -eq $CandidateTotal -or [long]$CandidateTotal -le 0 -or
+        $Tested -lt 0 -or $Tested -ge [long]$CandidateTotal -or $SpeedPerSecond -le 0) {
+        return $null
+    }
+
+    return [math]::Round(([long]$CandidateTotal - $Tested) / $SpeedPerSecond, 1)
+}
+
 function Read-LocalJson {
     [CmdletBinding()]
     param(
@@ -1173,17 +1225,26 @@ function Get-RecoveryRuntimeDirectory {
     [CmdletBinding()]
     param(
         [Parameter(Mandatory = $true)][string]$JobDirectory,
-        [string]$JobId = ''
+        [string]$JobId = '',
+        [string]$RunId = ''
     )
 
     if ([string]::IsNullOrWhiteSpace($JobId)) {
         $JobId = [System.IO.Path]::GetFileName(([System.IO.Path]::GetFullPath($JobDirectory).TrimEnd('\')))
     }
-    if ([string]::IsNullOrWhiteSpace($JobId) -or $JobId -match '[\\/]') {
+    if ([string]::IsNullOrWhiteSpace($JobId) -or $JobId -match '[\\/]|\.\.') {
         throw 'The local job id is invalid for a Runtime directory.'
     }
 
-    return (Join-Path (Get-RecoveryRuntimeRoot) $JobId)
+    $jobRuntimeDirectory = Join-Path (Get-RecoveryRuntimeRoot) $JobId
+    if ([string]::IsNullOrWhiteSpace($RunId)) {
+        return $jobRuntimeDirectory
+    }
+    if ($RunId -match '[\\/]|\.\.') {
+        throw 'The local Runtime run id is invalid.'
+    }
+
+    return (Join-Path $jobRuntimeDirectory $RunId)
 }
 
 function Get-RecoveryRuntimeActivity {
@@ -1235,6 +1296,16 @@ function Clear-RecoveryRuntime {
     }
 
     [System.IO.Directory]::Delete($targetFull, $true)
+
+    # A run directory is disposable. Remove its now-empty JobId container too,
+    # but never remove the Runtime root itself.
+    $parentFull = [System.IO.Directory]::GetParent($targetFull).FullName.TrimEnd('\')
+    if ($parentFull -ne $rootFull.TrimEnd('\') -and
+        $parentFull.StartsWith($rootFull, [System.StringComparison]::OrdinalIgnoreCase) -and
+        (Test-Path -LiteralPath $parentFull -PathType Container) -and
+        @([System.IO.Directory]::EnumerateFileSystemEntries($parentFull)).Count -eq 0) {
+        [System.IO.Directory]::Delete($parentFull, $false)
+    }
     return $true
 }
 
@@ -1252,8 +1323,22 @@ function Cleanup-StaleRecoveryRuntime {
         $activity = Get-RecoveryRuntimeActivity -JobId ([string]$directory.Name)
         if (-not $activity.Known -or $activity.Active) { continue }
         try {
-            if (Clear-RecoveryRuntime -RuntimeDirectory ([string]$directory.FullName)) {
-                [void]$removed.Add([string]$directory.Name)
+            $runDirectories = @(Get-ChildItem -LiteralPath $directory.FullName -Directory -ErrorAction SilentlyContinue)
+            if ($runDirectories.Count -eq 0) {
+                if (Clear-RecoveryRuntime -RuntimeDirectory ([string]$directory.FullName)) {
+                    [void]$removed.Add([string]$directory.Name)
+                }
+                continue
+            }
+
+            foreach ($runDirectory in $runDirectories) {
+                if (Clear-RecoveryRuntime -RuntimeDirectory ([string]$runDirectory.FullName)) {
+                    [void]$removed.Add(('{0}\{1}' -f $directory.Name, $runDirectory.Name))
+                }
+            }
+            if ((Test-Path -LiteralPath $directory.FullName -PathType Container) -and
+                @([System.IO.Directory]::EnumerateFileSystemEntries($directory.FullName)).Count -eq 0) {
+                [System.IO.Directory]::Delete($directory.FullName, $false)
             }
         }
         catch {
@@ -2402,6 +2487,8 @@ Export-ModuleMember -Function @(
     'Get-ArchiveInspection',
     'Test-ArchivePassword',
     'Write-LocalJsonAtomic',
+    'Resolve-CoverageProgress',
+    'Get-CoverageEtaSeconds',
     'Read-LocalJson',
     'Read-HashcatStatusIncremental',
     'Get-ArchiveIdentity',

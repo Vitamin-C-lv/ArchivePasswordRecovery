@@ -146,9 +146,9 @@ function New-InjectedWorker {
     $absoluteImport = "Import-Module '$([System.IO.Path]::GetFullPath((Join-Path $srcRoot 'RecoveryCore.psm1')))' -Force -DisableNameChecking"
     if (-not $workerText.Contains($importLine)) { throw 'Could not locate the Worker module import line.' }
     $workerText = $workerText.Replace($importLine, $absoluteImport)
-    $executionMarker = "try {`r`n    if (`$script:IsCumulativeJob) {"
+    $executionMarker = "try {`r`n    Set-WorkerActivity -Activity 'PreparingBackend' -Message 'Preparing the local recovery backend.'`r`n    Publish-Progress -State 'Running' -Message 'Preparing the local recovery backend.' -Result `$null -InitialSnapshot`r`n    if (`$script:IsCumulativeJob) {"
     if (-not $workerText.Contains($executionMarker)) {
-        $executionMarker = "try {`n    if (`$script:IsCumulativeJob) {"
+        $executionMarker = "try {`n    Set-WorkerActivity -Activity 'PreparingBackend' -Message 'Preparing the local recovery backend.'`n    Publish-Progress -State 'Running' -Message 'Preparing the local recovery backend.' -Result `$null -InitialSnapshot`n    if (`$script:IsCumulativeJob) {"
     }
     if (-not $workerText.Contains($executionMarker)) { throw 'Could not locate the Worker execution boundary.' }
     $workerText = $workerText.Replace($executionMarker, ($OverrideText + "`r`n" + $executionMarker))

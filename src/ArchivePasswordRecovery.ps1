@@ -454,6 +454,7 @@ function Convert-StateName {
         'Paused' { return '已暂停' }
         'Stopping' { return '正在停止' }
         'Stopped' { return '已停止' }
+        'Finalizing' { return '正在收尾' }
         'Recovered' { return '已恢复' }
         'Exhausted' { return '已完成（未找到密码）' }
         'Failed' { return '失败' }
@@ -466,6 +467,7 @@ function Convert-StateName {
 function Convert-BackendName {
     param([string]$Value)
 
+    if ([string]::IsNullOrWhiteSpace($Value)) { return '尚未启动' }
     switch ($Value) {
         'NanaZip local verifier' { return 'NanaZip 本地验证器' }
         'Hashcat OpenCL' { return 'Hashcat OpenCL' }
@@ -476,7 +478,7 @@ function Convert-BackendName {
 function Convert-ComputeDeviceName {
     param([string]$Value)
 
-    if ([string]::IsNullOrWhiteSpace($Value)) { return 'CPU' }
+    if ([string]::IsNullOrWhiteSpace($Value)) { return '尚未启动' }
     if ($Value -match '^AMD GPU \((.+)\)$') { return ('AMD 显卡（{0}）' -f $Matches[1]) }
     if ($Value -match '^NVIDIA GPU \((.+)\)$') { return ('NVIDIA 显卡（{0}）' -f $Matches[1]) }
     if ($Value -eq 'AMD GPU') { return 'AMD 显卡' }
@@ -491,6 +493,22 @@ function Convert-UiMessage {
 
     $exact = @{
         'Testing local candidates.' = '正在测试本地候选密码。'
+        'Preparing the local recovery backend.' = '正在准备本地恢复后端。'
+        'Preparing the local backend for coverage: ' = '正在准备当前覆盖范围的本地后端：'
+        'Preparing the local backend for stage ' = '正在准备当前阶段的本地后端：'
+        'Preparing local coverage: ' = '正在准备本地覆盖范围：'
+        'Preparing local coverage for stage ' = '正在准备当前阶段的本地覆盖范围：'
+        'Preparing local dictionary data for coverage: ' = '正在准备当前覆盖范围的本地字典数据：'
+        'Preparing local attack data for stage ' = '正在准备当前阶段的本地攻击数据：'
+        'Starting the local Hashcat backend.' = '正在启动本地 Hashcat 后端。'
+        'Restoring the saved local Hashcat checkpoint.' = '正在恢复已保存的本地 Hashcat 断点。'
+        'Verifying the current candidate locally.' = '正在本机验证当前候选密码。'
+        'Advancing to the next local coverage.' = '正在切换到下一个本地覆盖范围。'
+        'Coverage completed; advancing to the next local coverage.' = '当前覆盖范围已完成，正在切换到下一个本地覆盖范围。'
+        'Synchronizing current search progress.' = '正在同步当前搜索进度…'
+        'The archive does not require a password.' = '压缩包不需要密码。'
+        'All selected local coverage completed without recovering a password.' = '所有选定的本地覆盖范围均已完成，未恢复出密码。'
+        'The local recovery runtime artifact could not be created. The task was not marked as recovered.' = '无法创建本地恢复运行文件；任务不会标记为已恢复。'
         'Password recovered and verified locally.' = '密码已恢复，并已在本机验证。'
         'CPU was selected.' = '已选择 CPU。'
         'Starting local Hashcat GPU recovery.' = '正在启动本地 Hashcat GPU 恢复。'
@@ -520,6 +538,25 @@ function Convert-UiMessage {
     }
     if ($exact.ContainsKey($Message)) {
         return $exact[$Message]
+    }
+
+    if ($Message -match '^Preparing the local backend for coverage: (.+)\.$') {
+        return ('正在准备当前覆盖范围的本地后端：{0}。' -f $Matches[1])
+    }
+    if ($Message -match '^Preparing the local backend for stage (.+)\.$') {
+        return ('正在准备当前阶段的本地后端：{0}。' -f $Matches[1])
+    }
+    if ($Message -match '^Preparing local coverage: (.+)\.$') {
+        return ('正在准备本地覆盖范围：{0}。' -f $Matches[1])
+    }
+    if ($Message -match '^Preparing local coverage for stage (.+)\.$') {
+        return ('正在准备当前阶段的本地覆盖范围：{0}。' -f $Matches[1])
+    }
+    if ($Message -match '^Preparing local dictionary data for coverage: (.+)\.$') {
+        return ('正在准备当前覆盖范围的本地字典数据：{0}。' -f $Matches[1])
+    }
+    if ($Message -match '^Preparing local attack data for stage (.+)\.$') {
+        return ('正在准备当前阶段的本地攻击数据：{0}。' -f $Matches[1])
     }
 
     if ($Message -match '^Stage (.+) skipped: (.+)$') {
@@ -927,6 +964,25 @@ function Start-WorkerProcess {
     $script:CurrentWorker = Start-Process -FilePath (Resolve-WindowsPowerShell) -ArgumentList $arguments -WindowStyle Hidden -PassThru
 }
 
+function Reset-LiveTaskDisplay {
+    $script:LastProgressUpdated = ''
+    $controls.StateValue.Text = '正在启动'
+    $controls.StageValue.Text = '等待阶段信息'
+    $controls.EngineValue.Text = '尚未启动本地后端'
+    $controls.DeviceValue.Text = '尚未启动'
+    $controls.CandidatesValue.Text = '0 / 未知'
+    $controls.SpeedValue.Text = '正在准备本地任务…'
+    $controls.ElapsedValue.Text = '约 0 秒'
+    $controls.EstimatedRemainingValue.Text = '正在准备本地任务…'
+    $controls.WorstCaseValue.Text = '正在准备本地任务…'
+    $controls.SearchProgressBar.IsIndeterminate = $true
+    $controls.SearchProgressBar.Value = 0
+    $controls.ProgressPercentValue.Text = '正在准备本地恢复任务…'
+    $controls.ProgressMessageText.Text = '正在准备本地恢复任务。压缩包数据不会离开此电脑。'
+    $controls.ResultValue.Text = ''
+    $controls.ResultCard.Visibility = [System.Windows.Visibility]::Collapsed
+}
+
 function Start-NewJob {
     try {
         if ($null -eq $script:CurrentInspection -or [string]::IsNullOrWhiteSpace($controls.ArchivePathBox.Text)) {
@@ -956,7 +1012,7 @@ function Start-NewJob {
         }
         if (-not $reuseExistingJob) {
             $script:CurrentJobDirectory = Join-Path $jobsRoot ([guid]::NewGuid().ToString('N'))
-            New-Item -ItemType Directory -Path $script:CurrentJobDirectory -Force | Out-Null
+            New-Item -ItemType Directory -Path $script:CurrentJobDirectory | Out-Null
         }
         if ($reuseExistingJob) {
             $merged = Merge-RecoveryJobForLevelUpgrade -ExistingJob $existingJob -NewControlJob $controlJob
@@ -975,14 +1031,10 @@ function Start-NewJob {
             }
         }
         Write-LocalJsonAtomic -Path (Join-Path $script:CurrentJobDirectory 'job.json') -Value $job
-        Start-WorkerProcess -ResumeJob:$reuseExistingJob
-        $controls.StateValue.Text = '正在启动'
-        $controls.ResultValue.Text = ''
-        $controls.ResultCard.Visibility = [System.Windows.Visibility]::Collapsed
-        $controls.StageValue.Text = '等待阶段信息'
-        $controls.EngineValue.Text = '正在启动本地验证器'
-        $controls.DeviceValue.Text = 'Auto（推荐）'
-        $controls.ProgressMessageText.Text = '本地恢复任务已启动。压缩包数据不会离开此电脑。'
+        # A level upgrade is a new execution of the same persistent JobId. It
+        # reuses coverage.json but must not restore the old live Worker cursor.
+        Reset-LiveTaskDisplay
+        Start-WorkerProcess -ResumeJob:$false
         Update-TaskControls -State 'Starting'
         Write-UiLog '已启动新的本地恢复任务。'
     }
@@ -1016,6 +1068,7 @@ function Resume-CurrentJob {
         if (Test-Path -LiteralPath $pausePath) {
             Remove-Item -LiteralPath $pausePath -Force
             if (-not (Get-WorkerIsRunning)) {
+                Reset-LiveTaskDisplay
                 Start-WorkerProcess -ResumeJob
                 Write-UiLog '已从可用的本地会话断点重新启动暂停的 GPU 后端。'
             }
@@ -1036,6 +1089,7 @@ function Resume-CurrentJob {
 
         if (Test-Path -LiteralPath $stopPath) { Remove-Item -LiteralPath $stopPath -Force }
         if (-not (Get-WorkerIsRunning)) {
+            Reset-LiveTaskDisplay
             Start-WorkerProcess -ResumeJob
             Write-UiLog '已从保存的本地断点重新启动 Worker。'
         }
@@ -1144,34 +1198,75 @@ function Update-ProgressFromDisk {
         }
         $backendText = if ($progress.PSObject.Properties.Name -contains 'Backend') { Convert-BackendName -Value ([string]$progress.Backend) } else { Convert-BackendName -Value ([string]$progress.Engine) }
         $controls.StageValue.Text = $stageText
+        $activity = if ($progress.PSObject.Properties.Name -contains 'Activity' -and -not [string]::IsNullOrWhiteSpace([string]$progress.Activity)) { [string]$progress.Activity } else { $displayState }
+        $activityMessage = if ($progress.PSObject.Properties.Name -contains 'ActivityMessage' -and -not [string]::IsNullOrWhiteSpace([string]$progress.ActivityMessage)) { [string]$progress.ActivityMessage } else { [string]$progress.Message }
         $controls.EngineValue.Text = $backendText
         $controls.DeviceValue.Text = if ($progress.PSObject.Properties.Name -contains 'ComputeDevice') { Convert-ComputeDeviceName -Value ([string]$progress.ComputeDevice) } else { 'CPU' }
-        $total = Format-LocalCount -Value $progress.CandidateTotal
-        $stageTested = if ($progress.PSObject.Properties.Name -contains 'StageCandidatesTested') { $progress.StageCandidatesTested } else { $progress.CandidatesTested }
-        $controls.CandidatesValue.Text = ('{0} / {1}' -f (Format-LocalCount -Value $stageTested), $total)
+        $totalValue = if ($progress.PSObject.Properties.Name -contains 'CoverageTotal' -and $null -ne $progress.CoverageTotal) { $progress.CoverageTotal } else { $progress.CandidateTotal }
+        $testedValue = if ($progress.PSObject.Properties.Name -contains 'CoverageTested' -and $null -ne $progress.CoverageTested) {
+            $progress.CoverageTested
+        }
+        elseif ($progress.PSObject.Properties.Name -contains 'StageCandidatesTested') {
+            $progress.StageCandidatesTested
+        }
+        else {
+            $progress.CandidatesTested
+        }
+        $total = Format-LocalCount -Value $totalValue
+        $controls.CandidatesValue.Text = ('{0} / {1}' -f (Format-LocalCount -Value $testedValue), $total)
 
         [double]$speed = 0
         try { $speed = [double]$progress.SpeedPerSecond } catch { $speed = 0 }
-        $controls.SpeedValue.Text = if ($speed -gt 0) { ('{0:N2} 候选/秒' -f $speed) } else { '正在根据本地工作估算…' }
+        $controls.SpeedValue.Text = if ($activity -eq 'RunningCoverage' -and $speed -gt 0) { ('{0:N2} 候选/秒' -f $speed) } elseif ($activity -in @('Paused', 'Pausing', 'Stopping', 'Stopped')) { '当前执行未采样速度' } else { '正在根据本地工作估算…' }
         $controls.ElapsedValue.Text = Format-LocalDuration -Seconds $progress.ElapsedSeconds
 
-        $hasKnownTotal = ($null -ne $progress.CandidateTotal -and [long]$progress.CandidateTotal -gt 0)
-        $hasProgress = ($progress.PSObject.Properties.Name -contains 'ProgressPercent' -and $null -ne $progress.ProgressPercent)
+        $hasKnownTotal = ($null -ne $totalValue -and [long]$totalValue -gt 0)
+        $invariantViolation = ($progress.PSObject.Properties.Name -contains 'ProgressInvariantViolation' -and [bool]$progress.ProgressInvariantViolation)
+        $hasProgress = (-not $invariantViolation -and $progress.PSObject.Properties.Name -contains 'ProgressPercent' -and $null -ne $progress.ProgressPercent)
         if ($hasProgress) {
-            [double]$percent = [math]::Max(0, [math]::Min(100, [double]$progress.ProgressPercent))
+            [double]$percent = [double]$progress.ProgressPercent
             $controls.SearchProgressBar.IsIndeterminate = $false
             $controls.SearchProgressBar.Value = $percent
-            $controls.ProgressPercentValue.Text = ('{0:N2}%（{1} / {2}）' -f $percent, (Format-LocalCount -Value $stageTested), $total)
+            $controls.ProgressPercentValue.Text = ('{0:N2}%（{1} / {2}）' -f $percent, (Format-LocalCount -Value $testedValue), $total)
         }
         else {
             $controls.SearchProgressBar.IsIndeterminate = $true
             $controls.SearchProgressBar.Value = 0
-            $controls.ProgressPercentValue.Text = if ($hasKnownTotal) { '正在根据当前本地速度估算进度…' } else { '当前搜索空间无法可靠计算，不显示百分比。' }
+            $controls.ProgressPercentValue.Text = if ($invariantViolation) { '正在同步当前搜索进度…' } elseif ($activity -ne 'RunningCoverage') { Convert-UiMessage -Message $activityMessage } elseif ($hasKnownTotal) { '正在根据当前本地速度估算进度…' } else { '当前搜索空间无法可靠计算，不显示百分比。' }
         }
 
         $estimated = if ($progress.PSObject.Properties.Name -contains 'EstimatedRemainingSeconds') { $progress.EstimatedRemainingSeconds } else { $null }
         $worstCase = if ($progress.PSObject.Properties.Name -contains 'WorstCaseRemainingSeconds') { $progress.WorstCaseRemainingSeconds } else { $null }
-        if ($hasKnownTotal -and $speed -le 0) {
+        $etaAllowed = $activity -eq 'RunningCoverage' -and $hasKnownTotal -and -not $invariantViolation -and [long]$testedValue -lt [long]$totalValue -and $speed -gt 0
+        if ($etaAllowed) {
+            $controls.EstimatedRemainingValue.Text = Format-LocalDuration -Seconds $estimated
+            $controls.WorstCaseValue.Text = Format-LocalDuration -Seconds $worstCase
+        }
+        elseif ($invariantViolation) {
+            $controls.EstimatedRemainingValue.Text = '正在同步当前搜索进度…'
+            $controls.WorstCaseValue.Text = '正在同步当前搜索进度…'
+        }
+        elseif ($activity -in @('PreparingBackend', 'PreparingDictionary', 'PreparingCoverage', 'StartingHashcat', 'RestoringHashcat', 'AdvancingCoverage', 'Finalizing')) {
+            $controls.EstimatedRemainingValue.Text = '正在准备本地任务…'
+            $controls.WorstCaseValue.Text = '正在准备本地任务…'
+        }
+        elseif ($activity -eq 'VerifyingCandidate') {
+            $controls.EstimatedRemainingValue.Text = '正在验证当前候选…'
+            $controls.WorstCaseValue.Text = '正在验证当前候选…'
+        }
+        elseif ($activity -in @('Pausing', 'Paused', 'Stopping', 'Stopped')) {
+            $controls.EstimatedRemainingValue.Text = Convert-UiMessage -Message $activityMessage
+            $controls.WorstCaseValue.Text = Convert-UiMessage -Message $activityMessage
+        }
+        elseif ($hasKnownTotal -and [long]$testedValue -ge [long]$totalValue) {
+            $controls.EstimatedRemainingValue.Text = '正在切换到下一项…'
+            $controls.WorstCaseValue.Text = '正在切换到下一项…'
+        }
+        elseif (-not $hasKnownTotal) {
+            $controls.EstimatedRemainingValue.Text = '正在估算…'
+            $controls.WorstCaseValue.Text = '正在估算…'
+        }
+        elseif ($hasKnownTotal -and $speed -le 0) {
             $controls.EstimatedRemainingValue.Text = '正在根据本地工作估算…'
             $controls.WorstCaseValue.Text = '正在根据本地工作估算…'
         }
@@ -1179,7 +1274,7 @@ function Update-ProgressFromDisk {
             $controls.EstimatedRemainingValue.Text = Format-LocalDuration -Seconds $estimated
             $controls.WorstCaseValue.Text = Format-LocalDuration -Seconds $worstCase
         }
-        $controls.ProgressMessageText.Text = Convert-UiMessage -Message ([string]$progress.Message)
+        $controls.ProgressMessageText.Text = Convert-UiMessage -Message $activityMessage
 
         $password = ''
         if ($null -ne $progress.Result -and $progress.Result.PSObject.Properties.Name -contains 'Password') {

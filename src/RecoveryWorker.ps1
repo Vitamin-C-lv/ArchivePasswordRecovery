@@ -23,7 +23,9 @@ $job = Read-LocalJson -Path $jobPath
 $script:IsCumulativeJob = $job.PSObject.Properties.Name -contains 'RecoveryLevel'
 $jobId = ''
 if ($job.PSObject.Properties.Name -contains 'JobId') { $jobId = [string]$job.JobId }
-$script:RuntimeDirectory = Get-RecoveryRuntimeDirectory -JobDirectory $JobDirectory -JobId $jobId
+$script:RunId = [guid]::NewGuid().ToString('N')
+$script:RunStartedUtc = [datetime]::UtcNow
+$script:RuntimeDirectory = Get-RecoveryRuntimeDirectory -JobDirectory $JobDirectory -JobId $jobId -RunId $script:RunId
 $coveragePath = Join-Path $JobDirectory 'coverage.json'
 $coverageState = $null
 if (Test-Path -LiteralPath $coveragePath -PathType Leaf) {
@@ -40,14 +42,21 @@ if ($Resume -and (Test-Path -LiteralPath $progressPath -PathType Leaf)) {
 }
 
 $script:CandidatesTested = if ($null -ne $previous -and $previous.PSObject.Properties.Name -contains 'CandidatesTested' -and $null -ne $previous.CandidatesTested) { [long]$previous.CandidatesTested } else { 0L }
-$script:ElapsedBeforeSeconds = if ($null -ne $previous -and $previous.PSObject.Properties.Name -contains 'ElapsedSeconds' -and $null -ne $previous.ElapsedSeconds) { [double]$previous.ElapsedSeconds } else { 0.0 }
-$script:RunStartedUtc = [datetime]::UtcNow
+$script:RunCandidatesTested = 0L
 $script:LastPublishUtc = [datetime]::MinValue
 $script:TerminalState = $null
 $script:CoverageResult = ''
-$script:EngineLabel = 'CPU local verifier'
-$script:ComputeDevice = 'CPU'
-$script:BackendName = 'NanaZip local verifier'
+$script:EngineLabel = $null
+$script:ComputeDevice = $null
+$script:BackendName = $null
+$script:Activity = 'PreparingBackend'
+$script:ActivityMessage = 'Preparing the local recovery backend.'
+$script:ProgressInvariantViolation = $false
+$script:HashcatProgressMode = 'Absolute'
+$script:ResumeCoverageBase = 0L
+$script:ErrorCode = $null
+$script:ErrorFunction = $null
+$script:ErrorArtifactType = $null
 $script:TotalCandidates = $null
 $script:RecoveryLevel = Get-RecoveryLevel -Job $job
 $script:RecoveryPlanYear = Get-PlanYear -Job $job
@@ -88,6 +97,7 @@ elseif ($script:ResumeStage -and $null -ne $previous) {
     $script:StageCandidatesTested = [long]$script:CandidatesTested
 }
 $script:StageBaseCandidates = [math]::Max(0L, $script:CandidatesTested - $script:StageCandidatesTested)
+$script:ResumeStageBaseCandidates = if ($Resume) { [long]$script:StageCandidatesTested } else { 0L }
 if ($null -ne $previous -and $previous.PSObject.Properties.Name -contains 'SkippedStages') {
     foreach ($skippedStage in @($previous.SkippedStages)) {
         if ($null -ne $skippedStage) { [void]$script:SkippedStages.Add($skippedStage) }
@@ -119,14 +129,15 @@ $script:StageCoverageBaseCandidates = 0L
 $script:CurrentCoverageName = ''
 $script:ActivePlanItem = $null
 $script:RequestedCoverageIds = @()
-foreach ($cursorSource in @($previous, $job)) {
+$cursorSources = if ($Resume) { @($previous, $job) } else { @() }
+foreach ($cursorSource in $cursorSources) {
     if ($null -ne $cursorSource -and $cursorSource.PSObject.Properties.Name -contains 'CurrentCoverageId' -and
         -not [string]::IsNullOrWhiteSpace([string]$cursorSource.CurrentCoverageId)) {
         $script:CurrentCoverageId = [string]$cursorSource.CurrentCoverageId
         break
     }
 }
-foreach ($checkpointSource in @($previous, $job)) {
+foreach ($checkpointSource in $cursorSources) {
     if ($null -ne $checkpointSource -and $checkpointSource.PSObject.Properties.Name -contains 'CurrentCheckpoint' -and $null -ne $checkpointSource.CurrentCheckpoint) {
         $script:CurrentCheckpoint = $checkpointSource.CurrentCheckpoint
         if ($checkpointSource.CurrentCheckpoint.PSObject.Properties.Name -contains 'Position' -and $null -ne $checkpointSource.CurrentCheckpoint.Position) {
@@ -144,7 +155,31 @@ if ($script:CompletedCoverageIds.Contains($script:CurrentCoverageId)) {
 }
 
 function Get-ElapsedSeconds {
-    return [math]::Round($script:ElapsedBeforeSeconds + ([datetime]::UtcNow - $script:RunStartedUtc).TotalSeconds, 1)
+    return [math]::Round(([datetime]::UtcNow - $script:RunStartedUtc).TotalSeconds, 1)
+}
+
+function Set-WorkerActivity {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][string]$Activity,
+        [Parameter(Mandatory = $true)][string]$Message
+    )
+
+    $script:Activity = $Activity
+    $script:ActivityMessage = $Message
+}
+
+function Set-WorkerErrorContext {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][string]$Code,
+        [Parameter(Mandatory = $true)][string]$Function,
+        [Parameter(Mandatory = $true)][string]$ArtifactType
+    )
+
+    $script:ErrorCode = $Code
+    $script:ErrorFunction = $Function
+    $script:ErrorArtifactType = $ArtifactType
 }
 
 function Update-EffectiveSpeed {
@@ -236,6 +271,8 @@ function Complete-CoverageItem {
     $script:CoverageCandidatesTested = 0L
     $script:ActivePlanItem = $null
     $script:CoverageResult = ''
+    $script:ResumeCoverageBase = 0L
+    $script:ProgressInvariantViolation = $false
     Save-CoverageState
 }
 
@@ -255,8 +292,37 @@ function Publish-Progress {
         [Parameter(Mandatory = $true)][string]$State,
         [Parameter(Mandatory = $true)][string]$Message,
         $Result,
-        [double]$BackendSpeed = $script:LastBackendSpeed
+        [double]$BackendSpeed = $script:LastBackendSpeed,
+        [string]$Activity = '',
+        [string]$ActivityMessage = '',
+        [switch]$InitialSnapshot
     )
+
+    if ([string]::IsNullOrWhiteSpace($Activity)) {
+        $Activity = [string]$script:Activity
+    }
+    if ([string]::IsNullOrWhiteSpace($Activity)) {
+        $Activity = switch ($State) {
+            'Paused' { 'Paused' }
+            'Pausing' { 'Pausing' }
+            'Stopping' { 'Stopping' }
+            'Stopped' { 'Stopped' }
+            'Recovered' { 'Recovered' }
+            'Exhausted' { 'Exhausted' }
+            'Failed' { 'Failed' }
+            default { 'RunningCoverage' }
+        }
+    }
+    if ([string]::IsNullOrWhiteSpace($ActivityMessage)) {
+        $ActivityMessage = if (-not [string]::IsNullOrWhiteSpace([string]$script:ActivityMessage)) {
+            [string]$script:ActivityMessage
+        }
+        else {
+            $Message
+        }
+    }
+    $script:Activity = $Activity
+    $script:ActivityMessage = $ActivityMessage
 
     Update-EffectiveSpeed -BackendSpeed $BackendSpeed
     $elapsedSeconds = Get-ElapsedSeconds
@@ -264,24 +330,86 @@ function Publish-Progress {
     $progressPercent = $null
     $estimatedRemainingSeconds = $null
     $worstCaseRemainingSeconds = $null
-    if ($null -ne $script:TotalCandidates -and $script:TotalCandidates -gt 0) {
-        [long]$knownTotal = [long]$script:TotalCandidates
-        [long]$boundedTested = [math]::Min([long]$script:StageCandidatesTested, $knownTotal)
-        $progressPercent = [math]::Round((100.0 * $boundedTested) / $knownTotal, 2)
-        if ($speed -gt 0) {
-            [long]$remaining = [math]::Max([long]0, ($knownTotal - $boundedTested))
-            $estimatedRemainingSeconds = [math]::Round($remaining / $speed, 1)
+
+    $coverageTested = if ($InitialSnapshot) {
+        0L
+    }
+    elseif ($script:IsCumulativeJob -and $null -ne $script:ActivePlanItem) {
+        [long]$script:CoverageCandidatesTested
+    }
+    else {
+        [long]$script:StageCandidatesTested
+    }
+    $coverageTotal = if ($InitialSnapshot) {
+        $null
+    }
+    elseif ($script:IsCumulativeJob -and $null -ne $script:ActivePlanItem) {
+        $script:CoverageCandidateTotal
+    }
+    else {
+        $script:TotalCandidates
+    }
+    $hasKnownTotal = $null -ne $coverageTotal -and [long]$coverageTotal -gt 0
+    if ($hasKnownTotal) {
+        [long]$knownTotal = [long]$coverageTotal
+        if ($coverageTested -lt 0 -or $coverageTested -gt $knownTotal) {
+            $script:ProgressInvariantViolation = $true
+        }
+        else {
+            $script:ProgressInvariantViolation = $false
+        }
+
+        $canShowPercent = $Activity -in @('RunningCoverage', 'Paused', 'Stopped', 'Recovered', 'Exhausted')
+        if (-not $script:ProgressInvariantViolation -and $canShowPercent) {
+            $progressPercent = [math]::Round((100.0 * $coverageTested) / $knownTotal, 2)
+        }
+        $estimatedRemainingSeconds = Get-CoverageEtaSeconds -Activity $Activity -CandidateTotal $coverageTotal -Tested $coverageTested -SpeedPerSecond $speed -ProgressInvariantViolation $script:ProgressInvariantViolation
+        if ($null -ne $estimatedRemainingSeconds) {
             # For a deterministic search order, exhausting the rest of the current
             # configured range is also the current range's worst case.
             $worstCaseRemainingSeconds = $estimatedRemainingSeconds
         }
     }
+    else {
+        $script:ProgressInvariantViolation = $false
+    }
+
+    if ($script:ProgressInvariantViolation) {
+        $ActivityMessage = 'Synchronizing current search progress.'
+    }
+    elseif ($Activity -eq 'RunningCoverage' -and $ActivityMessage -eq 'Synchronizing current search progress.') {
+        $ActivityMessage = 'Testing local candidates.'
+    }
+    $script:ActivityMessage = $ActivityMessage
+
+    $recordCandidatesTested = if ($InitialSnapshot) { 0L } else { $script:CandidatesTested }
+    $recordStageCandidatesTested = if ($InitialSnapshot) { 0L } else { $script:StageCandidatesTested }
+    $recordCandidateTotal = if ($InitialSnapshot) { $null } else { $script:TotalCandidates }
+    $recordLiveCandidatesTested = if ($InitialSnapshot) { 0L } else { $script:RunCandidatesTested }
+    $recordCoverageTested = if ($InitialSnapshot) { $null } elseif ($script:IsCumulativeJob -and $null -ne $script:ActivePlanItem) { $script:CoverageCandidatesTested } else { $null }
+    $recordCoverageTotal = if ($InitialSnapshot) { $null } elseif ($script:IsCumulativeJob -and $null -ne $script:ActivePlanItem) { $script:CoverageCandidateTotal } else { $null }
+    $recordCurrentCoverageId = if ($InitialSnapshot) { $null } elseif ($script:IsCumulativeJob) { $script:CurrentCoverageId } else { '' }
+    $recordCurrentCoverageName = if ($InitialSnapshot) { $null } elseif ($script:IsCumulativeJob) { $script:CurrentCoverageName } else { '' }
+    $recordCurrentCheckpoint = if ($InitialSnapshot) { $null } elseif ($script:IsCumulativeJob) { $script:CurrentCheckpoint } else { $null }
+    $recordCoveragePosition = if ($InitialSnapshot) { $null } elseif ($script:IsCumulativeJob -and $null -ne $script:ActivePlanItem) { $script:CoveragePosition } else { $null }
+    $recordCoverageCandidatesTested = if ($InitialSnapshot) { $null } elseif ($script:IsCumulativeJob) { $script:CoverageCandidatesTested } else { $null }
+    $recordCoverageCandidateTotal = if ($InitialSnapshot) { $null } elseif ($script:IsCumulativeJob) { $script:CoverageCandidateTotal } else { $null }
+    $recordCoverageResult = if ($InitialSnapshot) { '' } elseif ($script:IsCumulativeJob) { $script:CoverageResult } else { '' }
 
     $record = [ordered]@{
-        SchemaVersion     = 3
+        SchemaVersion     = 4
         State             = $State
         Message           = $Message
         ArchivePath       = [string]$job.ArchivePath
+        RunId             = $script:RunId
+        RunStartedUtc     = $script:RunStartedUtc.ToString('o')
+        Activity          = $Activity
+        ActivityMessage   = $ActivityMessage
+        HashcatProgressMode = $script:HashcatProgressMode
+        HashcatResumeBase = $script:ResumeCoverageBase
+        ErrorCode         = $script:ErrorCode
+        ErrorFunction     = $script:ErrorFunction
+        ErrorArtifactType = $script:ErrorArtifactType
         Strategy          = $script:Strategy
         RecoveryLevel     = $script:RecoveryLevel
         StageNumber       = $script:StageNumber
@@ -293,22 +421,27 @@ function Publish-Progress {
         Engine            = $script:EngineLabel
         Backend           = $script:BackendName
         ComputeDevice     = $script:ComputeDevice
-        CandidatesTested  = $script:CandidatesTested
-        StageCandidatesTested = $script:StageCandidatesTested
-        CandidateTotal    = $script:TotalCandidates
+        CandidatesTested  = $recordCandidatesTested
+        StageCandidatesTested = $recordStageCandidatesTested
+        CandidateTotal    = $recordCandidateTotal
+        LiveCandidatesTested = $recordLiveCandidatesTested
+        CoverageTested    = $recordCoverageTested
+        CoverageTotal     = $recordCoverageTotal
+        ProgressInvariantViolation = [bool]$script:ProgressInvariantViolation
         ProgressPercent   = $progressPercent
-        SpeedPerSecond    = $speed
+        SpeedPerSecond    = if ($script:EffectiveSpeed -gt 0) { $speed } else { $null }
         ElapsedSeconds    = $elapsedSeconds
         EstimatedRemainingSeconds = $estimatedRemainingSeconds
         WorstCaseRemainingSeconds = $worstCaseRemainingSeconds
         CompletedCoverageIds = if ($script:IsCumulativeJob) { @($script:CompletedCoverageIds | ForEach-Object { [string]$_ }) } else { @() }
         RequestedCoverage = if ($script:IsCumulativeJob) { @($script:RequestedCoverageIds) } else { @() }
-        CurrentCoverageId = if ($script:IsCumulativeJob) { $script:CurrentCoverageId } else { '' }
-        CurrentCoverageName = if ($script:IsCumulativeJob) { $script:CurrentCoverageName } else { '' }
-        CurrentCheckpoint = if ($script:IsCumulativeJob) { $script:CurrentCheckpoint } else { $null }
-        CoverageCandidatesTested = if ($script:IsCumulativeJob) { $script:CoverageCandidatesTested } else { $null }
-        CoverageCandidateTotal = if ($script:IsCumulativeJob) { $script:CoverageCandidateTotal } else { $null }
-        CoverageResult     = if ($script:IsCumulativeJob) { $script:CoverageResult } else { $null }
+        CurrentCoverageId = $recordCurrentCoverageId
+        CurrentCoverageName = $recordCurrentCoverageName
+        CurrentCheckpoint = $recordCurrentCheckpoint
+        CoveragePosition   = $recordCoveragePosition
+        CoverageCandidatesTested = $recordCoverageCandidatesTested
+        CoverageCandidateTotal = $recordCoverageCandidateTotal
+        CoverageResult     = $recordCoverageResult
         UpdatedUtc        = [datetime]::UtcNow.ToString('o')
         Result            = $Result
     }
@@ -324,7 +457,7 @@ function Publish-ProgressIfDue {
     param()
 
     if (([datetime]::UtcNow - $script:LastPublishUtc).TotalMilliseconds -ge 500) {
-        Publish-Progress -State 'Running' -Message 'Testing local candidates.' -Result $null
+        Publish-Progress -State 'Running' -Message ([string]$script:ActivityMessage) -Result $null
     }
 }
 
@@ -335,16 +468,19 @@ function Wait-For-Controls {
     while (Test-Path -LiteralPath $pausePath -PathType Leaf) {
         if (Test-Path -LiteralPath $stopPath -PathType Leaf) {
             $script:TerminalState = 'Stopped'
+            Set-WorkerActivity -Activity 'Stopped' -Message 'Stopped by the user. The local checkpoint can be resumed.'
             Publish-Progress -State 'Stopped' -Message 'Stopped by the user. The local checkpoint can be resumed.' -Result $null
             return $false
         }
 
+        Set-WorkerActivity -Activity 'Paused' -Message 'Paused locally. Remove the pause flag or press Resume to continue.'
         Publish-Progress -State 'Paused' -Message 'Paused locally. Remove the pause flag or press Resume to continue.' -Result $null
         Start-Sleep -Milliseconds 250
     }
 
     if (Test-Path -LiteralPath $stopPath -PathType Leaf) {
         $script:TerminalState = 'Stopped'
+        Set-WorkerActivity -Activity 'Stopped' -Message 'Stopped by the user. The local checkpoint can be resumed.'
         Publish-Progress -State 'Stopped' -Message 'Stopped by the user. The local checkpoint can be resumed.' -Result $null
         return $false
     }
@@ -393,8 +529,10 @@ function Test-NextCandidate {
         return $false
     }
 
+    Set-WorkerActivity -Activity 'VerifyingCandidate' -Message 'Verifying the current candidate locally.'
     $attempt = Test-ArchivePassword -ArchivePath ([string]$job.ArchivePath) -Password $Candidate -SevenZip $SevenZip
     $script:CandidatesTested++
+    $script:RunCandidatesTested++
     if ($null -ne $script:ActivePlanItem) {
         $script:CoveragePosition++
         Set-CoverageAttemptProgress
@@ -414,10 +552,12 @@ function Test-NextCandidate {
             Verification      = 'NanaZip 7z t returned exit code 0 for this password.'
             VerifiedAtUtc     = [datetime]::UtcNow.ToString('o')
         }
+        Set-WorkerActivity -Activity 'Recovered' -Message 'Password recovered and verified locally.'
         Publish-Progress -State 'Recovered' -Message 'Password recovered and verified locally.' -Result $result
         return $false
     }
 
+    Set-WorkerActivity -Activity 'RunningCoverage' -Message 'Testing local candidates.'
     Publish-ProgressIfDue
     return $true
 }
@@ -674,25 +814,29 @@ function Update-HashcatStatusFromLine {
                     $reportedTested = [long]($completedShorterLengths + $reportedTested)
                 }
             }
-            if ($reportedTested -ge 0) {
-                if ($null -ne $script:ActivePlanItem) {
-                    $script:CoveragePosition = [math]::Max($script:CoveragePosition, $reportedTested)
-                    $script:CoverageCandidatesTested = $script:CoveragePosition
-                    $script:StageCandidatesTested = [math]::Max($script:StageCandidatesTested, ($script:StageCoverageBaseCandidates + $reportedTested))
-                    Update-CoverageCheckpoint
-                    $stageTotalTested = $script:StageBaseCandidates + $script:StageCandidatesTested
-                }
-                else {
-                    $script:StageCandidatesTested = [math]::Max($script:StageCandidatesTested, $reportedTested)
-                    $stageTotalTested = $script:StageBaseCandidates + $reportedTested
-                }
-                $script:CandidatesTested = [math]::Max($script:CandidatesTested, $stageTotalTested)
-            }
             if ($null -ne $script:ActivePlanItem -and $null -eq $script:CoverageCandidateTotal -and $reportedTotal -gt 0) {
                 $script:CoverageCandidateTotal = $reportedTotal
             }
-            if ($null -eq $script:TotalCandidates -and $reportedTotal -gt 0) {
+            if ($null -eq $script:ActivePlanItem -and $null -eq $script:TotalCandidates -and $reportedTotal -gt 0) {
                 $script:TotalCandidates = $reportedTotal
+            }
+
+            $progressTotal = if ($null -ne $script:ActivePlanItem) { $script:CoverageCandidateTotal } else { $script:TotalCandidates }
+            $resumeBase = if ($script:HashcatProgressMode -eq 'Relative') { $script:ResumeCoverageBase } else { 0L }
+            $resolved = Resolve-CoverageProgress -ReportedTested $reportedTested -CandidateTotal $progressTotal -Mode $script:HashcatProgressMode -ResumeBase $resumeBase
+            $script:ProgressInvariantViolation = [bool]$resolved.ProgressInvariantViolation
+            if ($null -ne $script:ActivePlanItem) {
+                $script:CoveragePosition = [long]$resolved.ResolvedTested
+                $script:CoverageCandidatesTested = $script:CoveragePosition
+                $script:StageCandidatesTested = [long]$script:StageCoverageBaseCandidates + $script:CoverageCandidatesTested
+                $script:CandidatesTested = [long]$script:StageBaseCandidates + $script:StageCandidatesTested
+                $script:RunCandidatesTested = [math]::Max(0L, $script:CoverageCandidatesTested - $script:ResumeCoverageBase)
+                Update-CoverageCheckpoint
+            }
+            else {
+                $script:StageCandidatesTested = [long]$resolved.ResolvedTested
+                $script:CandidatesTested = [long]$script:StageBaseCandidates + $script:StageCandidatesTested
+                $script:RunCandidatesTested = [math]::Max(0L, $script:StageCandidatesTested - $script:ResumeStageBaseCandidates)
             }
         }
         catch {
@@ -803,6 +947,61 @@ function Import-HashcatStatusFile {
     }
 }
 
+function Copy-HashcatRestoreCheckpoint {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][string]$SourcePath,
+        [Parameter(Mandatory = $true)][string]$DestinationPath,
+        [string]$RuntimeDirectory = '',
+        [string]$JobId = '',
+        [switch]$OverwriteDestination
+    )
+
+    if (-not (Test-Path -LiteralPath $SourcePath -PathType Leaf)) {
+        return $false
+    }
+
+    try {
+        [System.IO.File]::Copy($SourcePath, $DestinationPath, [bool]$OverwriteDestination)
+
+        # A Hashcat restore file contains the previous command line. The
+        # per-run directory changes on every Worker, so rewrite only the
+        # equal-length JobId\RunId path segments before --restore is invoked.
+        if (-not [string]::IsNullOrWhiteSpace($RuntimeDirectory) -and -not [string]::IsNullOrWhiteSpace($JobId)) {
+            $bytes = [System.IO.File]::ReadAllBytes($DestinationPath)
+            $ascii = [System.Text.Encoding]::ASCII.GetString($bytes)
+            $runtimePrefix = ([System.IO.Path]::GetFullPath((Get-RecoveryRuntimeRoot))).TrimEnd('\') + '\' + $JobId + '\'
+            $match = [regex]::Match($ascii, ([regex]::Escape($runtimePrefix) + '[0-9A-Fa-f]{32}'))
+            if ($match.Success) {
+                $oldPathBytes = [System.Text.Encoding]::ASCII.GetBytes($match.Value)
+                $newPath = ([System.IO.Path]::GetFullPath($RuntimeDirectory)).TrimEnd('\')
+                $newPathBytes = [System.Text.Encoding]::ASCII.GetBytes($newPath)
+                if ($oldPathBytes.Length -eq $newPathBytes.Length) {
+                    for ($offset = 0; $offset -le ($bytes.Length - $oldPathBytes.Length); $offset++) {
+                        $same = $true
+                        for ($index = 0; $index -lt $oldPathBytes.Length; $index++) {
+                            if ($bytes[$offset + $index] -ne $oldPathBytes[$index]) {
+                                $same = $false
+                                break
+                            }
+                        }
+                        if ($same) {
+                            [System.Array]::Copy($newPathBytes, 0, $bytes, $offset, $newPathBytes.Length)
+                            $offset += $oldPathBytes.Length - 1
+                        }
+                    }
+                    [System.IO.File]::WriteAllBytes($DestinationPath, $bytes)
+                }
+            }
+        }
+        return $true
+    }
+    catch {
+        Set-WorkerErrorContext -Code 'RUNTIME_ARTIFACT_CREATE_FAILED' -Function 'Copy-HashcatRestoreCheckpoint' -ArtifactType 'Hashcat restore checkpoint'
+        throw 'The local Hashcat restore checkpoint could not be prepared.'
+    }
+}
+
 function Invoke-HashcatRecovery {
     [CmdletBinding()]
     param(
@@ -815,7 +1014,9 @@ function Invoke-HashcatRecovery {
     )
 
     $temporaryDirectory = $script:RuntimeDirectory
-    New-Item -ItemType Directory -Path $temporaryDirectory -Force | Out-Null
+    if (-not (Test-Path -LiteralPath $temporaryDirectory -PathType Container)) {
+        New-Item -ItemType Directory -Path $temporaryDirectory -ErrorAction Stop | Out-Null
+    }
     $stageSuffix = if ($script:UseLegacyStageFiles) {
         ''
     }
@@ -826,11 +1027,21 @@ function Invoke-HashcatRecovery {
         '-stage{0}' -f $StageNumber
     }
     $resultPath = Join-Path $temporaryDirectory ('hashcat{0}-result.txt' -f $stageSuffix)
-    $restorePath = Join-Path $JobDirectory ('hashcat{0}.restore' -f $stageSuffix)
+    $runtimeRestorePath = Join-Path $temporaryDirectory ('hashcat{0}.restore' -f $stageSuffix)
+    $persistentRestorePath = Join-Path $JobDirectory ('hashcat{0}.restore' -f $stageSuffix)
+    # Hashcat stores the session identity inside the restore file. Keep the
+    # logical session stable so a checkpoint can be handed to a new Worker;
+    # the actual restore/status/result files remain isolated by RunId.
     $session = ('ArchivePasswordRecovery-' + [System.IO.Path]::GetFileName($JobDirectory) + $stageSuffix)
+    $script:HashcatProgressMode = 'Absolute'
+    $hasSavedRestore = $ResumeStage -and (Test-Path -LiteralPath $persistentRestorePath -PathType Leaf)
+    if ($hasSavedRestore) {
+        [void](Copy-HashcatRestoreCheckpoint -SourcePath $persistentRestorePath -DestinationPath $runtimeRestorePath -RuntimeDirectory $temporaryDirectory -JobId ([System.IO.Path]::GetFileName($JobDirectory)))
+    }
     if ($null -ne $script:ActivePlanItem) {
         Ensure-CoverageCheckpointDictionary
-        $script:CurrentCheckpoint['RestorePath'] = $restorePath
+        $script:CurrentCheckpoint['RestorePath'] = $persistentRestorePath
+        $script:CurrentCheckpoint['RestorePathScope'] = 'PersistentJob'
         Update-CoverageCheckpoint
     }
     $commonArguments = @(
@@ -838,14 +1049,14 @@ function Invoke-HashcatRecovery {
         '--backend-ignore-hip',
         '--potfile-disable',
         '--session', $session,
-        '--restore-file-path', $restorePath,
+        '--restore-file-path', $runtimeRestorePath,
         '--status',
         '--status-json',
         '--status-timer', '1',
         '-d', ([string]$Engine.DeviceId)
     )
 
-    if ($ResumeStage -and (Test-Path -LiteralPath $restorePath -PathType Leaf)) {
+    if ($hasSavedRestore) {
         $arguments = @($commonArguments + @('--restore'))
         $startupMessage = 'Resuming the saved local Hashcat session.'
     }
@@ -887,6 +1098,13 @@ function Invoke-HashcatRecovery {
     $script:StatusDecoder = $null
     $process = New-Object System.Diagnostics.Process
     $process.StartInfo = $startInfo
+    if ($hasSavedRestore) {
+        Set-WorkerActivity -Activity 'RestoringHashcat' -Message 'Restoring the saved local Hashcat checkpoint.'
+    }
+    else {
+        Set-WorkerActivity -Activity 'StartingHashcat' -Message 'Starting the local Hashcat backend.'
+    }
+    Publish-Progress -State 'Running' -Message $startupMessage -Result $null
     [void]$process.Start()
     $script:ActiveHashcatProcess = $process
     $standardOutputTask = Start-LocalStreamPump -Reader $process.StandardOutput -OutputPath $statusPath
@@ -896,7 +1114,6 @@ function Invoke-HashcatRecovery {
     $stopSent = $false
     $controlRequestedUtc = $null
     $lastStatusMessage = $startupMessage
-    Publish-Progress -State 'Running' -Message $startupMessage -Result $null
 
     while (-not $process.HasExited) {
         Import-HashcatStatusFile -StatusPath $statusPath
@@ -913,6 +1130,7 @@ function Invoke-HashcatRecovery {
                 $stopSent = $true
                 $controlRequestedUtc = [datetime]::UtcNow
                 $lastStatusMessage = 'Stopping local Hashcat. Hashcat session data remains in this local job folder when available.'
+                Set-WorkerActivity -Activity 'Stopping' -Message $lastStatusMessage
                 Publish-Progress -State 'Stopping' -Message $lastStatusMessage -Result $null
             }
         }
@@ -928,6 +1146,7 @@ function Invoke-HashcatRecovery {
                     $pauseSent = $true
                     $controlRequestedUtc = [datetime]::UtcNow
                     $lastStatusMessage = 'Pausing locally by saving the Hashcat session checkpoint.'
+                    Set-WorkerActivity -Activity 'Pausing' -Message $lastStatusMessage
                     Publish-Progress -State 'Pausing' -Message $lastStatusMessage -Result $null
                 }
                 catch {
@@ -935,6 +1154,7 @@ function Invoke-HashcatRecovery {
                         $process.Kill()
                     }
                     $script:TerminalState = 'Failed'
+                    Set-WorkerErrorContext -Code 'RUNTIME_ARTIFACT_CREATE_FAILED' -Function 'Invoke-HashcatRecovery' -ArtifactType 'Hashcat pause checkpoint'
                     Publish-Progress -State 'Failed' -Message ('Hashcat could not save the local pause checkpoint: ' + $_.Exception.Message) -Result $null
                     return
                 }
@@ -973,19 +1193,28 @@ function Invoke-HashcatRecovery {
     $script:ActiveHashcatProcess = $null
 
     if ($stopSent) {
+        $hasRestore = (Copy-HashcatRestoreCheckpoint -SourcePath $runtimeRestorePath -DestinationPath $persistentRestorePath -OverwriteDestination) -or (Test-Path -LiteralPath $persistentRestorePath -PathType Leaf)
         $script:TerminalState = 'Stopped'
-        Publish-Progress -State 'Stopped' -Message 'Stopped by the user. Hashcat session data remains in this local job folder when available.' -Result $null
+        $stopMessage = if ($hasRestore) {
+            'Stopped by the user. The local Hashcat checkpoint can be resumed.'
+        }
+        else {
+            'Stopped by the user. The local checkpoint can be resumed when available.'
+        }
+        Set-WorkerActivity -Activity 'Stopped' -Message $stopMessage
+        Publish-Progress -State 'Stopped' -Message $stopMessage -Result $null
         return
     }
     if ($pauseSent) {
         $script:TerminalState = 'Paused'
-        $hasRestore = Test-Path -LiteralPath $restorePath -PathType Leaf
+        $hasRestore = (Copy-HashcatRestoreCheckpoint -SourcePath $runtimeRestorePath -DestinationPath $persistentRestorePath -OverwriteDestination) -or (Test-Path -LiteralPath $persistentRestorePath -PathType Leaf)
         $pauseMessage = if ($hasRestore) {
             'Paused locally. Hashcat saved a local session checkpoint; Resume will launch the saved session.'
         }
         else {
             'Paused locally, but Hashcat did not leave a restore file. Resume will restart the current GPU stage.'
         }
+        Set-WorkerActivity -Activity 'Paused' -Message $pauseMessage
         Publish-Progress -State 'Paused' -Message $pauseMessage -Result $null
         return
     }
@@ -1001,17 +1230,20 @@ function Invoke-HashcatRecovery {
                 Verification    = 'NanaZip 7z t returned exit code 0 for the password reported by local Hashcat.'
                 VerifiedAtUtc   = [datetime]::UtcNow.ToString('o')
             }
+            Set-WorkerActivity -Activity 'Recovered' -Message 'Hashcat reported a password and NanaZip verified it locally.'
             Publish-Progress -State 'Recovered' -Message 'Hashcat reported a password and NanaZip verified it locally.' -Result $result
             return
         }
 
         $script:TerminalState = 'Failed'
+        Set-WorkerActivity -Activity 'Failed' -Message 'Hashcat reported a candidate, but NanaZip did not verify it.'
         Publish-Progress -State 'Failed' -Message 'Hashcat reported a candidate, but NanaZip did not verify it. The task was not marked as recovered.' -Result $null
         return
     }
 
     if ($processExitCode -notin @(0, 1)) {
         $script:TerminalState = 'Failed'
+        Set-WorkerActivity -Activity 'Failed' -Message 'The local Hashcat backend ended before a verified result was produced.'
         Publish-Progress -State 'Failed' -Message ('Local Hashcat ended with exit code {0} before a verified result was produced.' -f $processExitCode) -Result $null
         return
     }
@@ -1021,6 +1253,7 @@ function Invoke-HashcatRecovery {
     }
     else {
         $script:TerminalState = 'Exhausted'
+        Set-WorkerActivity -Activity 'Exhausted' -Message 'The selected local Hashcat GPU search completed without a verified password.'
         Publish-Progress -State 'Exhausted' -Message 'The selected local Hashcat GPU search completed without a verified password.' -Result $null
     }
 }
@@ -1286,6 +1519,7 @@ function Set-CumulativeStage {
     $script:StageBaseCandidates = [math]::Max(0L, $script:CandidatesTested - $script:StageCandidatesTested)
     $script:StageCoverageBaseCandidates = 0L
     $script:TotalCandidates = Get-RecoveryPlanCandidateCount -Job $job -StageNumber ([int]$Stage.StageNumber)
+    Set-WorkerActivity -Activity 'PreparingCoverage' -Message ('Preparing local coverage for stage {0}.' -f $Stage.DisplayName)
 }
 
 function Set-CumulativeCoverage {
@@ -1304,9 +1538,12 @@ function Set-CumulativeCoverage {
     $script:LastBackendSpeed = 0.0
     $script:CurrentCoverageName = [string]$Item.DisplayName
     $script:CoverageCandidateTotal = $Item.CandidateCount
+    $script:ResumeCoverageBase = if ($ResumeCoverage) { [long]$script:CoveragePosition } else { 0L }
     if (-not $ResumeCoverage) { $script:CoveragePosition = 0L }
     if ($script:CoveragePosition -lt 0) { $script:CoveragePosition = 0L }
     $script:CoverageCandidatesTested = $script:CoveragePosition
+    $script:RunCandidatesTested = 0L
+    $script:ProgressInvariantViolation = $false
     if ($script:StageCandidatesTested -lt $script:StageCoverageBaseCandidates) {
         $script:StageCandidatesTested = $script:StageCoverageBaseCandidates
     }
@@ -1315,6 +1552,7 @@ function Set-CumulativeCoverage {
     }
     Update-CoverageCheckpoint
     Save-CoverageState
+    Set-WorkerActivity -Activity 'PreparingCoverage' -Message ('Preparing local coverage: {0}.' -f $Item.DisplayName)
 }
 
 function Publish-PlanSkipped {
@@ -1331,7 +1569,6 @@ function Publish-PlanSkipped {
             Reason = $Reason
         })
     $script:StageMessage = $Reason
-    Publish-Progress -State 'Running' -Message ('Coverage {0} skipped: {1}' -f $Item.DisplayName, $Reason) -Result $null
     $script:CurrentCoverageId = ''
     $script:CurrentCoverageName = ''
     $script:CurrentCheckpoint = $null
@@ -1339,7 +1576,10 @@ function Publish-PlanSkipped {
     $script:CoverageCandidateTotal = $null
     $script:CoverageCandidatesTested = 0L
     $script:ActivePlanItem = $null
+    $script:ProgressInvariantViolation = $false
     Save-CoverageState
+    Set-WorkerActivity -Activity 'AdvancingCoverage' -Message ('Coverage {0} was skipped; advancing to the next local coverage.' -f $Item.DisplayName)
+    Publish-Progress -State 'Running' -Message ('Coverage {0} skipped: {1}' -f $Item.DisplayName, $Reason) -Result $null
 }
 
 function Publish-PlanAlreadyCompleted {
@@ -1352,6 +1592,7 @@ function Publish-PlanAlreadyCompleted {
     # do not touch the current coverage cursor: it may belong to a later paused
     # item that the outer loop has not reached yet.
     $script:StageMessage = ('Coverage {0} was already completed in this local job.' -f [string]$Item.DisplayName)
+    Set-WorkerActivity -Activity 'AdvancingCoverage' -Message 'Advancing to the next local coverage.'
     Publish-Progress -State 'Running' -Message $script:StageMessage -Result $null
 }
 
@@ -1710,6 +1951,8 @@ function Invoke-CumulativeRecovery {
             if ($item.PSObject.Properties.Name -contains 'EngineStrategy' -and [string]$item.EngineStrategy -eq 'Mask') {
                 $planningJob = Get-PlanJob -Item $item
             }
+            Set-WorkerActivity -Activity 'PreparingBackend' -Message ('Preparing the local backend for coverage: {0}.' -f $item.DisplayName)
+            Publish-Progress -State 'Running' -Message ('Preparing the local backend for coverage: ' + [string]$item.DisplayName) -Result $null
             if ($canGpu) {
                 $engine = Select-LocalEngine -Inspection $inspection -Strategy ([string]$item.EngineStrategy) -PlanningJob $planningJob
             }
@@ -1721,6 +1964,8 @@ function Invoke-CumulativeRecovery {
             $attackPlan = $null
             $planJob = $null
             if ($engine.UseGpu) {
+                Set-WorkerActivity -Activity 'PreparingDictionary' -Message ('Preparing local dictionary data for coverage: {0}.' -f $item.DisplayName)
+                Publish-Progress -State 'Running' -Message ('Preparing local dictionary data for coverage: ' + [string]$item.DisplayName) -Result $null
                 $dictionaryPaths = @(Get-PlanDictionaryPaths -Item $item)
                 if ($item.Kind -in @('BuiltinDictionary', 'CustomDictionary', 'RulesDictionary', 'CustomRules', 'HybridDictionary') -and $dictionaryPaths.Count -ne 1) {
                     $engine = New-CpuEngine -Message 'This coverage has multiple local dictionary streams; CPU streaming was selected.'
@@ -1730,7 +1975,9 @@ function Invoke-CumulativeRecovery {
                     if ($dictionaryPaths.Count -eq 1) { $planDictionaryPath = [string]$dictionaryPaths[0] }
                     $planJob = Get-PlanJob -Item $item -DictionaryPath $planDictionaryPath
                     $projectRoot = Split-Path $PSScriptRoot -Parent
-                    New-Item -ItemType Directory -Path $script:RuntimeDirectory -Force | Out-Null
+                    if (-not (Test-Path -LiteralPath $script:RuntimeDirectory -PathType Container)) {
+                        New-Item -ItemType Directory -Path $script:RuntimeDirectory -ErrorAction Stop | Out-Null
+                    }
                     $artifact = New-ArchiveHashcatArtifact -ArchivePath ([string]$job.ArchivePath) -ArchiveFormat ([string]$inspection.Format) -JobDirectory $script:RuntimeDirectory -ProjectRoot $projectRoot
                     if (-not $artifact.Supported) {
                         $engine = New-CpuEngine -Message ($artifact.Message + ' CPU fallback was selected.')
@@ -1747,6 +1994,7 @@ function Invoke-CumulativeRecovery {
             $script:EngineLabel = $engine.Label
             $script:BackendName = $engine.Backend
             $script:ComputeDevice = $engine.ComputeDevice
+            Set-WorkerActivity -Activity 'RunningCoverage' -Message ($engine.Message + ' Coverage: ' + [string]$item.DisplayName)
             Publish-Progress -State 'Running' -Message ($engine.Message + ' Coverage: ' + [string]$item.DisplayName) -Result $null
             if ($engine.UseGpu) {
                 Invoke-HashcatRecovery -SevenZip $sevenZip -Engine $engine -Artifact $artifact -AttackPlan $attackPlan -StageNumber $stageNumber -ResumeStage:$resumeThisCoverage
@@ -1767,6 +2015,8 @@ function Invoke-CumulativeRecovery {
                 Complete-CoverageItem -Item $item
                 if ($null -ne $item.CandidateCount) { $stageCompletedKnown += [long]$item.CandidateCount }
                 $script:TerminalState = $null
+                Set-WorkerActivity -Activity 'AdvancingCoverage' -Message 'Coverage completed; advancing to the next local coverage.'
+                Publish-Progress -State 'Running' -Message 'Coverage completed; advancing to the next local coverage.' -Result $null
             }
             else {
                 $script:TerminalState = 'Failed'
@@ -1779,6 +2029,7 @@ function Invoke-CumulativeRecovery {
 
         $script:StageStatus = 'Completed'
         $script:StageMessage = 'All planned coverage items in this stage completed without recovering a password.'
+        Set-WorkerActivity -Activity 'AdvancingCoverage' -Message ('Stage {0} completed; advancing to the next local stage.' -f $stage.DisplayName)
         Publish-Progress -State 'Running' -Message ('Stage {0} completed without recovering a password.' -f $stage.DisplayName) -Result $null
     }
 
@@ -1786,6 +2037,7 @@ function Invoke-CumulativeRecovery {
     $script:StageStatus = 'Completed'
     $script:StageMessage = 'All selected recovery coverage completed without recovering a password.'
     if ($script:SkippedStages.Count -gt 0) { $script:StageMessage += ' Skipped coverage was recorded in the local progress file.' }
+    Set-WorkerActivity -Activity 'Exhausted' -Message 'All selected local coverage completed without recovering a password.'
     Publish-Progress -State 'Exhausted' -Message $script:StageMessage -Result $null
 }
 
@@ -1814,6 +2066,7 @@ function Set-CurrentStage {
         # The stage readiness check below will publish a user-facing reason.
         $script:TotalCandidates = $null
     }
+    Set-WorkerActivity -Activity 'PreparingCoverage' -Message ('Preparing local coverage for stage {0}.' -f $Stage.DisplayName)
 }
 
 function Get-StageReadiness {
@@ -1884,10 +2137,13 @@ function Publish-StageSkipped {
             StageName   = [string]$Stage.DisplayName
             Reason      = $Reason
         })
+    Set-WorkerActivity -Activity 'AdvancingCoverage' -Message ('Stage {0} was skipped; advancing to the next local stage.' -f $Stage.DisplayName)
     Publish-Progress -State 'Running' -Message ('Stage {0} skipped: {1}' -f $Stage.DisplayName, $Reason) -Result $null
 }
 
 try {
+    Set-WorkerActivity -Activity 'PreparingBackend' -Message 'Preparing the local recovery backend.'
+    Publish-Progress -State 'Running' -Message 'Preparing the local recovery backend.' -Result $null -InitialSnapshot
     if ($script:IsCumulativeJob) {
         Invoke-CumulativeRecovery
         exit 0
@@ -1899,6 +2155,7 @@ try {
 
     if ($inspection.EncryptionState -eq 'No') {
         $script:TerminalState = 'NotEncrypted'
+        Set-WorkerActivity -Activity 'Finalizing' -Message 'The archive does not require a password.'
         Publish-Progress -State 'NotEncrypted' -Message 'The archive metadata indicates that no password is required; recovery was not started.' -Result $null
         exit 0
     }
@@ -1916,6 +2173,8 @@ try {
             continue
         }
 
+        Set-WorkerActivity -Activity 'PreparingBackend' -Message ('Preparing the local backend for stage {0}.' -f $stage.DisplayName)
+        Publish-Progress -State 'Running' -Message ('Preparing the local backend for stage ' + [string]$stage.DisplayName) -Result $null
         $engine = Select-LocalEngine -Inspection $inspection -Strategy ([string]$stage.Strategy)
         $script:EngineLabel = $engine.Label
         $script:BackendName = $engine.Backend
@@ -1925,7 +2184,11 @@ try {
         $attackPlan = $null
         if ($engine.UseGpu) {
             $projectRoot = Split-Path $PSScriptRoot -Parent
-            New-Item -ItemType Directory -Path $script:RuntimeDirectory -Force | Out-Null
+            Set-WorkerActivity -Activity 'PreparingDictionary' -Message ('Preparing local attack data for stage {0}.' -f $stage.DisplayName)
+            Publish-Progress -State 'Running' -Message ('Preparing local attack data for stage ' + [string]$stage.DisplayName) -Result $null
+            if (-not (Test-Path -LiteralPath $script:RuntimeDirectory -PathType Container)) {
+                New-Item -ItemType Directory -Path $script:RuntimeDirectory -ErrorAction Stop | Out-Null
+            }
             $artifact = New-ArchiveHashcatArtifact -ArchivePath ([string]$job.ArchivePath) -ArchiveFormat ([string]$inspection.Format) -JobDirectory $script:RuntimeDirectory -ProjectRoot $projectRoot
             if (-not $artifact.Supported) {
                 $engine = New-CpuEngine -Label 'CPU / NanaZip fallback' -Message ($artifact.Message + ' CPU fallback was selected.')
@@ -1945,10 +2208,12 @@ try {
         }
 
         if ($engine.UseGpu) {
+            Set-WorkerActivity -Activity 'RunningCoverage' -Message ($engine.Message + ' ' + $artifact.Message)
             Publish-Progress -State 'Running' -Message ($engine.Message + ' ' + $artifact.Message) -Result $null
             Invoke-HashcatRecovery -SevenZip $sevenZip -Engine $engine -Artifact $artifact -AttackPlan $attackPlan -StageNumber ([int]$stage.StageNumber) -ResumeStage:$resumeThisStage
         }
         else {
+            Set-WorkerActivity -Activity 'RunningCoverage' -Message $engine.Message
             Publish-Progress -State 'Running' -Message $engine.Message -Result $null
             $skipCount = $script:StageCandidatesTested
 
@@ -1971,6 +2236,7 @@ try {
 
         $script:StageStatus = 'Completed'
         $script:StageMessage = 'No verified password was found in this stage.'
+        Set-WorkerActivity -Activity 'AdvancingCoverage' -Message ('Stage {0} completed; advancing to the next local stage.' -f $stage.DisplayName)
         Publish-Progress -State 'Running' -Message ('Stage {0} completed without recovering a password.' -f $stage.DisplayName) -Result $null
     }
 
@@ -1980,6 +2246,7 @@ try {
         if ($script:SkippedStages.Count -gt 0) {
             $script:StageMessage += ' Skipped stages were recorded in the local progress file.'
         }
+        Set-WorkerActivity -Activity 'Exhausted' -Message 'All selected local coverage completed without recovering a password.'
         Publish-Progress -State 'Exhausted' -Message $script:StageMessage -Result $null
     }
     exit 0
@@ -1987,8 +2254,24 @@ try {
 catch {
     Stop-ActiveHashcatProcess
     $script:TerminalState = 'Failed'
+    $rawErrorMessage = [string]$_.Exception.Message
+    if ([string]::IsNullOrWhiteSpace([string]$script:ErrorCode)) {
+        if ($rawErrorMessage -match '(?i)already exists|file exists|cannot create the file|文件已存在|无法创建该文件') {
+            Set-WorkerErrorContext -Code 'RUNTIME_ARTIFACT_CREATE_FAILED' -Function 'RecoveryWorker' -ArtifactType 'local Runtime artifact'
+        }
+        else {
+            Set-WorkerErrorContext -Code 'WORKER_FAILED' -Function 'RecoveryWorker' -ArtifactType 'local recovery task'
+        }
+    }
+    $friendlyErrorMessage = if ([string]$script:ErrorCode -eq 'RUNTIME_ARTIFACT_CREATE_FAILED') {
+        'The local recovery runtime artifact could not be created. The task was not marked as recovered.'
+    }
+    else {
+        $rawErrorMessage
+    }
+    Set-WorkerActivity -Activity 'Failed' -Message $friendlyErrorMessage
     try {
-        Publish-Progress -State 'Failed' -Message $_.Exception.Message -Result $null
+        Publish-Progress -State 'Failed' -Message $friendlyErrorMessage -Result $null
     }
     catch {
         Write-Error $_
@@ -1996,7 +2279,9 @@ catch {
     exit 1
 }
 finally {
-    if ($script:TerminalState -in @('Recovered', 'Exhausted', 'Failed', 'Stopped', 'NotEncrypted')) {
+    # Keep a failed RunId directory for the next startup cleanup and local
+    # diagnostics; successful/stopped runs retain only their persistent state.
+    if ($script:TerminalState -in @('Recovered', 'Exhausted', 'Stopped', 'NotEncrypted')) {
         try { Clear-RecoveryRuntime -RuntimeDirectory $script:RuntimeDirectory | Out-Null } catch { }
     }
 }
