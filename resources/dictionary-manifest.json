@@ -1,0 +1,146 @@
+﻿{
+    "SchemaVersion":  1,
+    "ResourceVersion":  "v1",
+    "GeneratedUtc":  "2026-08-27T08:21:11.0155110Z",
+    "Description":  "Ordered, mutually-exclusive offline password candidates for ArchivePasswordRecovery.",
+    "Sources":  [
+                    {
+                        "Id":  "project-curated-offline-v1",
+                        "Type":  "ProjectCurated",
+                        "Description":  "Existing Quick baseline plus small project-curated candidates and bounded structural expansions used as fallback and source completion.",
+                        "ExternalDownload":  false,
+                        "UsedFor":  [
+                                        "global L1/L2/L3",
+                                        "Chinese L1/L2/L3"
+                                    ]
+                    },
+                    {
+                        "Id":  "SecLists-official-master-2026-08-27",
+                        "Type":  "SecLists",
+                        "Repository":  "https://gitlab.com/pentesting-tools/SecLists",
+                        "License":  "MIT",
+                        "LicenseFile":  "resources/licenses/SecLists-LICENSE.txt",
+                        "PackageVersion":  "Kali seclists package was absent; official SecLists master snapshot downloaded at build time on 2026-08-27.",
+                        "Files":  [
+                                      {
+                                          "Name":  "xato-net-10-million-passwords-1000.txt",
+                                          "Role":  "global",
+                                          "Level":  1,
+                                          "OriginalKaliPath":  "/usr/share/seclists/Passwords/Common-Credentials/xato-net-10-million-passwords-1000.txt",
+                                          "OfficialUrl":  "https://gitlab.com/pentesting-tools/SecLists/-/raw/master/Passwords/Common-Credentials/xato-net-10-million-passwords-1000.txt"
+                                      },
+                                      {
+                                          "Name":  "xato-net-10-million-passwords-10000.txt",
+                                          "Role":  "global",
+                                          "Level":  2,
+                                          "OriginalKaliPath":  "/usr/share/seclists/Passwords/Common-Credentials/xato-net-10-million-passwords-10000.txt",
+                                          "OfficialUrl":  "https://gitlab.com/pentesting-tools/SecLists/-/raw/master/Passwords/Common-Credentials/xato-net-10-million-passwords-10000.txt"
+                                      },
+                                      {
+                                          "Name":  "xato-net-10-million-passwords-100000.txt",
+                                          "Role":  "global",
+                                          "Level":  3,
+                                          "OriginalKaliPath":  "/usr/share/seclists/Passwords/Common-Credentials/xato-net-10-million-passwords-100000.txt",
+                                          "OfficialUrl":  "https://gitlab.com/pentesting-tools/SecLists/-/raw/master/Passwords/Common-Credentials/xato-net-10-million-passwords-100000.txt"
+                                      },
+                                      {
+                                          "Name":  "Chinese-common-password-list-top-1000.txt",
+                                          "Role":  "zh",
+                                          "Level":  1,
+                                          "OriginalKaliPath":  "/usr/share/seclists/Passwords/Common-Credentials/Language-Specific/Chinese-common-password-list-top-1000.txt",
+                                          "OfficialUrl":  "https://gitlab.com/pentesting-tools/SecLists/-/raw/master/Passwords/Common-Credentials/Language-Specific/Chinese-common-password-list-top-1000.txt"
+                                      },
+                                      {
+                                          "Name":  "Chinese-common-password-list-top-10000.txt",
+                                          "Role":  "zh",
+                                          "Level":  2,
+                                          "OriginalKaliPath":  "/usr/share/seclists/Passwords/Common-Credentials/Language-Specific/Chinese-common-password-list-top-10000.txt",
+                                          "OfficialUrl":  "https://gitlab.com/pentesting-tools/SecLists/-/raw/master/Passwords/Common-Credentials/Language-Specific/Chinese-common-password-list-top-10000.txt"
+                                      },
+                                      {
+                                          "Name":  "Chinese-common-password-list-top-100000.txt",
+                                          "Role":  "zh",
+                                          "Level":  3,
+                                          "OriginalKaliPath":  "/usr/share/seclists/Passwords/Common-Credentials/Language-Specific/Chinese-common-password-list-top-100000.txt",
+                                          "OfficialUrl":  "https://gitlab.com/pentesting-tools/SecLists/-/raw/master/Passwords/Common-Credentials/Language-Specific/Chinese-common-password-list-top-100000.txt"
+                                      }
+                                  ],
+                        "UsedFor":  [
+                                        "global L1/L2/L3",
+                                        "Chinese L1/L2/L3"
+                                    ]
+                    },
+                    {
+                        "Id":  "kali-readonly-check-2026-08-27",
+                        "Type":  "KaliReadOnlyInventory",
+                        "Description":  "Checked through Windows wsl.exe -d kali-linux before the authorized source download.",
+                        "Found":  [
+                                      "/usr/share/wordlists/rockyou.txt.gz"
+                                  ],
+                        "NotPackaged":  [
+                                            "/usr/share/wordlists/rockyou.txt.gz",
+                                            "/usr/share/seclists",
+                                            "/usr/share/john/password.lst"
+                                        ],
+                        "UsedFor":  [
+                                        "advanced user import record only"
+                                    ]
+                    }
+                ],
+    "Dictionaries":  [
+                         {
+                             "Id":  "builtin:L1-global:v1",
+                             "CoverageId":  "builtin:L1-global:v1",
+                             "Language":  "global",
+                             "Level":  1,
+                             "CandidateCount":  1000,
+                             "RelativePath":  "resources/dictionaries/level1-global.txt.gz",
+                             "Source":  "SecLists + project-curated-offline-v1"
+                         },
+                         {
+                             "Id":  "builtin:L2-global:v1",
+                             "CoverageId":  "builtin:L2-global:v1",
+                             "Language":  "global",
+                             "Level":  2,
+                             "CandidateCount":  9000,
+                             "RelativePath":  "resources/dictionaries/level2-global.txt.gz",
+                             "Source":  "SecLists + project-curated-offline-v1"
+                         },
+                         {
+                             "Id":  "builtin:L3-global:v1",
+                             "CoverageId":  "builtin:L3-global:v1",
+                             "Language":  "global",
+                             "Level":  3,
+                             "CandidateCount":  90000,
+                             "RelativePath":  "resources/dictionaries/level3-global.txt.gz",
+                             "Source":  "SecLists + project-curated-offline-v1"
+                         },
+                         {
+                             "Id":  "builtin:L1-zh:v1",
+                             "CoverageId":  "builtin:L1-zh:v1",
+                             "Language":  "zh",
+                             "Level":  1,
+                             "CandidateCount":  1000,
+                             "RelativePath":  "resources/dictionaries/level1-zh.txt.gz",
+                             "Source":  "SecLists + project-curated-offline-v1"
+                         },
+                         {
+                             "Id":  "builtin:L2-zh:v1",
+                             "CoverageId":  "builtin:L2-zh:v1",
+                             "Language":  "zh",
+                             "Level":  2,
+                             "CandidateCount":  9000,
+                             "RelativePath":  "resources/dictionaries/level2-zh.txt.gz",
+                             "Source":  "SecLists + project-curated-offline-v1"
+                         },
+                         {
+                             "Id":  "builtin:L3-zh:v1",
+                             "CoverageId":  "builtin:L3-zh:v1",
+                             "Language":  "zh",
+                             "Level":  3,
+                             "CandidateCount":  90000,
+                             "RelativePath":  "resources/dictionaries/level3-zh.txt.gz",
+                             "Source":  "SecLists + project-curated-offline-v1"
+                         }
+                     ]
+}

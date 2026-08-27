@@ -1,0 +1,44 @@
+# OS / editor
+.DS_Store
+Thumbs.db
+desktop.ini
+*.swp
+*.tmp
+*.temp
+*~
+
+# PowerShell / debug leftovers
+*.log
+*.pid
+
+# Local temporary/staging directories
+/tmp/
+/temp/
+/staging/
+/backup/
+/backups/
+
+# Local audit/export packages at the project root
+/*-AUDIT-*.zip
+/*-POST-FIX-*.zip
+/ArchivePasswordRecovery-*.zip
+
+# Hashcat temporary/runtime artifacts
+*.restore
+hashcat.restore
+hashcat.potfile
+
+# Accidental runtime output at the project root
+/Runtime/
+/Jobs/
+
+# Common local test output at the project root
+/test-output/
+/test-results/
+/artifacts/
+
+# Tests and fixtures may intentionally contain log/restore files.
+!tests/**/*.log
+!tests/**/*.restore
+!test-fixtures/**/*.log
+!test-fixtures/**/*.restore

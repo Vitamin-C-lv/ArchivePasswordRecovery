@@ -1,0 +1,6 @@
+7z2hashcat upstream credits:
+
+Project: philsmd/7z2hashcat
+Release: Version 2.0 (Windows release)
+
+The upstream project states that 7z2hashcat belongs to the public domain, was donated to hashcat, and that credits must go to hashcat and philsmd. The upstream release README also credits the perl module authors and pp (PAR Packager) used to generate the Windows executable.

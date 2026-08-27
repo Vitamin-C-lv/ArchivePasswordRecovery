@@ -1,0 +1,10 @@
+Upstream repository: https://github.com/philsmd/7z2hashcat
+Upstream release: https://github.com/philsmd/7z2hashcat/releases/tag/2.0
+Release asset: 7z2hashcat64-2.0.zip
+Contained executable: 7z2hashcat64-2.0.exe
+
+Local executable: tools\extractors\7z2hashcat.exe
+Verification performed: 2026-08-28
+Verification method: direct byte-for-byte comparison of the local executable and the extracted official 64-bit release executable; file sizes were both 5,526,057 bytes and the comparison was equal.
+
+The application uses the local executable offline and does not download, update, or contact the upstream project at runtime.
