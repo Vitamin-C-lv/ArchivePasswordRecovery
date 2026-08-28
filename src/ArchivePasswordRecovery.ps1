@@ -832,6 +832,57 @@ function Format-LocalEta {
     return (Format-LocalDuration -Seconds $value)
 }
 
+function Format-LocalEtaRange {
+    param($LowSeconds, $HighSeconds)
+
+    if ($null -eq $LowSeconds -or $null -eq $HighSeconds) { return '无法可靠估算' }
+    try {
+        [double]$low = [double]$LowSeconds
+        [double]$high = [double]$HighSeconds
+    }
+    catch {
+        return '无法可靠估算'
+    }
+    if ($low -lt 0 -or $high -lt 0) { return '无法可靠估算' }
+    if ($high -lt $low) { $high = $low }
+    if ([math]::Abs($high - $low) -lt 0.5) { return (Format-LocalEta -Seconds $low) }
+    $lowText = Format-LocalDuration -Seconds $low
+    $highText = Format-LocalDuration -Seconds $high
+    if ($lowText.StartsWith('约 ')) { $lowText = $lowText.Substring(2) }
+    if ($highText.StartsWith('约 ')) { $highText = $highText.Substring(2) }
+    return ('约 {0}–{1}' -f $lowText, $highText)
+}
+
+function Get-OverallEtaPrimaryText {
+    param(
+        [string]$DisplayState,
+        [string]$Readiness,
+        $EtaSeconds,
+        $EtaLowSeconds,
+        $EtaHighSeconds,
+        [bool]$InvariantViolation = $false,
+        [string]$Activity = '',
+        [bool]$HasValidHistory = $false
+    )
+
+    if ($DisplayState -eq 'Recovered') { return '已找到密码' }
+    if ($DisplayState -eq 'Exhausted') { return '已完成' }
+    if ($InvariantViolation) { return '正在同步…' }
+    if ($Readiness -eq 'Calibrating') { return '正在校准…' }
+    if ($Readiness -eq 'Preliminary' -and $null -ne $EtaLowSeconds -and $null -ne $EtaHighSeconds) {
+        return (Format-LocalEtaRange -LowSeconds $EtaLowSeconds -HighSeconds $EtaHighSeconds)
+    }
+    if ($Readiness -eq 'Stable' -and $null -ne $EtaSeconds) {
+        try {
+            if ([double]$EtaSeconds -ge 0) { return (Format-LocalEta -Seconds $EtaSeconds) }
+        }
+        catch { }
+    }
+    if ($Activity -in @('Pausing', 'Paused', 'Stopping', 'Stopped')) { return '继续搜索后更新' }
+    if ($HasValidHistory) { return '正在重新校正' }
+    return '开始搜索后显示'
+}
+
 function Update-DeviceInfo {
     $devices = @(Get-LocalComputeDevices)
     $gpuDescriptions = @($devices | Where-Object { $_.Kind -eq 'GPU' } | ForEach-Object { Convert-ComputeDeviceName -Value $_.ChoiceName })
@@ -1449,9 +1500,50 @@ function Update-ProgressFromDisk {
         if ($overallTotalReadiness -eq 'Partial') { $overallCandidatesPartial = $true }
         $overallSpeed = if ($progress.PSObject.Properties.Name -contains 'OverallSpeed') { $progress.OverallSpeed } elseif ($progress.PSObject.Properties.Name -contains 'SpeedPerSecond') { $progress.SpeedPerSecond } else { $null }
         $overallEta = if ($progress.PSObject.Properties.Name -contains 'DisplayedPlanEtaSeconds') { $progress.DisplayedPlanEtaSeconds } elseif ($progress.PSObject.Properties.Name -contains 'OverallEtaSeconds') { $progress.OverallEtaSeconds } else { $null }
-        $overallEtaReadiness = if ($progress.PSObject.Properties.Name -contains 'OverallEtaReadiness' -and -not [string]::IsNullOrWhiteSpace([string]$progress.OverallEtaReadiness)) { [string]$progress.OverallEtaReadiness } else { 'Unavailable' }
+        $overallEtaLow = if ($progress.PSObject.Properties.Name -contains 'DisplayedPlanEtaLowSeconds' -and $null -ne $progress.DisplayedPlanEtaLowSeconds) {
+            $progress.DisplayedPlanEtaLowSeconds
+        }
+        elseif ($progress.PSObject.Properties.Name -contains 'PlanEtaLowSeconds') {
+            $progress.PlanEtaLowSeconds
+        }
+        else { $null }
+        $overallEtaHigh = if ($progress.PSObject.Properties.Name -contains 'DisplayedPlanEtaHighSeconds' -and $null -ne $progress.DisplayedPlanEtaHighSeconds) {
+            $progress.DisplayedPlanEtaHighSeconds
+        }
+        elseif ($progress.PSObject.Properties.Name -contains 'PlanEtaHighSeconds') {
+            $progress.PlanEtaHighSeconds
+        }
+        else { $null }
+        $overallEtaReadiness = if ($progress.PSObject.Properties.Name -contains 'EtaReadiness' -and
+            [string]$progress.EtaReadiness -in @('Calibrating', 'Preliminary', 'Stable')) {
+            [string]$progress.EtaReadiness
+        }
+        elseif ($progress.PSObject.Properties.Name -contains 'OverallEtaReadiness' -and
+            [string]$progress.OverallEtaReadiness -in @('Calibrating', 'Preliminary', 'Stable')) {
+            [string]$progress.OverallEtaReadiness
+        }
+        else { 'Unavailable' }
         $overallEtaHasValidHistory = $progress.PSObject.Properties.Name -contains 'OverallEtaHasValidHistory' -and [bool]$progress.OverallEtaHasValidHistory
         $overallEtaIsHeld = $progress.PSObject.Properties.Name -contains 'OverallEtaIsHeld' -and [bool]$progress.OverallEtaIsHeld
+        $overallEtaKnownLowerBound = if ($progress.PSObject.Properties.Name -contains 'PlanEtaKnownLowerBoundSeconds') { $progress.PlanEtaKnownLowerBoundSeconds } else { $null }
+        [int]$requiredSpeedClassCount = 0
+        [int]$calibratedRequiredSpeedClassCount = 0
+        try {
+            if ($progress.PSObject.Properties.Name -contains 'RequiredFutureSpeedClassCount' -and $null -ne $progress.RequiredFutureSpeedClassCount) {
+                $requiredSpeedClassCount = [int]$progress.RequiredFutureSpeedClassCount
+            }
+            elseif ($progress.PSObject.Properties.Name -contains 'RequiredSpeedClassCount' -and $null -ne $progress.RequiredSpeedClassCount) {
+                $requiredSpeedClassCount = [int]$progress.RequiredSpeedClassCount
+            }
+            if ($progress.PSObject.Properties.Name -contains 'CalibratedRequiredSpeedClassCount' -and $null -ne $progress.CalibratedRequiredSpeedClassCount) {
+                $calibratedRequiredSpeedClassCount = [int]$progress.CalibratedRequiredSpeedClassCount
+            }
+        }
+        catch {
+            $requiredSpeedClassCount = 0
+            $calibratedRequiredSpeedClassCount = 0
+        }
+        $etaCalibrationCoverage = if ($progress.PSObject.Properties.Name -contains 'EtaCalibrationCoverage') { $progress.EtaCalibrationCoverage } else { $null }
         [int]$unestimatedCoverageCount = 0
         try { if ($progress.PSObject.Properties.Name -contains 'UnestimatedCoverageCount' -and $null -ne $progress.UnestimatedCoverageCount) { $unestimatedCoverageCount = [int]$progress.UnestimatedCoverageCount } } catch { $unestimatedCoverageCount = 0 }
         $planEtaAdjustmentReason = if ($progress.PSObject.Properties.Name -contains 'PlanEtaAdjustmentReason') { [string]$progress.PlanEtaAdjustmentReason } else { '' }
@@ -1537,54 +1629,50 @@ function Update-ProgressFromDisk {
             $controls.OverallSpeedValue.Text = '开始搜索后显示'
         }
 
-        if ($displayState -eq 'Recovered') {
-            $controls.OverallEtaValue.Text = '已找到密码'
-        }
-        elseif ($displayState -eq 'Exhausted') {
-            $controls.OverallEtaValue.Text = '已完成'
-        }
-        elseif ($null -ne $overallEta -and [double]$overallEta -ge 0 -and -not $overallInvariantViolation) {
-            $etaText = Format-LocalEta -Seconds $overallEta
-            if ($unestimatedCoverageCount -gt 0 -and [double]$overallEta -gt 0) { $etaText += '以上' }
-            $controls.OverallEtaValue.Text = $etaText
-        }
-        elseif ($overallInvariantViolation) {
-            $controls.OverallEtaValue.Text = '正在同步…'
-        }
-        elseif ($activity -in @('Pausing', 'Paused', 'Stopping', 'Stopped')) {
-            $controls.OverallEtaValue.Text = '继续搜索后更新'
-        }
-        elseif ($overallEtaHasValidHistory) {
-            $controls.OverallEtaValue.Text = '正在重新校正'
-        }
-        else {
-            $controls.OverallEtaValue.Text = '开始搜索后显示'
-        }
+        $controls.OverallEtaValue.Text = Get-OverallEtaPrimaryText -DisplayState $displayState -Readiness $overallEtaReadiness -EtaSeconds $overallEta -EtaLowSeconds $overallEtaLow -EtaHighSeconds $overallEtaHigh -InvariantViolation:$overallInvariantViolation -Activity $activity -HasValidHistory:$overallEtaHasValidHistory
 
         $overallHelperText = ''
-        if ($overallEtaIsHeld -and $null -ne $overallEta -and -not $overallInvariantViolation) {
+        if ($overallEtaReadiness -eq 'Calibrating') {
+            $calibrationParts = New-Object 'System.Collections.Generic.List[string]'
+            if ($planEtaAdjustmentReason -eq 'StructuralRecalibration') {
+                [void]$calibrationParts.Add('计算设备或恢复计划已变化，正在重新校准预计时间')
+            }
+            else {
+                [void]$calibrationParts.Add('正在根据实际 CPU/GPU 搜索速度校准预计时间')
+            }
+            if ($requiredSpeedClassCount -gt 0) {
+                [void]$calibrationParts.Add(('已校准 {0} / {1} 类搜索速度' -f $calibratedRequiredSpeedClassCount, $requiredSpeedClassCount))
+            }
+            if ($null -ne $overallEtaKnownLowerBound) {
+                try {
+                    if ([double]$overallEtaKnownLowerBound -gt 0) {
+                        [void]$calibrationParts.Add(('已确认的搜索范围至少还需{0}，其余范围仍在校准' -f (Format-LocalDuration -Seconds $overallEtaKnownLowerBound)))
+                    }
+                }
+                catch { }
+            }
+            $overallHelperText = $calibrationParts -join '；'
+        }
+        elseif ($overallEtaIsHeld -and $null -ne $overallEta -and -not $overallInvariantViolation) {
             $overallHelperText = '正在准备下一搜索范围，预计时间按最近有效速度保持并将在搜索开始后校正'
         }
         elseif ($planEtaAdjustmentReason -eq 'StructuralRecalibration') {
             $overallHelperText = '已根据当前搜索范围重新校正预计时间'
         }
-        elseif ($overallEtaReadiness -eq 'Calibrating') {
-            $overallHelperText = '正在校准后续搜索范围速度，预计时间会自动修正'
+        elseif ($overallEtaReadiness -eq 'Preliminary') {
+            $overallHelperText = '初步预计；按当前已校准速度和未完成范围的保守区间估算'
+            if ($requiredSpeedClassCount -gt $calibratedRequiredSpeedClassCount) {
+                $overallHelperText += ('；仍有 {0} 类搜索速度正在校准，预计时间可能继续调整' -f ($requiredSpeedClassCount - $calibratedRequiredSpeedClassCount))
+            }
+        }
+        elseif ($overallEtaReadiness -eq 'Stable') {
+            $overallHelperText = '稳定预计；按当前恢复计划和已校准速度估算'
         }
         elseif ($overallEtaReadiness -eq 'Unavailable' -and -not $overallEtaHasValidHistory) {
             $overallHelperText = '整体搜索计划正在准备，完成后显示完整总量与预计完成时间'
         }
         elseif ($null -eq $overallEta -and $overallSpeedNumber -le 0 -and -not $overallEtaHasValidHistory -and $displayState -notin @('Recovered', 'Exhausted')) {
             $overallHelperText = '开始搜索后显示当前搜索速度与预计完成时间'
-        }
-        if ($overallEtaReadiness -eq 'Partial') {
-            $partialHelper = if ($unestimatedCoverageCount -gt 0) {
-                '另有 {0} 个搜索范围暂无法预估耗时，当前预计为已知范围耗时之和' -f $unestimatedCoverageCount
-            }
-            else {
-                '当前为基于已知范围的预计，后续范围总量补齐后会自动修正'
-            }
-            $overallHelperText = if ([string]::IsNullOrWhiteSpace($overallHelperText)) { $partialHelper } else { $overallHelperText + '；' + $partialHelper }
         }
         $controls.OverallProgressHelper.Text = $overallHelperText
         $controls.OverallProgressHelper.Visibility = if ([string]::IsNullOrWhiteSpace($overallHelperText)) { [System.Windows.Visibility]::Collapsed } else { [System.Windows.Visibility]::Visible }

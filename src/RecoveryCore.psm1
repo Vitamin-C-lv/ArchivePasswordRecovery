@@ -2034,22 +2034,82 @@ function Get-CoverageDurationSumEta {
     [int]$estimatedCoverageCount = 0
     [int]$unestimatedCoverageCount = 0
     [int]$remainingCoverageCount = 0
-    [bool]$requiresCalibration = $false
+    [int]$remainingPlanItemCount = 0
     [bool]$usedFallbackSpeed = $false
     [bool]$usedCompatibleProfile = $false
     [bool]$currentCoverageSpeedIsStable = $false
     [string]$currentCoverageSpeedSource = ''
     $structureParts = New-Object 'System.Collections.Generic.List[string]'
+    $planIdentityParts = New-Object 'System.Collections.Generic.List[string]'
+    $speedClasses = @{}
+
+    # Plan identity deliberately excludes speed sources and completed state.
+    # A new sample must not look like a new plan: only a changed execution
+    # class/composition is allowed to start a new ETA model epoch in Worker.
+    foreach ($coverageId in $planIds) {
+        $identityItem = if ($itemById.ContainsKey([string]$coverageId)) {
+            $itemById[[string]$coverageId]
+        }
+        else {
+            [pscustomobject]@{ CoverageId = [string]$coverageId }
+        }
+        $identityArchiveClass = [string](Get-ObjectPropertyValue -Object $identityItem -Name 'ArchiveBackendClass' -Default '')
+        $identityComputeClass = [string](Get-ObjectPropertyValue -Object $identityItem -Name 'ComputeBackendClass' -Default '')
+        $identityFamily = [string](Get-ObjectPropertyValue -Object $identityItem -Name 'AttackFamily' -Default '')
+        $identitySpeedClass = [string](Get-ObjectPropertyValue -Object $identityItem -Name 'SpeedClassKey' -Default '')
+        if ([string]::IsNullOrWhiteSpace($identitySpeedClass)) {
+            $identitySpeedClass = '{0}|{1}|{2}' -f $identityArchiveClass, $identityComputeClass, $identityFamily
+        }
+        [void]$planIdentityParts.Add(('{0}={1}' -f [string]$coverageId, $identitySpeedClass))
+    }
 
     foreach ($coverageId in $planIds) {
+        $isCurrent = [string]::Equals([string]$coverageId, $CurrentCoverageId, [System.StringComparison]::Ordinal)
+        $item = if ($itemById.ContainsKey([string]$coverageId)) {
+            $itemById[[string]$coverageId]
+        }
+        else {
+            [pscustomobject]@{ CoverageId = [string]$coverageId }
+        }
+
+        $itemArchiveClass = [string](Get-ObjectPropertyValue -Object $item -Name 'ArchiveBackendClass' -Default '')
+        $itemComputeClass = [string](Get-ObjectPropertyValue -Object $item -Name 'ComputeBackendClass' -Default '')
+        $itemFamily = [string](Get-ObjectPropertyValue -Object $item -Name 'AttackFamily' -Default '')
+        $speedClassKey = [string](Get-ObjectPropertyValue -Object $item -Name 'SpeedClassKey' -Default '')
+        if ([string]::IsNullOrWhiteSpace($speedClassKey)) {
+            $speedClassKey = '{0}|{1}|{2}' -f $itemArchiveClass, $itemComputeClass, $itemFamily
+        }
+        if ([string]::IsNullOrWhiteSpace($speedClassKey)) {
+            $speedClassKey = 'coverage:' + [string]$coverageId
+        }
+        if (-not $speedClasses.ContainsKey($speedClassKey)) {
+            $speedClasses[$speedClassKey] = [pscustomobject]@{
+                SpeedClassKey = $speedClassKey
+                ArchiveBackendClass = $itemArchiveClass
+                ComputeBackendClass = $itemComputeClass
+                AttackFamily = $itemFamily
+                RequiredCoverageCount = 0
+                RequiredCandidateCount = 0L
+                HasUnknownCandidateTotal = $false
+                HasUnknownSpeed = $false
+                EstimatedDuration = 0.0
+                FullyCalibrated = $false
+                HasCalibratedEvidence = $false
+            }
+        }
+        $speedClass = $speedClasses[$speedClassKey]
+
         if ($completedSet.Contains([string]$coverageId)) {
             [void]$structureParts.Add(([string]$coverageId + '=completed'))
             continue
         }
 
-        $isCurrent = [string]::Equals([string]$coverageId, $CurrentCoverageId, [System.StringComparison]::Ordinal)
-        $item = if ($itemById.ContainsKey([string]$coverageId)) { $itemById[[string]$coverageId] } else { [pscustomobject]@{ CoverageId = [string]$coverageId } }
-        $candidateTotal = if ($isCurrent -and $null -ne $CurrentTotal) { $CurrentTotal } else { Get-ObjectPropertyValue -Object $item -Name 'CandidateCount' -Default $null }
+        $candidateTotal = if ($isCurrent -and $null -ne $CurrentTotal) {
+            $CurrentTotal
+        }
+        else {
+            Get-ObjectPropertyValue -Object $item -Name 'CandidateCount' -Default $null
+        }
         $hasCandidateTotal = $false
         [long]$normalizedTotal = 0
         if ($null -ne $candidateTotal) {
@@ -2060,6 +2120,9 @@ function Get-CoverageDurationSumEta {
             catch { $hasCandidateTotal = $false }
         }
         if (-not $hasCandidateTotal) {
+            $speedClass.RequiredCoverageCount++
+            $speedClass.HasUnknownCandidateTotal = $true
+            $remainingPlanItemCount++
             $unestimatedCoverageCount++
             [void]$structureParts.Add(([string]$coverageId + '=unknown-total'))
             continue
@@ -2073,8 +2136,12 @@ function Get-CoverageDurationSumEta {
             continue
         }
         $remainingCoverageCount++
+        $remainingPlanItemCount++
+        $speedClass.RequiredCoverageCount++
+        $speedClass.RequiredCandidateCount += $remaining
 
         $profile = Get-PlanEtaProfileSpeed -Item $item -SpeedProfiles $SpeedProfiles
+        [bool]$hasExactCalibratedProfile = $null -ne $profile -and [string]$profile.Source -eq 'ExactProfile'
         [double]$speed = 0
         [string]$source = ''
         [bool]$sourceIsStable = $false
@@ -2087,61 +2154,153 @@ function Get-CoverageDurationSumEta {
             $speed = [double]$profile.Speed
             $source = [string]$profile.Source
             $sourceIsStable = $source -eq 'ExactProfile'
-            if ($source -eq 'CompatibleProfile') {
-                $usedCompatibleProfile = $true
-                $requiresCalibration = $true
-            }
+            if ($source -eq 'CompatibleProfile') { $usedCompatibleProfile = $true }
         }
-        elseif (-not $isCurrent -and $FallbackGpuSpeedPerSecond -gt 0 -and
-            [string](Get-ObjectPropertyValue -Object $item -Name 'ComputeBackendClass' -Default '') -like 'gpu:*') {
+        elseif (-not $isCurrent -and $FallbackGpuSpeedPerSecond -gt 0 -and $itemComputeClass -like 'gpu:*') {
             $speed = $FallbackGpuSpeedPerSecond
             $source = 'CurrentRunGpuFallback'
             $usedFallbackSpeed = $true
-            $requiresCalibration = $true
         }
 
         if ($isCurrent) {
             $currentCoverageSpeedSource = $source
             $currentCoverageSpeedIsStable = $sourceIsStable
-            if ($source -eq 'CurrentSpeed' -and -not $sourceIsStable) { $requiresCalibration = $true }
+        }
+        if ($hasExactCalibratedProfile -or ($source -eq 'CurrentSpeed' -and $sourceIsStable)) {
+            $speedClass.FullyCalibrated = $true
+            $speedClass.HasCalibratedEvidence = $true
         }
         if ($speed -gt 0) {
-            $planEta += $remaining / $speed
+            $duration = $remaining / $speed
+            $planEta += $duration
+            $speedClass.EstimatedDuration += $duration
             $estimatedCoverageCount++
             [void]$structureParts.Add(('{0}={1}' -f [string]$coverageId, $source))
         }
         else {
+            $speedClass.HasUnknownSpeed = $true
             $unestimatedCoverageCount++
             [void]$structureParts.Add(([string]$coverageId + '=unestimated-speed'))
         }
     }
 
-    $planEtaValue = $null
-    if ($planIds.Count -gt 0 -and $remainingCoverageCount -eq 0) {
-        $planEtaValue = 0.0
+    $requiredClassRecords = @($speedClasses.Values | Where-Object { [int]$_.RequiredCoverageCount -gt 0 })
+    [int]$requiredSpeedClassCount = $requiredClassRecords.Count
+    [int]$calibratedRequiredSpeedClassCount = @($requiredClassRecords | Where-Object { [bool]$_.FullyCalibrated }).Count
+    [int]$uncalibratedRequiredSpeedClassCount = $requiredSpeedClassCount - $calibratedRequiredSpeedClassCount
+    [double]$etaCalibrationCoverage = if ($requiredSpeedClassCount -gt 0) {
+        [math]::Round($calibratedRequiredSpeedClassCount / [double]$requiredSpeedClassCount, 4)
     }
-    elseif ($estimatedCoverageCount -gt 0) {
-        $planEtaValue = [math]::Round($planEta, 1)
+    else {
+        1.0
     }
 
+    [double]$knownLowerBoundSeconds = 0
+    [double]$uncalibratedEstimatedDurationSeconds = 0
+    [double]$preliminaryLowSeconds = 0
+    [double]$preliminaryHighSeconds = 0
+    [bool]$hasFiniteEtaBounds = $true
+    [bool]$hasRealCalibration = $calibratedRequiredSpeedClassCount -gt 0
+    [bool]$canJudgeUncalibratedImpact = $true
+    foreach ($requiredClass in $requiredClassRecords) {
+        $classDuration = [double]$requiredClass.EstimatedDuration
+        if ($requiredClass.HasUnknownCandidateTotal -or $requiredClass.HasUnknownSpeed -or $classDuration -le 0) {
+            $hasFiniteEtaBounds = $false
+            $canJudgeUncalibratedImpact = $false
+        }
+        if ($requiredClass.FullyCalibrated) {
+            $knownLowerBoundSeconds += $classDuration
+            $preliminaryLowSeconds += $classDuration
+            $preliminaryHighSeconds += $classDuration
+        }
+        elseif ($classDuration -gt 0 -and -not $requiredClass.HasUnknownCandidateTotal -and -not $requiredClass.HasUnknownSpeed) {
+            # Compatible profiles and the current-run GPU fallback are useful
+            # estimates, but they are intentionally bounded until this exact
+            # execution class gets real samples.
+            $uncalibratedEstimatedDurationSeconds += $classDuration
+            $preliminaryLowSeconds += $classDuration / 1.25
+            $preliminaryHighSeconds += $classDuration / 0.75
+        }
+    }
+    [double]$estimatedDurationShare = 1.0
+    if ($canJudgeUncalibratedImpact -and $planEta -gt 0) {
+        $estimatedDurationShare = $uncalibratedEstimatedDurationSeconds / $planEta
+    }
+
+    $planEtaEstimatedValue = $null
+    if ($estimatedCoverageCount -gt 0) {
+        $planEtaEstimatedValue = [math]::Round($planEta, 1)
+    }
     $readiness = 'Unavailable'
-    if ($remainingCoverageCount -eq 0 -and $planIds.Count -gt 0) {
+    if ($planIds.Count -gt 0 -and $remainingPlanItemCount -eq 0) {
+        $readiness = 'Stable'
+        $planEtaEstimatedValue = 0.0
+        $preliminaryLowSeconds = 0
+        $preliminaryHighSeconds = 0
+        $hasFiniteEtaBounds = $true
+    }
+    elseif ($requiredSpeedClassCount -gt 0 -and $hasRealCalibration -and $hasFiniteEtaBounds -and
+        ($etaCalibrationCoverage -ge 1.0 -or ($canJudgeUncalibratedImpact -and $estimatedDurationShare -lt 0.05))) {
         $readiness = 'Stable'
     }
-    elseif ($null -ne $planEtaValue -and $unestimatedCoverageCount -gt 0) {
-        $readiness = 'Partial'
+    elseif ($requiredSpeedClassCount -gt 0 -and $hasRealCalibration -and $hasFiniteEtaBounds -and
+        ($etaCalibrationCoverage -ge 0.70 -or ($canJudgeUncalibratedImpact -and $estimatedDurationShare -lt 0.05))) {
+        $readiness = 'Preliminary'
     }
-    elseif ($null -ne $planEtaValue -and $requiresCalibration) {
+    elseif ($planIds.Count -gt 0) {
         $readiness = 'Calibrating'
     }
-    elseif ($null -ne $planEtaValue) {
-        $readiness = 'Stable'
+
+    $planEtaValue = $null
+    $planEtaLowValue = $null
+    $planEtaHighValue = $null
+    if ($readiness -eq 'Stable') {
+        $planEtaValue = if ($planIds.Count -gt 0 -and $remainingPlanItemCount -eq 0) { 0.0 } else { [math]::Round($planEta, 1) }
+        $planEtaLowValue = $planEtaValue
+        $planEtaHighValue = $planEtaValue
     }
+    elseif ($readiness -eq 'Preliminary' -and $hasFiniteEtaBounds) {
+        $planEtaLowValue = [math]::Round([math]::Max(0.0, $preliminaryLowSeconds), 1)
+        $planEtaHighValue = [math]::Round([math]::Max($planEtaLowValue, $preliminaryHighSeconds), 1)
+        $planEtaValue = [math]::Round(($planEtaLowValue + $planEtaHighValue) / 2.0, 1)
+    }
+
+    $classSummaries = @(
+        foreach ($requiredClass in ($requiredClassRecords | Sort-Object SpeedClassKey)) {
+            [pscustomobject]@{
+                SpeedClassKey = [string]$requiredClass.SpeedClassKey
+                ArchiveBackendClass = [string]$requiredClass.ArchiveBackendClass
+                ComputeBackendClass = [string]$requiredClass.ComputeBackendClass
+                AttackFamily = [string]$requiredClass.AttackFamily
+                RequiredCoverageCount = [int]$requiredClass.RequiredCoverageCount
+                RequiredCandidateCount = [long]$requiredClass.RequiredCandidateCount
+                FullyCalibrated = [bool]$requiredClass.FullyCalibrated
+                HasEstimate = -not [bool]$requiredClass.HasUnknownCandidateTotal -and -not [bool]$requiredClass.HasUnknownSpeed -and [double]$requiredClass.EstimatedDuration -gt 0
+                EstimatedDurationSeconds = if ([double]$requiredClass.EstimatedDuration -gt 0) { [math]::Round([double]$requiredClass.EstimatedDuration, 1) } else { $null }
+            }
+        }
+    )
 
     [pscustomobject]@{
         PlanEtaModel                  = 'CoverageDurationSum'
         PlanEtaSeconds                = $planEtaValue
+        PlanEtaEstimatedSeconds       = $planEtaEstimatedValue
+        PlanEtaLowSeconds             = $planEtaLowValue
+        PlanEtaHighSeconds            = $planEtaHighValue
+        PlanEtaKnownLowerBoundSeconds = if ($knownLowerBoundSeconds -gt 0) { [math]::Round($knownLowerBoundSeconds, 1) } else { $null }
+        EtaReadiness                  = $readiness
+        PlanEtaReadiness              = $readiness
         OverallEtaReadiness           = $readiness
+        EtaCalibrationCoverage        = $etaCalibrationCoverage
+        EtaCalibrationCoveragePercent = [math]::Round($etaCalibrationCoverage * 100.0, 1)
+        RequiredSpeedClassCount       = $requiredSpeedClassCount
+        RequiredFutureSpeedClassCount = $requiredSpeedClassCount
+        CalibratedRequiredSpeedClassCount = $calibratedRequiredSpeedClassCount
+        UncalibratedRequiredSpeedClassCount = $uncalibratedRequiredSpeedClassCount
+        UncalibratedEstimatedDurationSeconds = if ($uncalibratedEstimatedDurationSeconds -gt 0) { [math]::Round($uncalibratedEstimatedDurationSeconds, 1) } else { 0.0 }
+        EtaEstimatedDurationShare     = if ($canJudgeUncalibratedImpact) { [math]::Round($estimatedDurationShare, 4) } else { $null }
+        EtaHasFiniteBounds            = $hasFiniteEtaBounds
+        EtaSpeedClasses               = $classSummaries
         UnestimatedCoverageCount     = $unestimatedCoverageCount
         EstimatedCoverageCount       = $estimatedCoverageCount
         RemainingCoverageCount       = $remainingCoverageCount
@@ -2149,6 +2308,7 @@ function Get-CoverageDurationSumEta {
         UsedCompatibleProfile        = $usedCompatibleProfile
         CurrentCoverageSpeedSource   = $currentCoverageSpeedSource
         CurrentCoverageSpeedIsStable = $currentCoverageSpeedIsStable
+        PlanEtaPlanIdentity           = ($planIdentityParts.ToArray() -join ';')
         PlanEtaStructureKey           = ($structureParts.ToArray() -join ';')
     }
 }
@@ -2324,15 +2484,41 @@ function Get-OverallFlowProgress {
     }
     $overallEtaSeconds = $null
     $planEtaSeconds = $null
+    $planEtaEstimatedSeconds = $null
+    $planEtaLowSeconds = $null
+    $planEtaHighSeconds = $null
+    $planEtaKnownLowerBoundSeconds = $null
     $displayedPlanEtaSeconds = $null
+    $displayedPlanEtaLowSeconds = $null
+    $displayedPlanEtaHighSeconds = $null
     $overallEtaReadiness = 'Unavailable'
+    $etaReadiness = 'Unavailable'
+    $etaModelEpoch = $null
+    $etaCalibrationCoverage = $null
+    $requiredSpeedClassCount = 0
+    $requiredFutureSpeedClassCount = 0
+    $calibratedRequiredSpeedClassCount = 0
+    $uncalibratedRequiredSpeedClassCount = 0
     $unestimatedCoverageCount = 0
     if ($null -ne $PlanEta) {
         if ($PlanEta.PSObject.Properties.Name -contains 'PlanEtaSeconds') { $planEtaSeconds = $PlanEta.PlanEtaSeconds }
+        if ($PlanEta.PSObject.Properties.Name -contains 'PlanEtaEstimatedSeconds') { $planEtaEstimatedSeconds = $PlanEta.PlanEtaEstimatedSeconds }
+        if ($PlanEta.PSObject.Properties.Name -contains 'PlanEtaLowSeconds') { $planEtaLowSeconds = $PlanEta.PlanEtaLowSeconds }
+        if ($PlanEta.PSObject.Properties.Name -contains 'PlanEtaHighSeconds') { $planEtaHighSeconds = $PlanEta.PlanEtaHighSeconds }
+        if ($PlanEta.PSObject.Properties.Name -contains 'PlanEtaKnownLowerBoundSeconds') { $planEtaKnownLowerBoundSeconds = $PlanEta.PlanEtaKnownLowerBoundSeconds }
         if ($PlanEta.PSObject.Properties.Name -contains 'DisplayedPlanEtaSeconds') { $displayedPlanEtaSeconds = $PlanEta.DisplayedPlanEtaSeconds }
+        if ($PlanEta.PSObject.Properties.Name -contains 'DisplayedPlanEtaLowSeconds') { $displayedPlanEtaLowSeconds = $PlanEta.DisplayedPlanEtaLowSeconds }
+        if ($PlanEta.PSObject.Properties.Name -contains 'DisplayedPlanEtaHighSeconds') { $displayedPlanEtaHighSeconds = $PlanEta.DisplayedPlanEtaHighSeconds }
         if ($null -eq $displayedPlanEtaSeconds) { $displayedPlanEtaSeconds = $planEtaSeconds }
         $overallEtaSeconds = $displayedPlanEtaSeconds
         if ($PlanEta.PSObject.Properties.Name -contains 'OverallEtaReadiness') { $overallEtaReadiness = [string]$PlanEta.OverallEtaReadiness }
+        if ($PlanEta.PSObject.Properties.Name -contains 'EtaReadiness') { $etaReadiness = [string]$PlanEta.EtaReadiness } else { $etaReadiness = $overallEtaReadiness }
+        if ($PlanEta.PSObject.Properties.Name -contains 'EtaModelEpoch') { $etaModelEpoch = $PlanEta.EtaModelEpoch }
+        if ($PlanEta.PSObject.Properties.Name -contains 'EtaCalibrationCoverage') { $etaCalibrationCoverage = $PlanEta.EtaCalibrationCoverage }
+        if ($PlanEta.PSObject.Properties.Name -contains 'RequiredSpeedClassCount') { $requiredSpeedClassCount = [int]$PlanEta.RequiredSpeedClassCount }
+        if ($PlanEta.PSObject.Properties.Name -contains 'RequiredFutureSpeedClassCount') { $requiredFutureSpeedClassCount = [int]$PlanEta.RequiredFutureSpeedClassCount }
+        if ($PlanEta.PSObject.Properties.Name -contains 'CalibratedRequiredSpeedClassCount') { $calibratedRequiredSpeedClassCount = [int]$PlanEta.CalibratedRequiredSpeedClassCount }
+        if ($PlanEta.PSObject.Properties.Name -contains 'UncalibratedRequiredSpeedClassCount') { $uncalibratedRequiredSpeedClassCount = [int]$PlanEta.UncalibratedRequiredSpeedClassCount }
         if ($PlanEta.PSObject.Properties.Name -contains 'UnestimatedCoverageCount') { $unestimatedCoverageCount = [int]$PlanEta.UnestimatedCoverageCount }
     }
 
@@ -2384,8 +2570,21 @@ function Get-OverallFlowProgress {
         OverallSpeed                        = $overallSpeed
         OverallEtaSeconds                   = $overallEtaSeconds
         PlanEtaSeconds                      = $planEtaSeconds
+        PlanEtaEstimatedSeconds             = $planEtaEstimatedSeconds
+        PlanEtaLowSeconds                   = $planEtaLowSeconds
+        PlanEtaHighSeconds                  = $planEtaHighSeconds
+        PlanEtaKnownLowerBoundSeconds       = $planEtaKnownLowerBoundSeconds
         DisplayedPlanEtaSeconds             = $displayedPlanEtaSeconds
+        DisplayedPlanEtaLowSeconds          = $displayedPlanEtaLowSeconds
+        DisplayedPlanEtaHighSeconds         = $displayedPlanEtaHighSeconds
         OverallEtaReadiness                 = $overallEtaReadiness
+        EtaReadiness                        = $etaReadiness
+        EtaModelEpoch                       = $etaModelEpoch
+        EtaCalibrationCoverage              = $etaCalibrationCoverage
+        RequiredSpeedClassCount             = $requiredSpeedClassCount
+        RequiredFutureSpeedClassCount       = $requiredFutureSpeedClassCount
+        CalibratedRequiredSpeedClassCount   = $calibratedRequiredSpeedClassCount
+        UncalibratedRequiredSpeedClassCount = $uncalibratedRequiredSpeedClassCount
         UnestimatedCoverageCount            = $unestimatedCoverageCount
         OverallCoverageCompleted            = $processedSet.Count
         OverallCoverageTotal                = $planIds.Count

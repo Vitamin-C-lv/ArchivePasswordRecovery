@@ -158,11 +158,18 @@ $script:CurrentCoverageSpeedSampleCount = 0
 $script:CurrentCoverageLastSpeedSampleUtc = $null
 $script:ConservativeObservedGpuSpeed = 0.0
 $script:DisplayedPlanEtaSeconds = $null
+$script:DisplayedPlanEtaLowSeconds = $null
+$script:DisplayedPlanEtaHighSeconds = $null
 $script:DisplayedPlanEtaUpdatedUtc = $null
 $script:LastValidPlanEtaSeconds = $null
+$script:LastValidPlanEtaLowSeconds = $null
+$script:LastValidPlanEtaHighSeconds = $null
 $script:LastValidPlanEtaUtc = $null
 $script:LastPlanEtaStructureKey = ''
 $script:LastPlanEtaAdjustmentReason = ''
+$script:EtaReadiness = 'Unavailable'
+$script:EtaModelEpoch = 1
+$script:LastEtaPlanIdentity = ''
 if ($null -ne $previous) {
     $previousOverallSpeed = $null
     if ($previous.PSObject.Properties.Name -contains 'LastKnownOverallSpeed') {
@@ -749,6 +756,107 @@ function Get-WorkerCurrentCoverageSpeedIsStable {
     return $false
 }
 
+function Get-WorkerEtaReadinessRank {
+    [CmdletBinding()]
+    param(
+        [string]$Readiness = ''
+    )
+
+    switch ($Readiness) {
+        'Stable' { return 2 }
+        'Preliminary' { return 1 }
+        'Calibrating' { return 0 }
+        default { return -1 }
+    }
+}
+
+function Update-WorkerEtaReadiness {
+    [CmdletBinding()]
+    param(
+        $PlanEta = $null
+    )
+
+    $rawReadiness = ''
+    if ($null -ne $PlanEta -and $PlanEta.PSObject.Properties.Name -contains 'EtaReadiness') {
+        $rawReadiness = [string]$PlanEta.EtaReadiness
+    }
+    elseif ($null -ne $PlanEta -and $PlanEta.PSObject.Properties.Name -contains 'OverallEtaReadiness') {
+        $rawReadiness = [string]$PlanEta.OverallEtaReadiness
+    }
+    $planIdentity = ''
+    if ($null -ne $PlanEta -and $PlanEta.PSObject.Properties.Name -contains 'PlanEtaPlanIdentity') {
+        $planIdentity = [string]$PlanEta.PlanEtaPlanIdentity
+    }
+    $hasPlanIdentity = -not [string]::IsNullOrWhiteSpace($planIdentity)
+    if ($rawReadiness -notin @('Calibrating', 'Preliminary', 'Stable')) {
+        $hasPoint = $null -ne $PlanEta -and $PlanEta.PSObject.Properties.Name -contains 'PlanEtaSeconds' -and $null -ne $PlanEta.PlanEtaSeconds
+        if ($hasPoint) {
+            $rawReadiness = 'Stable'
+        }
+        elseif ($hasPlanIdentity) {
+            $rawReadiness = 'Calibrating'
+        }
+        else {
+            $rawReadiness = 'Unavailable'
+        }
+    }
+
+    $structureChanged = $false
+    if ($hasPlanIdentity) {
+        if (-not [string]::IsNullOrWhiteSpace($script:LastEtaPlanIdentity) -and
+            -not [string]::Equals($planIdentity, $script:LastEtaPlanIdentity, [System.StringComparison]::Ordinal)) {
+            $structureChanged = $true
+            $script:EtaModelEpoch++
+            $script:EtaReadiness = 'Calibrating'
+            $script:DisplayedPlanEtaSeconds = $null
+            $script:DisplayedPlanEtaLowSeconds = $null
+            $script:DisplayedPlanEtaHighSeconds = $null
+            $script:DisplayedPlanEtaUpdatedUtc = $null
+            $script:LastValidPlanEtaSeconds = $null
+            $script:LastValidPlanEtaLowSeconds = $null
+            $script:LastValidPlanEtaHighSeconds = $null
+            $script:LastValidPlanEtaUtc = $null
+            $script:LastPlanEtaStructureKey = ''
+            $script:LastPlanEtaAdjustmentReason = 'StructuralRecalibration'
+        }
+        $script:LastEtaPlanIdentity = $planIdentity
+    }
+
+    if (-not $hasPlanIdentity) {
+        $script:EtaReadiness = 'Unavailable'
+    }
+    elseif ($structureChanged) {
+        # A new level/device/fallback/plan composition gets one clean
+        # calibration frame even if an old profile happens to make the raw
+        # estimate look immediately complete.
+        $script:EtaReadiness = 'Calibrating'
+    }
+    elseif ($rawReadiness -eq 'Calibrating') {
+        # The state is monotonic inside one epoch. A lower raw confidence
+        # signal during a transition cannot make an already visible estimate
+        # disappear; the display layer will hold its last valid value.
+        if ([string]::IsNullOrWhiteSpace($script:EtaReadiness) -or $script:EtaReadiness -eq 'Unavailable') {
+            $script:EtaReadiness = 'Calibrating'
+        }
+    }
+    else {
+        $currentRank = Get-WorkerEtaReadinessRank -Readiness ([string]$script:EtaReadiness)
+        $rawRank = Get-WorkerEtaReadinessRank -Readiness $rawReadiness
+        if ($currentRank -lt 0 -or $rawRank -gt $currentRank) {
+            $script:EtaReadiness = $rawReadiness
+        }
+    }
+
+    [pscustomobject]@{
+        EtaReadiness = [string]$script:EtaReadiness
+        OverallEtaReadiness = [string]$script:EtaReadiness
+        RawEtaReadiness = $rawReadiness
+        EtaModelEpoch = [int]$script:EtaModelEpoch
+        PlanEtaPlanIdentity = $planIdentity
+        StructureChanged = $structureChanged
+    }
+}
+
 function Update-WorkerDisplayedPlanEta {
     [CmdletBinding()]
     param(
@@ -757,6 +865,8 @@ function Update-WorkerDisplayedPlanEta {
 
     $now = [datetime]::UtcNow
     $rawEta = $null
+    $rawLow = $null
+    $rawHigh = $null
     if ($null -ne $PlanEta -and $PlanEta.PSObject.Properties.Name -contains 'PlanEtaSeconds' -and $null -ne $PlanEta.PlanEtaSeconds) {
         try {
             [double]$rawEta = $PlanEta.PlanEtaSeconds
@@ -764,6 +874,27 @@ function Update-WorkerDisplayedPlanEta {
         }
         catch { $rawEta = $null }
     }
+    if ($null -ne $PlanEta -and $PlanEta.PSObject.Properties.Name -contains 'PlanEtaLowSeconds' -and $null -ne $PlanEta.PlanEtaLowSeconds) {
+        try {
+            [double]$rawLow = $PlanEta.PlanEtaLowSeconds
+            if ($rawLow -lt 0) { $rawLow = $null }
+        }
+        catch { $rawLow = $null }
+    }
+    if ($null -ne $PlanEta -and $PlanEta.PSObject.Properties.Name -contains 'PlanEtaHighSeconds' -and $null -ne $PlanEta.PlanEtaHighSeconds) {
+        try {
+            [double]$rawHigh = $PlanEta.PlanEtaHighSeconds
+            if ($rawHigh -lt 0) { $rawHigh = $null }
+        }
+        catch { $rawHigh = $null }
+    }
+    if ($null -eq $rawLow -and $null -ne $rawEta) { $rawLow = $rawEta }
+    if ($null -eq $rawHigh -and $null -ne $rawEta) { $rawHigh = $rawEta }
+    if ($null -ne $rawLow -and $null -ne $rawHigh -and $rawHigh -lt $rawLow) {
+        $rawHigh = $rawLow
+    }
+    $hasNewReadinessModel = $null -ne $PlanEta -and $PlanEta.PSObject.Properties.Name -contains 'EtaReadiness'
+    $effectiveReadiness = if ($hasNewReadinessModel) { [string]$PlanEta.EtaReadiness } else { 'Stable' }
     $currentStable = if ($null -ne $PlanEta -and $PlanEta.PSObject.Properties.Name -contains 'CurrentCoverageSpeedIsStable') {
         [bool]$PlanEta.CurrentCoverageSpeedIsStable
     }
@@ -772,59 +903,138 @@ function Update-WorkerDisplayedPlanEta {
     }
     $holdActivities = @('AdvancingCoverage', 'PreparingCoverage', 'PreparingBackend', 'PreparingDictionary', 'StartingHashcat', 'RestoringHashcat', 'RunningCoverage')
     $hasLastValid = $null -ne $script:LastValidPlanEtaSeconds -and $null -ne $script:LastValidPlanEtaUtc
+    if ($null -eq $script:DisplayedPlanEtaLowSeconds -and $null -ne $script:DisplayedPlanEtaSeconds) {
+        $script:DisplayedPlanEtaLowSeconds = [double]$script:DisplayedPlanEtaSeconds
+    }
+    if ($null -eq $script:DisplayedPlanEtaHighSeconds -and $null -ne $script:DisplayedPlanEtaSeconds) {
+        $script:DisplayedPlanEtaHighSeconds = [double]$script:DisplayedPlanEtaSeconds
+    }
     $needsCoverageCalibration = [string]::IsNullOrWhiteSpace($script:CurrentCoverageId) -or -not $currentStable
-    $shouldHold = $hasLastValid -and $script:Activity -in $holdActivities -and $needsCoverageCalibration
+    $hasCurrentEstimate = $null -ne $rawEta -or ($null -ne $rawLow -and $null -ne $rawHigh)
+    $shouldHold = $hasLastValid -and $script:Activity -in $holdActivities -and
+        ($needsCoverageCalibration -or $effectiveReadiness -eq 'Calibrating' -or -not $hasCurrentEstimate)
     if ($shouldHold) {
         $heldEta = [math]::Max(0.0, [double]$script:LastValidPlanEtaSeconds - ([double]($now - $script:LastValidPlanEtaUtc.ToUniversalTime()).TotalSeconds))
         $script:DisplayedPlanEtaSeconds = [math]::Round($heldEta, 1)
+        $lastLow = if ($null -ne $script:LastValidPlanEtaLowSeconds) { [double]$script:LastValidPlanEtaLowSeconds } else { [double]$script:LastValidPlanEtaSeconds }
+        $lastHigh = if ($null -ne $script:LastValidPlanEtaHighSeconds) { [double]$script:LastValidPlanEtaHighSeconds } else { [double]$script:LastValidPlanEtaSeconds }
+        $holdElapsed = [double]($now - $script:LastValidPlanEtaUtc.ToUniversalTime()).TotalSeconds
+        $script:DisplayedPlanEtaLowSeconds = [math]::Round([math]::Max(0.0, $lastLow - $holdElapsed), 1)
+        $script:DisplayedPlanEtaHighSeconds = [math]::Round([math]::Max([double]$script:DisplayedPlanEtaLowSeconds, $lastHigh - $holdElapsed), 1)
         $script:DisplayedPlanEtaUpdatedUtc = $now
         $script:LastPlanEtaAdjustmentReason = ''
         return [pscustomobject]@{
             PlanEtaSeconds = $rawEta
+            PlanEtaLowSeconds = $rawLow
+            PlanEtaHighSeconds = $rawHigh
             DisplayedPlanEtaSeconds = $script:DisplayedPlanEtaSeconds
+            DisplayedPlanEtaLowSeconds = $script:DisplayedPlanEtaLowSeconds
+            DisplayedPlanEtaHighSeconds = $script:DisplayedPlanEtaHighSeconds
             OverallEtaIsHeld = $true
             OverallEtaHasValidHistory = $true
             PlanEtaAdjustmentReason = ''
+            EtaReadiness = $effectiveReadiness
         }
     }
 
-    if ($null -ne $rawEta) {
+    if ($effectiveReadiness -eq 'Calibrating') {
+        $calibratingReason = if ($null -ne $PlanEta -and $PlanEta.PSObject.Properties.Name -contains 'StructureChanged' -and [bool]$PlanEta.StructureChanged) {
+            'StructuralRecalibration'
+        }
+        else {
+            ''
+        }
+        return [pscustomobject]@{
+            PlanEtaSeconds = $rawEta
+            PlanEtaLowSeconds = $rawLow
+            PlanEtaHighSeconds = $rawHigh
+            DisplayedPlanEtaSeconds = $null
+            DisplayedPlanEtaLowSeconds = $null
+            DisplayedPlanEtaHighSeconds = $null
+            OverallEtaIsHeld = $false
+            OverallEtaHasValidHistory = $hasLastValid
+            PlanEtaAdjustmentReason = $calibratingReason
+            EtaReadiness = $effectiveReadiness
+        }
+    }
+
+    $hasDisplayRange = $null -ne $rawLow -and $null -ne $rawHigh
+    if (($effectiveReadiness -eq 'Preliminary' -and $hasDisplayRange) -or
+        ($effectiveReadiness -eq 'Stable' -and $null -ne $rawEta)) {
+        if ($effectiveReadiness -eq 'Stable' -and $null -ne $script:DisplayedPlanEtaSeconds) {
+            $script:DisplayedPlanEtaLowSeconds = [double]$script:DisplayedPlanEtaSeconds
+            $script:DisplayedPlanEtaHighSeconds = [double]$script:DisplayedPlanEtaSeconds
+        }
         $structureKey = if ($null -ne $PlanEta -and $PlanEta.PSObject.Properties.Name -contains 'PlanEtaStructureKey') { [string]$PlanEta.PlanEtaStructureKey } else { '' }
-        $structureChanged = -not [string]::IsNullOrWhiteSpace($script:LastPlanEtaStructureKey) -and
-            -not [string]::Equals($structureKey, $script:LastPlanEtaStructureKey, [System.StringComparison]::Ordinal)
+        $usesEpochModel = $null -ne $PlanEta -and $PlanEta.PSObject.Properties.Name -contains 'EtaModelEpoch'
+        $structureChanged = if ($usesEpochModel -and $PlanEta.PSObject.Properties.Name -contains 'StructureChanged') {
+            [bool]$PlanEta.StructureChanged
+        }
+        else {
+            $false
+        }
+        if (-not $usesEpochModel) {
+            $structureChanged = -not [string]::IsNullOrWhiteSpace($script:LastPlanEtaStructureKey) -and
+                -not [string]::Equals($structureKey, $script:LastPlanEtaStructureKey, [System.StringComparison]::Ordinal)
+        }
         $reason = if ($structureChanged) { 'StructuralRecalibration' } else { '' }
         if ($null -eq $script:DisplayedPlanEtaSeconds -or $null -eq $script:DisplayedPlanEtaUpdatedUtc -or $structureChanged) {
-            $script:DisplayedPlanEtaSeconds = [math]::Round($rawEta, 1)
+            $script:DisplayedPlanEtaLowSeconds = [math]::Round([double]$rawLow, 1)
+            $script:DisplayedPlanEtaHighSeconds = [math]::Round([double]$rawHigh, 1)
         }
         else {
             $elapsedSinceDisplay = [math]::Max(0.0, ($now - $script:DisplayedPlanEtaUpdatedUtc.ToUniversalTime()).TotalSeconds)
-            $naturalCountdown = [math]::Max(0.0, [double]$script:DisplayedPlanEtaSeconds - $elapsedSinceDisplay)
-            $corrected = $naturalCountdown + (([double]$rawEta - $naturalCountdown) * 0.25)
+            $naturalLow = [math]::Max(0.0, [double]$script:DisplayedPlanEtaLowSeconds - $elapsedSinceDisplay)
+            $naturalHigh = [math]::Max(0.0, [double]$script:DisplayedPlanEtaHighSeconds - $elapsedSinceDisplay)
+            $correctionRatio = if ($effectiveReadiness -eq 'Preliminary') { 0.30 } else { 0.25 }
+            $correctedLow = $naturalLow + (([double]$rawLow - $naturalLow) * $correctionRatio)
+            $correctedHigh = $naturalHigh + (([double]$rawHigh - $naturalHigh) * $correctionRatio)
             # A normal speed sample may correct the estimate downward, but it
             # must not turn elapsed time into a long-term upward countdown.
             # Structural changes are handled by the direct-reset branch above.
-            $script:DisplayedPlanEtaSeconds = [math]::Round([math]::Max(0.0, [math]::Min($naturalCountdown, $corrected)), 1)
+            $script:DisplayedPlanEtaLowSeconds = [math]::Round([math]::Max(0.0, [math]::Min($naturalLow, $correctedLow)), 1)
+            $script:DisplayedPlanEtaHighSeconds = [math]::Round([math]::Max([double]$script:DisplayedPlanEtaLowSeconds, [math]::Min($naturalHigh, $correctedHigh)), 1)
+        }
+        if ($effectiveReadiness -eq 'Preliminary') {
+            $script:DisplayedPlanEtaSeconds = [math]::Round(([double]$script:DisplayedPlanEtaLowSeconds + [double]$script:DisplayedPlanEtaHighSeconds) / 2.0, 1)
+        }
+        else {
+            $script:DisplayedPlanEtaSeconds = [math]::Round(([double]$script:DisplayedPlanEtaLowSeconds + [double]$script:DisplayedPlanEtaHighSeconds) / 2.0, 1)
+            $script:DisplayedPlanEtaLowSeconds = $script:DisplayedPlanEtaSeconds
+            $script:DisplayedPlanEtaHighSeconds = $script:DisplayedPlanEtaSeconds
         }
         $script:DisplayedPlanEtaUpdatedUtc = $now
         $script:LastValidPlanEtaSeconds = $script:DisplayedPlanEtaSeconds
+        $script:LastValidPlanEtaLowSeconds = $script:DisplayedPlanEtaLowSeconds
+        $script:LastValidPlanEtaHighSeconds = $script:DisplayedPlanEtaHighSeconds
         $script:LastValidPlanEtaUtc = $now
         $script:LastPlanEtaStructureKey = $structureKey
         $script:LastPlanEtaAdjustmentReason = $reason
         return [pscustomobject]@{
             PlanEtaSeconds = $rawEta
+            PlanEtaLowSeconds = $rawLow
+            PlanEtaHighSeconds = $rawHigh
             DisplayedPlanEtaSeconds = $script:DisplayedPlanEtaSeconds
+            DisplayedPlanEtaLowSeconds = $script:DisplayedPlanEtaLowSeconds
+            DisplayedPlanEtaHighSeconds = $script:DisplayedPlanEtaHighSeconds
             OverallEtaIsHeld = $false
             OverallEtaHasValidHistory = $true
             PlanEtaAdjustmentReason = $reason
+            EtaReadiness = $effectiveReadiness
         }
     }
 
     return [pscustomobject]@{
         PlanEtaSeconds = $null
+        PlanEtaLowSeconds = $rawLow
+        PlanEtaHighSeconds = $rawHigh
         DisplayedPlanEtaSeconds = $null
+        DisplayedPlanEtaLowSeconds = $null
+        DisplayedPlanEtaHighSeconds = $null
         OverallEtaIsHeld = $false
         OverallEtaHasValidHistory = $hasLastValid
         PlanEtaAdjustmentReason = ''
+        EtaReadiness = $effectiveReadiness
     }
 }
 
@@ -862,13 +1072,40 @@ function Get-WorkerOverallFlowSnapshot {
     $planEta = $null
     $planEtaDisplay = $null
     $planEtaForSnapshot = $null
+    $planEtaReadiness = $null
     if ($script:IsCumulativeJob) {
         $planEta = Get-CoverageDurationSumEta -PlanCoverageIds $planIds -PlanCoverageItems $planItems -CompletedCoverageIds @($script:CompletedCoverageIds | ForEach-Object { [string]$_ }) -CurrentCoverageId ([string]$script:CurrentCoverageId) -CurrentTested ([long]$script:CoverageCandidatesTested) -CurrentTotal $currentTotal -Activity ([string]$script:Activity) -CurrentSpeedPerSecond $currentSpeedForPlan -CurrentSpeedIsStable (Get-WorkerCurrentCoverageSpeedIsStable) -FallbackGpuSpeedPerSecond $script:ConservativeObservedGpuSpeed -SpeedProfiles $script:SpeedClassProfiles
-        $planEtaDisplay = Update-WorkerDisplayedPlanEta -PlanEta $planEta
+        $planEtaReadiness = Update-WorkerEtaReadiness -PlanEta $planEta
+        $planEtaForDisplay = [pscustomobject]@{
+            PlanEtaSeconds = $planEta.PlanEtaSeconds
+            PlanEtaLowSeconds = $planEta.PlanEtaLowSeconds
+            PlanEtaHighSeconds = $planEta.PlanEtaHighSeconds
+            CurrentCoverageSpeedIsStable = $planEta.CurrentCoverageSpeedIsStable
+            PlanEtaStructureKey = $planEta.PlanEtaStructureKey
+            EtaReadiness = $planEtaReadiness.EtaReadiness
+            EtaModelEpoch = $planEtaReadiness.EtaModelEpoch
+            StructureChanged = $planEtaReadiness.StructureChanged
+        }
+        $planEtaDisplay = Update-WorkerDisplayedPlanEta -PlanEta $planEtaForDisplay
         $planEtaForSnapshot = [pscustomobject]@{
             PlanEtaSeconds = $planEta.PlanEtaSeconds
+            PlanEtaEstimatedSeconds = $planEta.PlanEtaEstimatedSeconds
+            PlanEtaLowSeconds = $planEta.PlanEtaLowSeconds
+            PlanEtaHighSeconds = $planEta.PlanEtaHighSeconds
+            PlanEtaKnownLowerBoundSeconds = $planEta.PlanEtaKnownLowerBoundSeconds
             DisplayedPlanEtaSeconds = $planEtaDisplay.DisplayedPlanEtaSeconds
-            OverallEtaReadiness = $planEta.OverallEtaReadiness
+            DisplayedPlanEtaLowSeconds = $planEtaDisplay.DisplayedPlanEtaLowSeconds
+            DisplayedPlanEtaHighSeconds = $planEtaDisplay.DisplayedPlanEtaHighSeconds
+            OverallEtaReadiness = $planEtaReadiness.OverallEtaReadiness
+            EtaReadiness = $planEtaReadiness.EtaReadiness
+            EtaModelEpoch = $planEtaReadiness.EtaModelEpoch
+            EtaCalibrationCoverage = $planEta.EtaCalibrationCoverage
+            RequiredSpeedClassCount = $planEta.RequiredSpeedClassCount
+            RequiredFutureSpeedClassCount = $planEta.RequiredFutureSpeedClassCount
+            CalibratedRequiredSpeedClassCount = $planEta.CalibratedRequiredSpeedClassCount
+            UncalibratedRequiredSpeedClassCount = $planEta.UncalibratedRequiredSpeedClassCount
+            PlanEtaPlanIdentity = $planEtaReadiness.PlanEtaPlanIdentity
+            StructureChanged = $planEtaReadiness.StructureChanged
             UnestimatedCoverageCount = $planEta.UnestimatedCoverageCount
         }
     }
@@ -902,7 +1139,20 @@ function Get-WorkerOverallFlowSnapshot {
     $recordLastKnownOverallSpeedUtc = if ($null -ne $script:LastKnownOverallSpeedUtc) { $script:LastKnownOverallSpeedUtc.ToUniversalTime().ToString('o') } else { $null }
     $recordOverallSpeedSampleUtc = if ($null -ne $recentOverallSpeed) { $recentOverallSpeed.Utc.ToUniversalTime().ToString('o') } else { $null }
     $snapshot | Add-Member -NotePropertyName PlanEtaSeconds -NotePropertyValue $(if ($null -ne $planEta) { $planEta.PlanEtaSeconds } else { $null }) -Force
+    $snapshot | Add-Member -NotePropertyName PlanEtaEstimatedSeconds -NotePropertyValue $(if ($null -ne $planEta) { $planEta.PlanEtaEstimatedSeconds } else { $null }) -Force
+    $snapshot | Add-Member -NotePropertyName PlanEtaLowSeconds -NotePropertyValue $(if ($null -ne $planEta) { $planEta.PlanEtaLowSeconds } else { $null }) -Force
+    $snapshot | Add-Member -NotePropertyName PlanEtaHighSeconds -NotePropertyValue $(if ($null -ne $planEta) { $planEta.PlanEtaHighSeconds } else { $null }) -Force
+    $snapshot | Add-Member -NotePropertyName PlanEtaKnownLowerBoundSeconds -NotePropertyValue $(if ($null -ne $planEta) { $planEta.PlanEtaKnownLowerBoundSeconds } else { $null }) -Force
     $snapshot | Add-Member -NotePropertyName DisplayedPlanEtaSeconds -NotePropertyValue $(if ($null -ne $planEtaDisplay) { $planEtaDisplay.DisplayedPlanEtaSeconds } else { $null }) -Force
+    $snapshot | Add-Member -NotePropertyName DisplayedPlanEtaLowSeconds -NotePropertyValue $(if ($null -ne $planEtaDisplay) { $planEtaDisplay.DisplayedPlanEtaLowSeconds } else { $null }) -Force
+    $snapshot | Add-Member -NotePropertyName DisplayedPlanEtaHighSeconds -NotePropertyValue $(if ($null -ne $planEtaDisplay) { $planEtaDisplay.DisplayedPlanEtaHighSeconds } else { $null }) -Force
+    $snapshot | Add-Member -NotePropertyName EtaReadiness -NotePropertyValue ([string]$(if ($null -ne $planEtaReadiness) { $planEtaReadiness.EtaReadiness } else { 'Unavailable' })) -Force
+    $snapshot | Add-Member -NotePropertyName EtaModelEpoch -NotePropertyValue ([int]$(if ($null -ne $planEtaReadiness) { $planEtaReadiness.EtaModelEpoch } else { $script:EtaModelEpoch })) -Force
+    $snapshot | Add-Member -NotePropertyName EtaCalibrationCoverage -NotePropertyValue $(if ($null -ne $planEta) { $planEta.EtaCalibrationCoverage } else { $null }) -Force
+    $snapshot | Add-Member -NotePropertyName RequiredSpeedClassCount -NotePropertyValue ([int]$(if ($null -ne $planEta) { $planEta.RequiredSpeedClassCount } else { 0 })) -Force
+    $snapshot | Add-Member -NotePropertyName RequiredFutureSpeedClassCount -NotePropertyValue ([int]$(if ($null -ne $planEta) { $planEta.RequiredFutureSpeedClassCount } else { 0 })) -Force
+    $snapshot | Add-Member -NotePropertyName CalibratedRequiredSpeedClassCount -NotePropertyValue ([int]$(if ($null -ne $planEta) { $planEta.CalibratedRequiredSpeedClassCount } else { 0 })) -Force
+    $snapshot | Add-Member -NotePropertyName UncalibratedRequiredSpeedClassCount -NotePropertyValue ([int]$(if ($null -ne $planEta) { $planEta.UncalibratedRequiredSpeedClassCount } else { 0 })) -Force
     $snapshot | Add-Member -NotePropertyName OverallEtaIsHeld -NotePropertyValue ([bool]$(if ($null -ne $planEtaDisplay) { $planEtaDisplay.OverallEtaIsHeld } else { $false })) -Force
     $snapshot | Add-Member -NotePropertyName OverallEtaHasValidHistory -NotePropertyValue ([bool]$(if ($null -ne $planEtaDisplay) { $planEtaDisplay.OverallEtaHasValidHistory } else { $false })) -Force
     $snapshot | Add-Member -NotePropertyName LastValidPlanEtaSeconds -NotePropertyValue $script:LastValidPlanEtaSeconds -Force
@@ -1281,8 +1531,21 @@ function Publish-Progress {
         OverallSpeed = $overallFlow.OverallSpeed
         OverallEtaSeconds = $overallFlow.OverallEtaSeconds
         PlanEtaSeconds = $overallFlow.PlanEtaSeconds
+        PlanEtaEstimatedSeconds = $overallFlow.PlanEtaEstimatedSeconds
+        PlanEtaLowSeconds = $overallFlow.PlanEtaLowSeconds
+        PlanEtaHighSeconds = $overallFlow.PlanEtaHighSeconds
+        PlanEtaKnownLowerBoundSeconds = $overallFlow.PlanEtaKnownLowerBoundSeconds
         DisplayedPlanEtaSeconds = $overallFlow.DisplayedPlanEtaSeconds
+        DisplayedPlanEtaLowSeconds = $overallFlow.DisplayedPlanEtaLowSeconds
+        DisplayedPlanEtaHighSeconds = $overallFlow.DisplayedPlanEtaHighSeconds
         OverallEtaReadiness = [string]$overallFlow.OverallEtaReadiness
+        EtaReadiness = [string]$overallFlow.EtaReadiness
+        EtaModelEpoch = [int]$overallFlow.EtaModelEpoch
+        EtaCalibrationCoverage = $overallFlow.EtaCalibrationCoverage
+        RequiredSpeedClassCount = [int]$overallFlow.RequiredSpeedClassCount
+        RequiredFutureSpeedClassCount = [int]$overallFlow.RequiredFutureSpeedClassCount
+        CalibratedRequiredSpeedClassCount = [int]$overallFlow.CalibratedRequiredSpeedClassCount
+        UncalibratedRequiredSpeedClassCount = [int]$overallFlow.UncalibratedRequiredSpeedClassCount
         OverallEtaIsHeld = [bool]$overallFlow.OverallEtaIsHeld
         OverallEtaHasValidHistory = [bool]$overallFlow.OverallEtaHasValidHistory
         LastValidPlanEtaSeconds = $overallFlow.LastValidPlanEtaSeconds

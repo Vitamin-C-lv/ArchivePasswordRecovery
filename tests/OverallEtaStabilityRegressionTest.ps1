@@ -61,7 +61,7 @@ $uncalibratedItems = @(
     (New-TestEtaItem -Id 'U-C' -Count 1000L -Family 'CPUVerify' -Compute 'cpu')
 )
 $uncalibrated = Get-CoverageDurationSumEta -PlanCoverageIds @('U-A', 'U-B', 'U-C') -PlanCoverageItems $uncalibratedItems -CurrentCoverageId 'U-A' -CurrentTested 0 -CurrentTotal 10000000L -Activity RunningCoverage -CurrentSpeedPerSecond 4000000.0 -CurrentSpeedIsStable $true -FallbackGpuSpeedPerSecond 4000000.0 -SpeedProfiles @{}
-Assert-True ($null -ne $uncalibrated.PlanEtaSeconds -and $uncalibrated.OverallEtaReadiness -eq 'Partial' -and [int]$uncalibrated.UnestimatedCoverageCount -eq 1) 'uncalibrated future coverage did not retain a useful partial ETA'
+Assert-True ($null -eq $uncalibrated.PlanEtaSeconds -and $uncalibrated.OverallEtaReadiness -eq 'Calibrating' -and [int]$uncalibrated.UnestimatedCoverageCount -eq 1 -and $null -ne $uncalibrated.PlanEtaKnownLowerBoundSeconds) 'uncalibrated future coverage exposed a partial lower bound as the primary ETA'
 
 $compatibleProfile = @{}
 $compatibleProfile[$uncalibratedItems[0].SpeedClassKey] = [pscustomobject]@{
@@ -73,7 +73,7 @@ $calibratingItems = @(
     (New-TestEtaItem -Id 'K-B' -Count 5000000L -Family 'Generated')
 )
 $calibrating = Get-CoverageDurationSumEta -PlanCoverageIds @('K-A', 'K-B') -PlanCoverageItems $calibratingItems -CurrentCoverageId 'K-A' -CurrentTested 0 -CurrentTotal 10000000L -Activity RunningCoverage -CurrentSpeedPerSecond 4000000.0 -CurrentSpeedIsStable $true -SpeedProfiles $compatibleProfile
-Assert-True ($null -ne $calibrating.PlanEtaSeconds -and $calibrating.OverallEtaReadiness -eq 'Calibrating') 'compatible future profile did not expose a calibrating ETA'
+Assert-True ($null -eq $calibrating.PlanEtaSeconds -and $calibrating.OverallEtaReadiness -eq 'Calibrating') 'compatible future profile did not remain in the calibrating state'
 $emptyPlan = Get-CoverageDurationSumEta -PlanCoverageIds @() -PlanCoverageItems @() -Activity PreparingBackend
 Assert-True ($null -eq $emptyPlan.PlanEtaSeconds -and $emptyPlan.OverallEtaReadiness -eq 'Unavailable') 'empty startup plan invented a completed ETA'
 
@@ -85,13 +85,13 @@ $timelineItems = @(
     (New-TestEtaItem -Id 'T-C' -Count 5000000L -Family 'Generated')
 )
 $first = Get-CoverageDurationSumEta -PlanCoverageIds @('T-A', 'T-B', 'T-C') -PlanCoverageItems $timelineItems -CurrentCoverageId 'T-A' -CurrentTested 1000000L -CurrentTotal 10000000L -Activity RunningCoverage -CurrentSpeedPerSecond 3290000.0 -CurrentSpeedIsStable $false -FallbackGpuSpeedPerSecond 3290000.0
-Assert-True ($null -ne $first.PlanEtaSeconds -and [double]$first.PlanEtaSeconds -gt 0) 'first valid speed did not produce a plan ETA'
+Assert-True ($null -eq $first.PlanEtaSeconds -and $first.OverallEtaReadiness -eq 'Calibrating' -and $null -ne $first.PlanEtaEstimatedSeconds) 'first valid speed was promoted before the class was calibrated'
 $transition = Get-CoverageDurationSumEta -PlanCoverageIds @('T-A', 'T-B', 'T-C') -PlanCoverageItems $timelineItems -CompletedCoverageIds @('T-A') -CurrentCoverageId '' -Activity AdvancingCoverage -FallbackGpuSpeedPerSecond 3290000.0
-Assert-True ($null -ne $transition.PlanEtaSeconds -and [double]$transition.PlanEtaSeconds -gt 0) 'transition cleared the plan ETA estimate'
+Assert-True ($null -eq $transition.PlanEtaSeconds -and $null -ne $transition.PlanEtaEstimatedSeconds) 'transition exposed an uncalibrated partial ETA as the primary value'
 $rules = Get-CoverageDurationSumEta -PlanCoverageIds @('T-A', 'T-B', 'T-C') -PlanCoverageItems $timelineItems -CompletedCoverageIds @('T-A') -CurrentCoverageId 'T-B' -CurrentTested 1000000L -CurrentTotal 10000000L -Activity RunningCoverage -CurrentSpeedPerSecond 2380000.0 -CurrentSpeedIsStable $true -FallbackGpuSpeedPerSecond 2380000.0
-Assert-True ($null -ne $rules.PlanEtaSeconds -and [double]$rules.PlanEtaSeconds -gt 0) 'rules coverage did not produce a plan ETA'
+Assert-True ($null -eq $rules.PlanEtaSeconds -and $rules.OverallEtaReadiness -eq 'Calibrating' -and $null -ne $rules.PlanEtaEstimatedSeconds) 'rules coverage was promoted before the remaining classes were calibrated'
 $transitionAgain = Get-CoverageDurationSumEta -PlanCoverageIds @('T-A', 'T-B', 'T-C') -PlanCoverageItems $timelineItems -CompletedCoverageIds @('T-A', 'T-B') -CurrentCoverageId '' -Activity AdvancingCoverage -FallbackGpuSpeedPerSecond 2380000.0
-Assert-True ($null -ne $transitionAgain.PlanEtaSeconds -and [double]$transitionAgain.PlanEtaSeconds -gt 0) 'second transition cleared the plan ETA estimate'
+Assert-True ($null -eq $transitionAgain.PlanEtaSeconds -and $null -ne $transitionAgain.PlanEtaEstimatedSeconds) 'second transition exposed an uncalibrated partial ETA as the primary value'
 $starting = Get-CoverageDurationSumEta -PlanCoverageIds @('T-A', 'T-B', 'T-C') -PlanCoverageItems $timelineItems -CompletedCoverageIds @('T-A', 'T-B') -CurrentCoverageId 'T-C' -CurrentTested 1000000L -CurrentTotal 5000000L -Activity StartingHashcat -SpeedProfiles @{}
 $runningC = Get-CoverageDurationSumEta -PlanCoverageIds @('T-A', 'T-B', 'T-C') -PlanCoverageItems $timelineItems -CompletedCoverageIds @('T-A', 'T-B') -CurrentCoverageId 'T-C' -CurrentTested 1000000L -CurrentTotal 5000000L -Activity RunningCoverage -CurrentSpeedPerSecond 4260000.0 -CurrentSpeedIsStable $true
 Assert-True ($null -eq $starting.PlanEtaSeconds) 'starting a new uncalibrated speed class invented an ETA without a hold/profile'
@@ -123,8 +123,12 @@ $script:CurrentCoverageRunningStartedUtc = [datetime]::UtcNow.AddSeconds(-2)
 $script:CurrentSpeedClassKey = 'timeline-key'
 $script:SpeedClassProfiles = @{}
 $script:DisplayedPlanEtaSeconds = $null
+$script:DisplayedPlanEtaLowSeconds = $null
+$script:DisplayedPlanEtaHighSeconds = $null
 $script:DisplayedPlanEtaUpdatedUtc = $null
 $script:LastValidPlanEtaSeconds = $null
+$script:LastValidPlanEtaLowSeconds = $null
+$script:LastValidPlanEtaHighSeconds = $null
 $script:LastValidPlanEtaUtc = $null
 $script:LastPlanEtaStructureKey = ''
 $firstDisplay = Update-WorkerDisplayedPlanEta -PlanEta ([pscustomobject]@{ PlanEtaSeconds = 25.0; CurrentCoverageSpeedIsStable = $true; PlanEtaStructureKey = 'T-A=CurrentSpeed' })

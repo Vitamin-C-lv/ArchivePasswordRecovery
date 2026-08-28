@@ -45,8 +45,9 @@ $builtinLevel4Ids = @($builtinLevel4Items | ForEach-Object { [string]$_.Coverage
 $builtinLevel4Summary = Get-OverallFlowProgress -PlanCoverageIds $builtinLevel4Ids -PlanCoverageItems $builtinLevel4Items -CurrentCoverageId ([string]$builtinLevel4Items[0].CoverageId) -CurrentTested 100 -CurrentTotal ([long]$builtinLevel4Items[0].CandidateCount) -Activity PreparingCoverage -OverallSpeedPerSecond 100
 Assert-Equal -Actual $builtinLevel4Summary.OverallTotalReadiness -Expected 'Exact' -Message 'built-in level-4 readiness did not reach Exact'
 
-# A plan is Unavailable only before its coverage list exists, and becomes
-# Partial when future coverage totals are not all known.
+# Candidate totals remain a separate readiness axis. ETA readiness starts in
+# Calibrating as soon as a plan exists, even when only a confirmed lower bound
+# can be computed.
 $unavailable = Get-OverallFlowProgress -PlanCoverageIds @() -PlanCoverageItems @() -OverallCandidatesTested 0 -Activity PreparingBackend
 Assert-Equal -Actual $unavailable.OverallTotalReadiness -Expected 'Unavailable' -Message 'empty early plan was not marked Unavailable'
 $partialItems = @(
@@ -82,11 +83,11 @@ $preparing = Get-CoverageDurationSumEta -PlanCoverageIds @('C1', 'C2') -PlanCove
 Assert-Equal -Actual $preparing.PlanEtaSeconds -Expected $running.PlanEtaSeconds -Message 'calibrated preparation ETA did not persist'
 $early = Get-CoverageDurationSumEta -PlanCoverageIds @('C1', 'C2') -PlanCoverageItems $etaItems -CurrentCoverageId C1 -CurrentTested 0 -CurrentTotal 1000 -Activity PreparingCoverage
 Assert-True ($null -eq $early.PlanEtaSeconds) 'early preparation invented an ETA without a speed sample'
-Assert-Equal -Actual $early.OverallEtaReadiness -Expected 'Unavailable' -Message 'early ETA readiness was not Unavailable'
+Assert-Equal -Actual $early.OverallEtaReadiness -Expected 'Calibrating' -Message 'early ETA readiness was not Calibrating'
 
 $sourceText = [System.IO.File]::ReadAllText($workerPath)
 $uiText = [System.IO.File]::ReadAllText($uiPath)
-foreach ($field in @('OverallTotalReadiness', 'OverallEtaReadiness', 'PlanEtaSeconds', 'DisplayedPlanEtaSeconds', 'LastValidPlanEtaSeconds', 'LastValidPlanEtaUtc', 'UnestimatedCoverageCount', 'LastKnownOverallSpeed', 'LastKnownOverallSpeedUtc', 'OverallSpeedIsRecent', 'SpeedClassProfiles')) {
+foreach ($field in @('OverallTotalReadiness', 'OverallEtaReadiness', 'EtaReadiness', 'EtaModelEpoch', 'PlanEtaSeconds', 'PlanEtaLowSeconds', 'PlanEtaHighSeconds', 'PlanEtaKnownLowerBoundSeconds', 'DisplayedPlanEtaSeconds', 'LastValidPlanEtaSeconds', 'LastValidPlanEtaUtc', 'EtaCalibrationCoverage', 'RequiredFutureSpeedClassCount', 'CalibratedRequiredSpeedClassCount', 'UnestimatedCoverageCount', 'LastKnownOverallSpeed', 'LastKnownOverallSpeedUtc', 'OverallSpeedIsRecent', 'SpeedClassProfiles')) {
     Assert-True ($sourceText.IndexOf($field) -ge 0 -or $uiText.IndexOf($field) -ge 0) ('readiness/speed field is missing: ' + $field)
 }
 Assert-True ($sourceText.IndexOf('Set-WorkerOverallCoverageTotal -CoverageId ([string]$Item.CoverageId) -CandidateCount $Item.CandidateCount') -ge 0) 'prepared deterministic coverage totals are not returned to the overall summary'
