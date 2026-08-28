@@ -5,8 +5,31 @@ param()
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
+function Show-StartupFailure {
+    param([Parameter(Mandatory = $true)]$ErrorRecord)
+
+    $detail = [string]$ErrorRecord.Exception.Message
+    if ([string]::IsNullOrWhiteSpace($detail)) { $detail = '图形界面初始化失败。' }
+    if ($detail.Length -gt 240) { $detail = $detail.Substring(0, 240) }
+    try {
+        Add-Type -AssemblyName System.Windows.Forms -ErrorAction SilentlyContinue
+        [System.Windows.Forms.MessageBox]::Show(
+            ('程序启动失败。' + [Environment]::NewLine + $detail),
+            '压缩包密码恢复',
+            [System.Windows.Forms.MessageBoxButtons]::OK,
+            [System.Windows.Forms.MessageBoxIcon]::Error
+        ) | Out-Null
+    }
+    catch { }
+}
+
+trap {
+    Show-StartupFailure -ErrorRecord $_
+    exit 1
+}
+
 Add-Type -AssemblyName PresentationFramework, PresentationCore, WindowsBase, System.Windows.Forms
-Import-Module (Join-Path $PSScriptRoot 'RecoveryCore.psm1') -Force
+Import-Module (Join-Path $PSScriptRoot 'RecoveryCore.psm1') -Force -DisableNameChecking
 
 $projectRoot = Split-Path $PSScriptRoot -Parent
 $jobsRoot = Join-Path $env:LOCALAPPDATA 'ArchivePasswordRecovery\Jobs'
@@ -1507,7 +1530,7 @@ function Update-ProgressFromDisk {
     }
 }
 
-Set-SelectedValue -Control $controls.StrategyBox -Value '1'
+[void](Set-SelectedValue -Control $controls.StrategyBox -Value '1')
 
 [void](Add-LocalizedComboChoice -Control $controls.CharacterSetBox -DisplayText '小写字母' -Value 'lower')
 [void](Add-LocalizedComboChoice -Control $controls.CharacterSetBox -DisplayText '大写字母' -Value 'upper')
@@ -1515,7 +1538,7 @@ Set-SelectedValue -Control $controls.StrategyBox -Value '1'
 [void](Add-LocalizedComboChoice -Control $controls.CharacterSetBox -DisplayText '字母和数字' -Value 'alnum')
 [void](Add-LocalizedComboChoice -Control $controls.CharacterSetBox -DisplayText '全部字符' -Value 'all')
 [void](Add-LocalizedComboChoice -Control $controls.CharacterSetBox -DisplayText '自定义字符集' -Value 'custom')
-Set-SelectedValue -Control $controls.CharacterSetBox -Value 'alnum'
+[void](Set-SelectedValue -Control $controls.CharacterSetBox -Value 'alnum')
 
         Populate-DeviceChoices
 Update-StrategyHelp
