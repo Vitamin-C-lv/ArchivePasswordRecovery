@@ -18,6 +18,7 @@
 - L4 的第一个覆盖项是用户自定义 Mask/Hybrid（若填写）；不含 `?w` 时精确计算候选数，含 `?w` 时必须填写本地字典，`?w` 位于首尾可走 GPU，位于中间保持 CPU。其后才是 global/zh 字典覆盖项和首字母大写加 1–4 位数字覆盖项；后者只保留首字母确实发生变化的唯一词，再乘以 1–4 位数字空间。L4/L5 的 ID、数量和累计进度按实际规划计算，重复的年份/混合范围不会重复计数。
 - L4 的日期范围与“字典词 + 常见符号”都使用统一的有限生成集适配器：CPU 流式验证与 GPU 临时字典来自同一个候选顺序。常见符号固定为 `@`、`#`、`$`、`_`、`-`，不再生成 `!`；每个语言的候选总量是 L1 字典条目数的 5 倍。旧版已经完成的 `hybrid:L4-word-symbol-*:v2` 是包含新版 v3 的严格超集，只作显式兼容记账，不会反向把 v3 当成 v2。
 - Stage 3 的 Rules 明确拆成大小写族和追加族，CPU 与 GPU 使用同一组变形语义；Quick 和自定义 Mask 的覆盖修订号会随配置变化递增，避免复用旧断点。
+- GPU 兼容的内置小型、确定性 Coverage 可按原有逻辑顺序组成连续的 MaterializedDictionaryBatch；批次只减少 Hashcat 初始化次数，不改变 CoverageId、候选顺序、候选空间、断点或界面进度。
 - CPU 路径始终可用：由本机 NanaZip 对每个候选进行最终验证，适用于全部已识别格式和全部五层策略。
 - 已接入两条真实的本地 GPU 执行链：**ZIP WinZip AES → `zip2john` 本地提取 → Hashcat 7.1.2 OpenCL → 单块本机 GPU → NanaZip 最终验证**，以及 **7z AES → `7z2hashcat` 本地提取 → Hashcat mode 11600 → 单块本机 GPU → NanaZip 最终验证**。
 - Hashcat 只在实际初始化成功的本机 OpenCL 设备上运行，不按“RTX 4070”“780M”等型号字符串硬编码。界面显示 Windows 枚举设备和 Hashcat 实际可用设备；未被 Backend 初始化的显卡会明确显示为不可用。
@@ -43,7 +44,7 @@
 ## 隐私与本地数据边界
 
 - 归档本体、文件名、路径、提取到的元数据、字典、候选密码和找到的密码都不会上传；程序没有任何 HTTP、云、遥测或在线查询代码。
-- Worker 只在当前用户的 `%LOCALAPPDATA%\ArchivePasswordRecovery\Jobs\<任务 ID>` 保存 `job.json`、`progress.json` 和可恢复的 Hashcat restore 数据，以支持暂停/继续。`job.json` 可能包含恢复等级、固定 `RecoveryPlanYear` 与 Quick 候选，`progress.json` 会记录当前阶段、覆盖项断点、累计候选数和被跳过覆盖项的真实原因，并在恢复成功后包含找到的密码。每个 Worker Run 的 GPU 归档派生 hash、生成字典、规则文件、状态流和临时结果都放在 `%LOCALAPPDATA%\ArchivePasswordRecovery\Runtime\<任务 ID>\<RunId>`；一个 Run 最多生成一次 ZIP/7z Hashcat 归档工件（失败也缓存），终态清理该 Run 的临时内容，Jobs 下的持久化任务与 restore 不受影响。Hashcat executable、依赖、device-specific kernel cache 和 dictionary statistics 使用 `%LOCALAPPDATA%\ArchivePasswordRecovery\Cache\Hashcat` 作为工作目录持久保留，以复用编译结果且不写入正式 `tools\hashcat`；`--logfile-disable` 关闭日志，当前 Hashcat 7.1.2 不提供 `--dictstat-disable`，所以 dictstat 只会落在 app-local cache。启动时只清理已无活动进程的应用自有 Hashcat `.log`/`.pid` 残留；终态任务超过 7 天才会自动清理，暂停、停止和失败任务不会被自动删除。
+- Worker 只在当前用户的 `%LOCALAPPDATA%\ArchivePasswordRecovery\Jobs\<任务 ID>` 保存 `job.json`、`progress.json` 和可恢复的 Hashcat restore 数据，以支持暂停/继续。`job.json` 可能包含恢复等级、固定 `RecoveryPlanYear` 与 Quick 候选，`progress.json` 会记录当前阶段、覆盖项断点、累计候选数和被跳过覆盖项的真实原因，并在恢复成功后包含找到的密码。每个 Worker Run 的 GPU 归档派生 hash、生成字典、规则文件、状态流和临时结果都放在 `%LOCALAPPDATA%\ArchivePasswordRecovery\Runtime\<任务 ID>\<RunId>`；一个 Run 最多生成一次 ZIP/7z Hashcat 归档工件（失败也缓存），终态清理该 Run 的临时内容，Jobs 下的持久化任务与 restore 不受影响。Hashcat executable、依赖、device-specific kernel cache 和 dictionary statistics 使用 `%LOCALAPPDATA%\ArchivePasswordRecovery\Cache\HashcatRuntime\<RuntimeKey>` 作为版本化、不可变的工作目录持久保留；内置解压字典使用 `%LOCALAPPDATA%\ArchivePasswordRecovery\Cache\BuiltinDerived\<ResourceVersion>`，内置确定性批次使用 `%LOCALAPPDATA%\ArchivePasswordRecovery\Cache\BuiltinBatches`，不保存用户字典或归档/密码数据。这样可复用编译结果且不写入正式 `tools\hashcat`；`--logfile-disable` 关闭日志，当前 Hashcat 7.1.2 不提供 `--dictstat-disable`，所以 dictstat 只会落在 app-local cache。启动时只清理已无活动进程的应用自有 Hashcat `.log`/`.pid` 残留；终态任务超过 7 天才会自动清理，暂停、停止和失败任务不会被自动删除。
 - CPU 验证时，候选密码会作为本地 `7z.exe` 的一次命令行参数传递，但不会写入应用日志或上传。具有本机管理员/进程查看权限的其他软件理论上可在进程运行期间观察命令行，因此不要在不受信任的本机环境中运行密码恢复任务。
 - 程序在完全断网时可运行；网络不是运行组件。
 

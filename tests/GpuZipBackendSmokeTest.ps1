@@ -63,8 +63,11 @@ try {
         }
         Write-LocalJsonAtomic -Path (Join-Path $jobDirectory 'job.json') -Value $job
 
-        & (Resolve-WindowsPowerShell) -NoProfile -ExecutionPolicy Bypass -File $worker -JobDirectory $jobDirectory
+        $workerOutput = @(& (Resolve-WindowsPowerShell) -NoProfile -ExecutionPolicy Bypass -File $worker -JobDirectory $jobDirectory 2>&1)
         if ($LASTEXITCODE -ne 0) {
+            $workerOutput | ForEach-Object { Write-Error ([string]$_) }
+            $progressPath = Join-Path $jobDirectory 'progress.json'
+            if (Test-Path -LiteralPath $progressPath -PathType Leaf) { Write-Error ('Worker progress: ' + ((Get-Content -Raw $progressPath))) }
             throw "$vendor worker exited with code: $LASTEXITCODE"
         }
 

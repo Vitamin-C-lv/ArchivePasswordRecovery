@@ -27,6 +27,7 @@ desktop.ini
 *.restore
 hashcat.restore
 hashcat.potfile
+/tools/hashcat/ArchivePasswordRecovery-*.outfiles/
 
 # Accidental runtime output at the project root
 /Runtime/

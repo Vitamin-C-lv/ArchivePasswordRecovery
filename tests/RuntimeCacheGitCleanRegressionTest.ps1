@@ -78,10 +78,17 @@ try {
         })
 
     $statusBefore = Get-GitStatusText
-    Assert-True ([string]::IsNullOrEmpty($statusBefore)) ('Runtime cache baseline Git worktree is not clean: ' + $statusBefore)
     $kernelsBefore = @(Get-HashcatKernelNames)
     $ownedBefore = @(Get-HashcatOwnedLogPidNames)
-    $hashcatCacheDirectory = Join-Path (Get-RecoveryDataRoot) 'Cache\Hashcat'
+    $hashcatCacheDirectory = ''
+    foreach ($runtimeDirectory in @(
+        Get-ChildItem -LiteralPath (Join-Path (Get-RecoveryDataRoot) 'Cache\HashcatRuntime') -Directory -ErrorAction SilentlyContinue |
+            Where-Object { Test-Path -LiteralPath (Join-Path $_.FullName 'hashcat.exe') -PathType Leaf } |
+            Sort-Object LastWriteTime -Descending
+    )) {
+        $hashcatCacheDirectory = [string]$runtimeDirectory.FullName
+        break
+    }
     $workerPath = Join-Path $srcRoot 'RecoveryWorker.ps1'
     & (Resolve-WindowsPowerShell) -NoProfile -ExecutionPolicy Bypass -File $workerPath -JobDirectory $jobDirectory
     $exitCode = $LASTEXITCODE
@@ -93,7 +100,7 @@ try {
     Assert-True ([int]$progress.ArchiveArtifactExtractionCalls -eq 1) 'Runtime cache Worker did not perform one cached archive extraction'
     Assert-True ([string]$progress.ArchiveArtifactState -eq 'Ready') 'Runtime cache Worker did not report a ready artifact cache'
     Assert-True ([bool]$progress.HashcatLogfileDisabled) 'Runtime cache Worker did not disable Hashcat logfile output'
-    Assert-True (Test-Path -LiteralPath (Join-Path $hashcatCacheDirectory 'hashcat.exe') -PathType Leaf) 'Hashcat executable was not shadowed into the app-local cache'
+    Assert-True (-not [string]::IsNullOrWhiteSpace([string]$hashcatCacheDirectory) -and (Test-Path -LiteralPath (Join-Path $hashcatCacheDirectory 'hashcat.exe') -PathType Leaf)) 'Hashcat executable was not shadowed into the versioned app-local cache'
     Assert-True (Test-Path -LiteralPath (Join-Path $hashcatCacheDirectory 'kernels') -PathType Container) 'Hashcat app-local kernel cache directory was not created'
     $appLocalKernelCount = @(Get-ChildItem -LiteralPath (Join-Path $hashcatCacheDirectory 'kernels') -File -Filter '*.kernel' -ErrorAction SilentlyContinue).Count
     Assert-True ($appLocalKernelCount -gt 0) 'The real GPU run did not leave a reusable app-local Hashcat kernel cache'

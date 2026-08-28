@@ -3,6 +3,7 @@
 $script:HashcatDeviceCache = $null
 $script:HashcatDeviceCacheUtc = [datetime]::MinValue
 $script:TerminalJobRetentionDays = 7
+$script:BuiltinDictionaryManifestCache = $null
 
 function Resolve-SevenZip {
     [CmdletBinding()]
@@ -1548,13 +1549,18 @@ function Cleanup-StaleRecoveryRuntime {
 
 function Get-BuiltinDictionaryManifest {
     [CmdletBinding()]
-    param()
+    param(
+        [switch]$Refresh
+    )
 
     $manifestPath = Join-Path (Split-Path $PSScriptRoot -Parent) 'resources\dictionary-manifest.json'
     if (-not (Test-Path -LiteralPath $manifestPath -PathType Leaf)) {
         throw 'The built-in dictionary manifest is missing from the local application resources.'
     }
-    return (Read-LocalJson -Path $manifestPath)
+    if ($Refresh -or $null -eq $script:BuiltinDictionaryManifestCache) {
+        $script:BuiltinDictionaryManifestCache = Read-LocalJson -Path $manifestPath
+    }
+    return $script:BuiltinDictionaryManifestCache
 }
 
 function Get-BuiltinDictionaryDefinition {
@@ -1610,33 +1616,77 @@ function Expand-BuiltinDictionary {
         throw ('The built-in dictionary resource is missing: {0}' -f $sourcePath)
     }
 
-    $dictionaryDirectory = Join-Path $RuntimeDirectory 'dictionaries'
-    New-Item -ItemType Directory -Path $dictionaryDirectory -Force | Out-Null
-    $outputPath = Join-Path $dictionaryDirectory ('level{0}-{1}.txt' -f $Level, $Language)
-    if (Test-Path -LiteralPath $outputPath -PathType Leaf) {
-        if ((Get-Item -LiteralPath $outputPath).Length -gt 0) {
-            return $outputPath
-        }
-    }
-
-    $temporaryPath = $outputPath + '.' + [guid]::NewGuid().ToString('N') + '.tmp'
-    $inputStream = [System.IO.File]::Open($sourcePath, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::Read)
-    try {
-        $gzip = New-Object System.IO.Compression.GZipStream($inputStream, [System.IO.Compression.CompressionMode]::Decompress)
+    # Built-in plaintext is deterministic application data, so keep it in an
+    # app-local, resource-versioned cache rather than rebuilding it under each
+    # per-run Runtime directory. RuntimeDirectory remains in the signature for
+    # callers that already pass it, but it is deliberately not used for this
+    # persistent built-in cache.
+    $manifest = Get-BuiltinDictionaryManifest
+    $resourceVersion = if ($manifest.PSObject.Properties.Name -contains 'ResourceVersion') { [string]$manifest.ResourceVersion } else { 'v1' }
+    $cacheRoot = Join-Path (Get-RecoveryDataRoot) ('Cache\BuiltinDerived\' + $resourceVersion)
+    $cacheDirectory = Join-Path $cacheRoot ('dictionary-level{0}-{1}' -f $Level, $Language)
+    $outputPath = Join-Path $cacheDirectory 'dictionary.txt'
+    $cachePath = Join-Path $cacheDirectory 'cache.json'
+    $expectedCount = [long]$definition.CandidateCount
+    $cacheHit = $false
+    if ((Test-Path -LiteralPath $outputPath -PathType Leaf) -and (Test-Path -LiteralPath $cachePath -PathType Leaf)) {
         try {
-            $outputStream = [System.IO.File]::Create($temporaryPath)
-            try { $gzip.CopyTo($outputStream) }
-            finally { $outputStream.Dispose() }
+            $cache = Read-LocalJson -Path $cachePath
+            $cacheHit = [int]$cache.CacheSchemaVersion -eq 1 -and [string]$cache.ResourceVersion -eq $resourceVersion -and
+                [string]$cache.Kind -eq 'BuiltinDictionary' -and [string]$cache.Language -eq $Language -and
+                [int]$cache.Level -eq $Level -and [long]$cache.OutputCount -eq $expectedCount -and
+                (Get-Item -LiteralPath $outputPath -Force).Length -gt 0
         }
-        finally { $gzip.Dispose() }
+        catch { $cacheHit = $false }
     }
-    finally { $inputStream.Dispose() }
+    if ($cacheHit) { return $outputPath }
+    if (Test-Path -LiteralPath $cacheDirectory -PathType Container) {
+        throw ('BUILTIN_DERIVED_CACHE_INVALID: immutable cache marker did not match: ' + $cacheDirectory)
+    }
 
+    New-Item -ItemType Directory -Path $cacheRoot -Force | Out-Null
+    $temporaryDirectory = Join-Path $cacheRoot ('.' + (Split-Path $cacheDirectory -Leaf) + '.' + [guid]::NewGuid().ToString('N') + '.tmp')
+    New-Item -ItemType Directory -Path $temporaryDirectory | Out-Null
+    $temporaryPath = Join-Path $temporaryDirectory 'dictionary.txt'
     try {
-        Move-Item -LiteralPath $temporaryPath -Destination $outputPath -Force
+        $inputStream = [System.IO.File]::Open($sourcePath, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::Read)
+        try {
+            $gzip = New-Object System.IO.Compression.GZipStream($inputStream, [System.IO.Compression.CompressionMode]::Decompress)
+            try {
+                $outputStream = [System.IO.File]::Create($temporaryPath)
+                try { $gzip.CopyTo($outputStream) }
+                finally { $outputStream.Dispose() }
+            }
+            finally { $gzip.Dispose() }
+        }
+        finally {
+            $inputStream.Dispose()
+        }
+        Write-LocalJsonAtomic -Path (Join-Path $temporaryDirectory 'cache.json') -Value ([ordered]@{
+                CacheSchemaVersion = 1
+                ResourceVersion = $resourceVersion
+                Kind = 'BuiltinDictionary'
+                Language = $Language
+                Level = $Level
+                OutputCount = $expectedCount
+                CreatedUtc = [datetime]::UtcNow.ToString('o')
+            })
+        try {
+            [System.IO.Directory]::Move($temporaryDirectory, $cacheDirectory)
+        }
+        catch {
+            # A second Worker may have published the same immutable cache while
+            # this copy was running. Reuse it only when its marker is exact.
+            if (-not (Test-Path -LiteralPath $cacheDirectory -PathType Container)) { throw }
+            $existing = Read-LocalJson -Path $cachePath
+            if ([int]$existing.CacheSchemaVersion -ne 1 -or [string]$existing.ResourceVersion -ne $resourceVersion -or
+                [string]$existing.Kind -ne 'BuiltinDictionary' -or [string]$existing.Language -ne $Language -or
+                [int]$existing.Level -ne $Level -or [long]$existing.OutputCount -ne $expectedCount -or
+                -not (Test-Path -LiteralPath $outputPath -PathType Leaf)) { throw 'A concurrent built-in cache has a different marker.' }
+        }
     }
     finally {
-        if (Test-Path -LiteralPath $temporaryPath) { Remove-Item -LiteralPath $temporaryPath -Force -ErrorAction SilentlyContinue }
+        if (Test-Path -LiteralPath $temporaryDirectory -PathType Container) { [System.IO.Directory]::Delete($temporaryDirectory, $true) }
     }
     return $outputPath
 }
@@ -3282,7 +3332,10 @@ function Get-RecoveryPlanItems {
                         })
                     $items.Add([pscustomobject]@{
                             CoverageId = ('rules:append:L{0}-{1}:v3' -f $level, $language); Kind = 'RuleAppendVariants'; RuleFamily = 'Append'; DictionarySource = 'Builtin'; DisplayName = ('L{0} 后缀变形（{1}）' -f $level, $language);
-                            Language = $language; DictionaryLevel = $level; CandidateCount = $null; EngineStrategy = 'Rules'; GpuSupported = $true
+                            # Built-in append has six deterministic, non-empty
+                            # variants per source word. Avoid a preparation
+                            # rescan only to discover this planner total.
+                            Language = $language; DictionaryLevel = $level; CandidateCount = ([long](Get-BuiltinDictionaryCount -Language $language -Level $level) * 6L); EngineStrategy = 'Rules'; GpuSupported = $true
                         })
                 }
             }
