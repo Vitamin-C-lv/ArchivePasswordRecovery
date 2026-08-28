@@ -41,7 +41,7 @@ try {
     for ($index = 0; $index -lt ($primaryLabelNames.Count - 1); $index++) {
         Assert-True ($xamlText.IndexOf($primaryLabelNames[$index]) -lt $xamlText.IndexOf($primaryLabelNames[$index + 1])) 'overall primary KPI order does not put ETA first'
     }
-    foreach ($label in @('预计完成', '已累计测试', '剩余待尝试', '整体速度')) {
+    foreach ($label in @('预计完成', '已累计测试', '剩余待尝试', '当前搜索速度')) {
         Assert-True ($xamlText.IndexOf($label) -ge 0) ('overall primary label is missing: ' + $label)
     }
 

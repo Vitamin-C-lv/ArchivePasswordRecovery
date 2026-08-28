@@ -54,6 +54,7 @@ foreach ($text in @($startingText, $restoringText, $partialText)) {
     Assert-True (-not [string]::IsNullOrWhiteSpace($text)) 'preparation UX message is empty'
     Assert-True ($text -notmatch '未知|约 0 秒') ('preparation UX message contains a bare/false status: ' + $text)
 }
+Assert-True ($startingText -match '速度采样后自动校正' -and $restoringText -match '速度采样后自动校正') 'preparation copy still says ETA only appears when search starts'
 
 # C: ETA formatting never turns a positive sub-second ETA into fake "about 0
 # seconds", and an unavailable ETA explains when it can be updated.

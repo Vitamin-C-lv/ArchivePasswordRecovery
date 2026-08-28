@@ -221,7 +221,7 @@ try { $startupJobCleanup = @(Cleanup-TerminalRecoveryJobs -JobsRoot $jobsRoot) }
                                     <ColumnDefinition Width="*" />
                                 </Grid.ColumnDefinitions>
                                 <StackPanel Grid.Column="0">
-                                    <TextBlock x:Name="OverallEtaLabel" FontSize="12" Foreground="#687789" Text="预计完成" />
+                                    <TextBlock x:Name="OverallEtaLabel" FontSize="12" Foreground="#687789" ToolTip="表示按当前恢复级别耗尽已配置搜索范围所需的预计时间；密码可能更早找到，也可能不在当前搜索范围内。" Text="预计完成" />
                                     <TextBlock x:Name="OverallEtaValue" Margin="0,3,8,0" TextWrapping="Wrap" FontSize="22" FontWeight="SemiBold" Foreground="#173B62" Text="开始搜索后显示" />
                                 </StackPanel>
                                 <StackPanel Grid.Column="1">
@@ -233,7 +233,7 @@ try { $startupJobCleanup = @(Cleanup-TerminalRecoveryJobs -JobsRoot $jobsRoot) }
                                     <TextBlock x:Name="OverallCandidatesRemainingValue" Margin="0,3,8,0" TextWrapping="Wrap" FontSize="22" FontWeight="SemiBold" Foreground="#173B62" Text="准备后显示" />
                                 </StackPanel>
                                 <StackPanel Grid.Column="3">
-                                    <TextBlock x:Name="OverallSpeedLabel" FontSize="12" Foreground="#687789" Text="整体速度" />
+                                    <TextBlock x:Name="OverallSpeedLabel" FontSize="12" Foreground="#687789" Text="当前搜索速度" />
                                     <TextBlock x:Name="OverallSpeedValue" Margin="0,3,0,0" TextWrapping="Wrap" FontSize="22" FontWeight="SemiBold" Foreground="#173B62" Text="开始搜索后显示" />
                                 </StackPanel>
                             </Grid>
@@ -626,10 +626,10 @@ function Convert-UiMessage {
         'The overall recovery plan is ready; preparing the local recovery backend.' = '整体恢复计划已就绪，正在准备本地恢复后端。'
         'Preparing the next coverage.' = '正在准备下一搜索范围。'
         'Preparing the local search.' = '正在准备本地搜索。'
-        'Preparing the current coverage; overall ETA will update when preparation completes.' = '正在准备当前范围，准备完成后将更新整体预计时间。'
-        'Preparing the local search; overall ETA will update when search starts.' = '正在准备本地搜索，开始搜索后将更新整体预计时间。'
-        'Starting the local search backend; overall ETA will update when search starts.' = '正在启动本地搜索后端，开始搜索后将更新整体预计时间。'
-        'Restoring the saved local search checkpoint; overall ETA will update when search starts.' = '正在恢复已保存的本地搜索断点，开始搜索后将更新整体预计时间。'
+        'Preparing the current coverage; overall ETA will update when preparation completes.' = '正在准备当前范围，整体预计时间将在搜索范围速度稳定后自动校正。'
+        'Preparing the local search; overall ETA will update when search starts.' = '正在准备本地搜索，整体预计时间将在速度采样后自动校正。'
+        'Starting the local search backend; overall ETA will update when search starts.' = '正在启动本地搜索后端，整体预计时间将在速度采样后自动校正。'
+        'Restoring the saved local search checkpoint; overall ETA will update when search starts.' = '正在恢复已保存的本地搜索断点，整体预计时间将在速度采样后自动校正。'
         'Searching the current coverage.' = '正在搜索当前范围。'
         'Overall progress is pausing; the current checkpoint will remain available.' = '整体进度正在暂停，当前断点仍可继续使用。'
         'Overall progress is paused; resume to continue searching.' = '整体进度已暂停，点击“继续”恢复搜索。'
@@ -1448,7 +1448,13 @@ function Update-ProgressFromDisk {
         }
         if ($overallTotalReadiness -eq 'Partial') { $overallCandidatesPartial = $true }
         $overallSpeed = if ($progress.PSObject.Properties.Name -contains 'OverallSpeed') { $progress.OverallSpeed } elseif ($progress.PSObject.Properties.Name -contains 'SpeedPerSecond') { $progress.SpeedPerSecond } else { $null }
-        $overallEta = if ($progress.PSObject.Properties.Name -contains 'OverallEtaSeconds') { $progress.OverallEtaSeconds } else { $null }
+        $overallEta = if ($progress.PSObject.Properties.Name -contains 'DisplayedPlanEtaSeconds') { $progress.DisplayedPlanEtaSeconds } elseif ($progress.PSObject.Properties.Name -contains 'OverallEtaSeconds') { $progress.OverallEtaSeconds } else { $null }
+        $overallEtaReadiness = if ($progress.PSObject.Properties.Name -contains 'OverallEtaReadiness' -and -not [string]::IsNullOrWhiteSpace([string]$progress.OverallEtaReadiness)) { [string]$progress.OverallEtaReadiness } else { 'Unavailable' }
+        $overallEtaHasValidHistory = $progress.PSObject.Properties.Name -contains 'OverallEtaHasValidHistory' -and [bool]$progress.OverallEtaHasValidHistory
+        $overallEtaIsHeld = $progress.PSObject.Properties.Name -contains 'OverallEtaIsHeld' -and [bool]$progress.OverallEtaIsHeld
+        [int]$unestimatedCoverageCount = 0
+        try { if ($progress.PSObject.Properties.Name -contains 'UnestimatedCoverageCount' -and $null -ne $progress.UnestimatedCoverageCount) { $unestimatedCoverageCount = [int]$progress.UnestimatedCoverageCount } } catch { $unestimatedCoverageCount = 0 }
+        $planEtaAdjustmentReason = if ($progress.PSObject.Properties.Name -contains 'PlanEtaAdjustmentReason') { [string]$progress.PlanEtaAdjustmentReason } else { '' }
         $overallSpeedIsRecent = $progress.PSObject.Properties.Name -contains 'OverallSpeedIsRecent' -and [bool]$progress.OverallSpeedIsRecent
         $overallInvariantViolation = $progress.PSObject.Properties.Name -contains 'ProgressInvariantViolation' -and [bool]$progress.ProgressInvariantViolation
 
@@ -1531,14 +1537,16 @@ function Update-ProgressFromDisk {
             $controls.OverallSpeedValue.Text = '开始搜索后显示'
         }
 
-        if ($null -ne $overallEta -and [double]$overallEta -ge 0 -and -not $overallInvariantViolation) {
-            $controls.OverallEtaValue.Text = Format-LocalEta -Seconds $overallEta
-        }
-        elseif ($displayState -eq 'Recovered') {
+        if ($displayState -eq 'Recovered') {
             $controls.OverallEtaValue.Text = '已找到密码'
         }
         elseif ($displayState -eq 'Exhausted') {
             $controls.OverallEtaValue.Text = '已完成'
+        }
+        elseif ($null -ne $overallEta -and [double]$overallEta -ge 0 -and -not $overallInvariantViolation) {
+            $etaText = Format-LocalEta -Seconds $overallEta
+            if ($unestimatedCoverageCount -gt 0 -and [double]$overallEta -gt 0) { $etaText += '以上' }
+            $controls.OverallEtaValue.Text = $etaText
         }
         elseif ($overallInvariantViolation) {
             $controls.OverallEtaValue.Text = '正在同步…'
@@ -1546,23 +1554,37 @@ function Update-ProgressFromDisk {
         elseif ($activity -in @('Pausing', 'Paused', 'Stopping', 'Stopped')) {
             $controls.OverallEtaValue.Text = '继续搜索后更新'
         }
+        elseif ($overallEtaHasValidHistory) {
+            $controls.OverallEtaValue.Text = '正在重新校正'
+        }
         else {
             $controls.OverallEtaValue.Text = '开始搜索后显示'
         }
 
         $overallHelperText = ''
-        if ($overallSpeedIsRecent -and $null -ne $overallEta -and -not $overallInvariantViolation) {
-            $overallHelperText = '当前正在准备下一范围，预计时间按最近速度计算'
+        if ($overallEtaIsHeld -and $null -ne $overallEta -and -not $overallInvariantViolation) {
+            $overallHelperText = '正在准备下一搜索范围，预计时间按最近有效速度保持并将在搜索开始后校正'
         }
-        if ($overallTotalReadiness -eq 'Partial') {
-            $partialHelper = '当前为基于已知范围的预计，后续范围总量补齐后会自动修正'
-            $overallHelperText = if ([string]::IsNullOrWhiteSpace($overallHelperText)) { $partialHelper } else { $overallHelperText + '；' + $partialHelper }
+        elseif ($planEtaAdjustmentReason -eq 'StructuralRecalibration') {
+            $overallHelperText = '已根据当前搜索范围重新校正预计时间'
         }
-        elseif ($overallTotalReadiness -eq 'Unavailable') {
+        elseif ($overallEtaReadiness -eq 'Calibrating') {
+            $overallHelperText = '正在校准后续搜索范围速度，预计时间会自动修正'
+        }
+        elseif ($overallEtaReadiness -eq 'Unavailable' -and -not $overallEtaHasValidHistory) {
             $overallHelperText = '整体搜索计划正在准备，完成后显示完整总量与预计完成时间'
         }
-        elseif ($overallSpeedNumber -le 0 -and $displayState -notin @('Recovered', 'Exhausted')) {
-            $overallHelperText = '开始搜索后显示整体速度与预计完成时间'
+        elseif ($null -eq $overallEta -and $overallSpeedNumber -le 0 -and -not $overallEtaHasValidHistory -and $displayState -notin @('Recovered', 'Exhausted')) {
+            $overallHelperText = '开始搜索后显示当前搜索速度与预计完成时间'
+        }
+        if ($overallEtaReadiness -eq 'Partial') {
+            $partialHelper = if ($unestimatedCoverageCount -gt 0) {
+                '另有 {0} 个搜索范围暂无法预估耗时，当前预计为已知范围耗时之和' -f $unestimatedCoverageCount
+            }
+            else {
+                '当前为基于已知范围的预计，后续范围总量补齐后会自动修正'
+            }
+            $overallHelperText = if ([string]::IsNullOrWhiteSpace($overallHelperText)) { $partialHelper } else { $overallHelperText + '；' + $partialHelper }
         }
         $controls.OverallProgressHelper.Text = $overallHelperText
         $controls.OverallProgressHelper.Visibility = if ([string]::IsNullOrWhiteSpace($overallHelperText)) { [System.Windows.Visibility]::Collapsed } else { [System.Windows.Visibility]::Visible }

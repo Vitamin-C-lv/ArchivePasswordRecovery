@@ -142,8 +142,27 @@ $script:EffectiveSpeed = 0.0
 $script:LastMetricUtc = [datetime]::UtcNow
 $script:LastMetricCandidates = $script:CandidatesTested
 $script:LastBackendSpeed = 0.0
+$script:LastBackendSpeedSampleUtc = $null
+$script:LastConsumedBackendSpeedSampleUtc = $null
 $script:LastKnownOverallSpeed = 0.0
 $script:LastKnownOverallSpeedUtc = $null
+$script:SpeedClassProfiles = @{}
+$script:ArchiveBackendClass = 'archive:unknown'
+$script:PreferredGpuComputeBackendClass = ''
+$script:CurrentSpeedClassKey = ''
+$script:CurrentArchiveBackendClass = ''
+$script:CurrentComputeBackendClass = ''
+$script:CurrentAttackFamily = ''
+$script:CurrentCoverageRunningStartedUtc = $null
+$script:CurrentCoverageSpeedSampleCount = 0
+$script:CurrentCoverageLastSpeedSampleUtc = $null
+$script:ConservativeObservedGpuSpeed = 0.0
+$script:DisplayedPlanEtaSeconds = $null
+$script:DisplayedPlanEtaUpdatedUtc = $null
+$script:LastValidPlanEtaSeconds = $null
+$script:LastValidPlanEtaUtc = $null
+$script:LastPlanEtaStructureKey = ''
+$script:LastPlanEtaAdjustmentReason = ''
 if ($null -ne $previous) {
     $previousOverallSpeed = $null
     if ($previous.PSObject.Properties.Name -contains 'LastKnownOverallSpeed') {
@@ -263,6 +282,9 @@ function Set-WorkerActivity {
 
     $script:Activity = $Activity
     $script:ActivityMessage = $Message
+    if ($Activity -eq 'RunningCoverage' -and $null -eq $script:CurrentCoverageRunningStartedUtc) {
+        $script:CurrentCoverageRunningStartedUtc = [datetime]::UtcNow
+    }
 }
 
 function Reset-PreparationProgress {
@@ -415,6 +437,211 @@ function Set-WorkerOverallCoverageTotal {
     catch { }
 }
 
+function Get-WorkerArchiveBackendClass {
+    [CmdletBinding()]
+    param(
+        $Inspection,
+        $Artifact = $null
+    )
+
+    $format = [string](Get-ObjectPropertyValue -Object $Inspection -Name 'Format' -Default '')
+    $formatKey = if ($format -match '(?i)7.?z') { '7z' } elseif ($format -match '(?i)zip') { 'zip' } elseif ($format -match '(?i)rar') { 'rar' } else { $format.ToLowerInvariant() }
+    if ([string]::IsNullOrWhiteSpace($formatKey)) { $formatKey = 'archive' }
+    $hashMode = [string](Get-ObjectPropertyValue -Object $Artifact -Name 'HashMode' -Default '')
+    if ([string]::IsNullOrWhiteSpace($hashMode)) {
+        $hashMode = switch ($formatKey) {
+            'zip' { '13600' }
+            '7z' { '11600' }
+            default { '' }
+        }
+    }
+    if ([string]::IsNullOrWhiteSpace($hashMode)) { return $formatKey }
+    return ($formatKey + $hashMode)
+}
+
+function Get-WorkerAttackFamily {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]$Item
+    )
+
+    $kind = [string](Get-ObjectPropertyValue -Object $Item -Name 'Kind' -Default '')
+    $strategy = [string](Get-ObjectPropertyValue -Object $Item -Name 'EngineStrategy' -Default '')
+    switch ($kind) {
+        'Quick' { return 'CPUVerify' }
+        'BuiltinDictionary' { return 'Dictionary' }
+        'CustomDictionary' { return 'Dictionary' }
+        'Dictionary' { return 'Dictionary' }
+        'RuleCaseVariants' { return 'Rules' }
+        'RuleAppendVariants' { return 'Rules' }
+        'RulesDictionary' { return 'Rules' }
+        'CustomRules' { return 'Rules' }
+        'DateRange' { return 'Generated' }
+        'CommonSymbols' { return 'Generated' }
+        'HybridDictionary' { return 'Hybrid' }
+        'CapitalInitialDigits' { return 'Hybrid' }
+        'ConfiguredBruteForce' { return 'BruteForce' }
+        'MaskRange' {
+            if ($strategy -eq 'BruteForce') { return 'BruteForce' }
+            return 'Mask'
+        }
+        'MaskExact' { return 'Mask' }
+        'CustomMask' { return 'Mask' }
+    }
+    switch ($strategy) {
+        'Dictionary' { return 'Dictionary' }
+        'GeneratedDictionary' { return 'Generated' }
+        'Rules' { return 'Rules' }
+        'Mask' { return 'Mask' }
+        'BruteForce' { return 'BruteForce' }
+        default { return 'CPUVerify' }
+    }
+}
+
+function Get-WorkerComputeBackendClass {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]$Engine
+    )
+
+    if (-not [bool](Get-ObjectPropertyValue -Object $Engine -Name 'UseGpu' -Default $false)) { return 'cpu' }
+    $vendor = [string](Get-ObjectPropertyValue -Object $Engine -Name 'DeviceVendor' -Default '')
+    $deviceId = [string](Get-ObjectPropertyValue -Object $Engine -Name 'DeviceId' -Default '')
+    $deviceName = [string](Get-ObjectPropertyValue -Object $Engine -Name 'ComputeDevice' -Default '')
+    $identity = if (-not [string]::IsNullOrWhiteSpace($deviceId)) {
+        ($vendor + '-device-' + $deviceId)
+    }
+    else {
+        ($vendor + '-' + $deviceName)
+    }
+    $identity = [regex]::Replace($identity.ToLowerInvariant(), '[^a-z0-9_.:-]', '_')
+    if ([string]::IsNullOrWhiteSpace($identity)) { $identity = 'unidentified' }
+    return ('gpu:' + $identity)
+}
+
+function Get-WorkerPlanSpeedClassMetadata {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]$Item,
+        $Engine = $null,
+        $Artifact = $null
+    )
+
+    $existingKey = [string](Get-ObjectPropertyValue -Object $Item -Name 'SpeedClassKey' -Default '')
+    $archiveClass = [string](Get-ObjectPropertyValue -Object $Item -Name 'ArchiveBackendClass' -Default '')
+    if ([string]::IsNullOrWhiteSpace($archiveClass)) { $archiveClass = [string]$script:ArchiveBackendClass }
+    if ($null -ne $Artifact) { $archiveClass = Get-WorkerArchiveBackendClass -Inspection ([pscustomobject]@{ Format = $archiveClass }) -Artifact $Artifact }
+    $attackFamily = [string](Get-ObjectPropertyValue -Object $Item -Name 'AttackFamily' -Default '')
+    if ([string]::IsNullOrWhiteSpace($attackFamily)) { $attackFamily = Get-WorkerAttackFamily -Item $Item }
+
+    $computeClass = [string](Get-ObjectPropertyValue -Object $Item -Name 'ComputeBackendClass' -Default '')
+    if ($null -ne $Engine) {
+        $computeClass = Get-WorkerComputeBackendClass -Engine $Engine
+    }
+    elseif ([string]::IsNullOrWhiteSpace($computeClass)) {
+        $gpuSupported = [bool](Get-ObjectPropertyValue -Object $Item -Name 'GpuSupported' -Default $false)
+        if (-not $gpuSupported) {
+            $computeClass = 'cpu'
+        }
+        else {
+            $preference = [string](Get-ObjectPropertyValue -Object $job -Name 'DevicePreference' -Default 'Auto')
+            if ($preference -eq 'CPU') {
+                $computeClass = 'cpu'
+            }
+            elseif (-not [string]::IsNullOrWhiteSpace($script:PreferredGpuComputeBackendClass)) {
+                $computeClass = $script:PreferredGpuComputeBackendClass
+            }
+            else {
+                $computeClass = 'gpu:uninitialized'
+            }
+        }
+    }
+
+    $key = if (-not [string]::IsNullOrWhiteSpace($existingKey) -and $null -eq $Engine -and $null -eq $Artifact) {
+        $existingKey
+    }
+    else {
+        '{0}|{1}|{2}' -f $archiveClass, $computeClass, $attackFamily
+    }
+    return [pscustomobject]@{
+        SpeedClassKey       = $key
+        ArchiveBackendClass = $archiveClass
+        ComputeBackendClass = $computeClass
+        AttackFamily        = $attackFamily
+    }
+}
+
+function Set-WorkerCoverageSpeedClass {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]$Item,
+        [Parameter(Mandatory = $true)]$Engine,
+        $Artifact = $null
+    )
+
+    $metadata = Get-WorkerPlanSpeedClassMetadata -Item $Item -Engine $Engine -Artifact $Artifact
+    $Item | Add-Member -NotePropertyName SpeedClassKey -NotePropertyValue ([string]$metadata.SpeedClassKey) -Force
+    $Item | Add-Member -NotePropertyName ArchiveBackendClass -NotePropertyValue ([string]$metadata.ArchiveBackendClass) -Force
+    $Item | Add-Member -NotePropertyName ComputeBackendClass -NotePropertyValue ([string]$metadata.ComputeBackendClass) -Force
+    $Item | Add-Member -NotePropertyName AttackFamily -NotePropertyValue ([string]$metadata.AttackFamily) -Force
+    $script:CurrentSpeedClassKey = [string]$metadata.SpeedClassKey
+    $script:CurrentArchiveBackendClass = [string]$metadata.ArchiveBackendClass
+    $script:CurrentComputeBackendClass = [string]$metadata.ComputeBackendClass
+    $script:CurrentAttackFamily = [string]$metadata.AttackFamily
+    if ($metadata.ComputeBackendClass -like 'gpu:*') {
+        $script:PreferredGpuComputeBackendClass = [string]$metadata.ComputeBackendClass
+    }
+    return $metadata
+}
+
+function Update-WorkerSpeedClassProfile {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][double]$ObservedSpeed,
+        [Parameter(Mandatory = $true)][datetime]$SampleUtc
+    )
+
+    if ($ObservedSpeed -le 0 -or [string]::IsNullOrWhiteSpace($script:CurrentSpeedClassKey) -or
+        $script:Activity -ne 'RunningCoverage' -or $null -eq $script:ActivePlanItem) { return }
+    $profile = if ($script:SpeedClassProfiles.ContainsKey($script:CurrentSpeedClassKey)) { $script:SpeedClassProfiles[$script:CurrentSpeedClassKey] } else { $null }
+    if ($null -eq $profile) {
+        $profile = [pscustomobject]@{
+            SpeedClassKey       = $script:CurrentSpeedClassKey
+            ArchiveBackendClass = $script:CurrentArchiveBackendClass
+            ComputeBackendClass = $script:CurrentComputeBackendClass
+            AttackFamily        = $script:CurrentAttackFamily
+            SampleCount         = 0
+            SmoothedSpeed       = 0.0
+            LastSampleUtc       = $null
+            IsCalibrated         = $false
+        }
+    }
+    [int]$profile.SampleCount = [int]$profile.SampleCount + 1
+    [double]$profile.SmoothedSpeed = if ([double]$profile.SmoothedSpeed -le 0) {
+        $ObservedSpeed
+    }
+    else {
+        (0.70 * [double]$profile.SmoothedSpeed) + (0.30 * $ObservedSpeed)
+    }
+    $profile.LastSampleUtc = $SampleUtc.ToUniversalTime().ToString('o')
+    $script:CurrentCoverageSpeedSampleCount++
+    $script:CurrentCoverageLastSpeedSampleUtc = $SampleUtc.ToUniversalTime()
+    $runningLongEnough = $false
+    if ($null -ne $script:CurrentCoverageRunningStartedUtc) {
+        $runningLongEnough = ($SampleUtc.ToUniversalTime() - $script:CurrentCoverageRunningStartedUtc.ToUniversalTime()).TotalSeconds -ge 1
+    }
+    $profile.IsCalibrated = [int]$profile.SampleCount -ge 2 -or $runningLongEnough
+    $script:SpeedClassProfiles[$script:CurrentSpeedClassKey] = $profile
+    if ($script:CurrentComputeBackendClass -like 'gpu:*') {
+        if ($script:ConservativeObservedGpuSpeed -le 0) {
+            $script:ConservativeObservedGpuSpeed = $ObservedSpeed
+        }
+        else {
+            $script:ConservativeObservedGpuSpeed = [math]::Min($script:ConservativeObservedGpuSpeed, $ObservedSpeed)
+        }
+    }
+}
+
 function Get-WorkerOverallPlanItems {
     [CmdletBinding()]
     param()
@@ -446,9 +673,14 @@ function Get-WorkerOverallPlanItems {
         if ($null -eq $candidateCount -and $script:OverallCoverageTotals.ContainsKey($coverageId)) {
             $candidateCount = $script:OverallCoverageTotals[$coverageId]
         }
+        $speedClass = Get-WorkerPlanSpeedClassMetadata -Item $item
         [void]$items.Add([pscustomobject]@{
-                CoverageId    = $coverageId
-                CandidateCount = $candidateCount
+                CoverageId          = $coverageId
+                CandidateCount       = $candidateCount
+                SpeedClassKey        = [string]$speedClass.SpeedClassKey
+                ArchiveBackendClass  = [string]$speedClass.ArchiveBackendClass
+                ComputeBackendClass  = [string]$speedClass.ComputeBackendClass
+                AttackFamily         = [string]$speedClass.AttackFamily
             })
     }
     return $items.ToArray()
@@ -499,6 +731,103 @@ function Get-WorkerOverallStatusMessage {
     }
 }
 
+function Get-WorkerCurrentCoverageSpeedIsStable {
+    [CmdletBinding()]
+    param()
+
+    if ($null -eq $script:ActivePlanItem -or [string]::IsNullOrWhiteSpace($script:CurrentCoverageId)) { return $false }
+    if ($script:CurrentCoverageSpeedSampleCount -ge 2) { return $true }
+    if ($script:CurrentCoverageSpeedSampleCount -gt 0 -and $null -ne $script:CurrentCoverageRunningStartedUtc -and
+        ([datetime]::UtcNow - $script:CurrentCoverageRunningStartedUtc.ToUniversalTime()).TotalSeconds -ge 1) {
+        return $true
+    }
+    if (-not [string]::IsNullOrWhiteSpace($script:CurrentSpeedClassKey) -and $script:SpeedClassProfiles.ContainsKey($script:CurrentSpeedClassKey)) {
+        $profile = $script:SpeedClassProfiles[$script:CurrentSpeedClassKey]
+        if ($profile.PSObject.Properties.Name -contains 'IsCalibrated') { return [bool]$profile.IsCalibrated }
+        try { return [int]$profile.SampleCount -ge 2 } catch { return $false }
+    }
+    return $false
+}
+
+function Update-WorkerDisplayedPlanEta {
+    [CmdletBinding()]
+    param(
+        $PlanEta = $null
+    )
+
+    $now = [datetime]::UtcNow
+    $rawEta = $null
+    if ($null -ne $PlanEta -and $PlanEta.PSObject.Properties.Name -contains 'PlanEtaSeconds' -and $null -ne $PlanEta.PlanEtaSeconds) {
+        try {
+            [double]$rawEta = $PlanEta.PlanEtaSeconds
+            if ($rawEta -lt 0) { $rawEta = $null }
+        }
+        catch { $rawEta = $null }
+    }
+    $currentStable = if ($null -ne $PlanEta -and $PlanEta.PSObject.Properties.Name -contains 'CurrentCoverageSpeedIsStable') {
+        [bool]$PlanEta.CurrentCoverageSpeedIsStable
+    }
+    else {
+        Get-WorkerCurrentCoverageSpeedIsStable
+    }
+    $holdActivities = @('AdvancingCoverage', 'PreparingCoverage', 'PreparingBackend', 'PreparingDictionary', 'StartingHashcat', 'RestoringHashcat', 'RunningCoverage')
+    $hasLastValid = $null -ne $script:LastValidPlanEtaSeconds -and $null -ne $script:LastValidPlanEtaUtc
+    $needsCoverageCalibration = [string]::IsNullOrWhiteSpace($script:CurrentCoverageId) -or -not $currentStable
+    $shouldHold = $hasLastValid -and $script:Activity -in $holdActivities -and $needsCoverageCalibration
+    if ($shouldHold) {
+        $heldEta = [math]::Max(0.0, [double]$script:LastValidPlanEtaSeconds - ([double]($now - $script:LastValidPlanEtaUtc.ToUniversalTime()).TotalSeconds))
+        $script:DisplayedPlanEtaSeconds = [math]::Round($heldEta, 1)
+        $script:DisplayedPlanEtaUpdatedUtc = $now
+        $script:LastPlanEtaAdjustmentReason = ''
+        return [pscustomobject]@{
+            PlanEtaSeconds = $rawEta
+            DisplayedPlanEtaSeconds = $script:DisplayedPlanEtaSeconds
+            OverallEtaIsHeld = $true
+            OverallEtaHasValidHistory = $true
+            PlanEtaAdjustmentReason = ''
+        }
+    }
+
+    if ($null -ne $rawEta) {
+        $structureKey = if ($null -ne $PlanEta -and $PlanEta.PSObject.Properties.Name -contains 'PlanEtaStructureKey') { [string]$PlanEta.PlanEtaStructureKey } else { '' }
+        $structureChanged = -not [string]::IsNullOrWhiteSpace($script:LastPlanEtaStructureKey) -and
+            -not [string]::Equals($structureKey, $script:LastPlanEtaStructureKey, [System.StringComparison]::Ordinal)
+        $reason = if ($structureChanged) { 'StructuralRecalibration' } else { '' }
+        if ($null -eq $script:DisplayedPlanEtaSeconds -or $null -eq $script:DisplayedPlanEtaUpdatedUtc -or $structureChanged) {
+            $script:DisplayedPlanEtaSeconds = [math]::Round($rawEta, 1)
+        }
+        else {
+            $elapsedSinceDisplay = [math]::Max(0.0, ($now - $script:DisplayedPlanEtaUpdatedUtc.ToUniversalTime()).TotalSeconds)
+            $naturalCountdown = [math]::Max(0.0, [double]$script:DisplayedPlanEtaSeconds - $elapsedSinceDisplay)
+            $corrected = $naturalCountdown + (([double]$rawEta - $naturalCountdown) * 0.25)
+            # A normal speed sample may correct the estimate downward, but it
+            # must not turn elapsed time into a long-term upward countdown.
+            # Structural changes are handled by the direct-reset branch above.
+            $script:DisplayedPlanEtaSeconds = [math]::Round([math]::Max(0.0, [math]::Min($naturalCountdown, $corrected)), 1)
+        }
+        $script:DisplayedPlanEtaUpdatedUtc = $now
+        $script:LastValidPlanEtaSeconds = $script:DisplayedPlanEtaSeconds
+        $script:LastValidPlanEtaUtc = $now
+        $script:LastPlanEtaStructureKey = $structureKey
+        $script:LastPlanEtaAdjustmentReason = $reason
+        return [pscustomobject]@{
+            PlanEtaSeconds = $rawEta
+            DisplayedPlanEtaSeconds = $script:DisplayedPlanEtaSeconds
+            OverallEtaIsHeld = $false
+            OverallEtaHasValidHistory = $true
+            PlanEtaAdjustmentReason = $reason
+        }
+    }
+
+    return [pscustomobject]@{
+        PlanEtaSeconds = $null
+        DisplayedPlanEtaSeconds = $null
+        OverallEtaIsHeld = $false
+        OverallEtaHasValidHistory = $hasLastValid
+        PlanEtaAdjustmentReason = ''
+    }
+}
+
 function Get-WorkerOverallFlowSnapshot {
     [CmdletBinding()]
     param(
@@ -519,12 +848,29 @@ function Get-WorkerOverallFlowSnapshot {
     $currentTotal = if ($script:IsCumulativeJob -and $null -ne $script:ActivePlanItem) { $script:CoverageCandidateTotal } else { $null }
     $effectiveCandidatesTested = if ($null -ne $CandidatesTested) { $CandidatesTested } else { $script:CandidatesTested }
     $recentOverallSpeed = Get-WorkerRecentOverallSpeed
-    [double]$overallSpeedForSnapshot = $SpeedPerSecond
-    [bool]$useRecentOverallSpeed = $false
-    $canUseRecentOverallSpeed = $script:Activity -in @('PreparingCoverage', 'PreparingBackend', 'PreparingDictionary', 'StartingHashcat', 'RestoringHashcat', 'RunningCoverage')
-    if ($overallSpeedForSnapshot -le 0 -and $canUseRecentOverallSpeed -and $null -ne $recentOverallSpeed) {
+    [double]$overallSpeedForSnapshot = 0
+    [bool]$overallSpeedIsRecent = $false
+    $canShowRecentOverallSpeed = $script:Activity -in @('PreparingCoverage', 'PreparingBackend', 'PreparingDictionary', 'StartingHashcat', 'RestoringHashcat', 'RunningCoverage', 'AdvancingCoverage')
+    if ($canShowRecentOverallSpeed -and $null -ne $recentOverallSpeed) {
         $overallSpeedForSnapshot = [double]$recentOverallSpeed.Speed
-        $useRecentOverallSpeed = $true
+        $overallSpeedIsRecent = $true
+    }
+    [double]$currentSpeedForPlan = 0
+    if ($script:Activity -eq 'RunningCoverage' -and $null -ne $recentOverallSpeed -and $SpeedPerSecond -gt 0) {
+        $currentSpeedForPlan = $SpeedPerSecond
+    }
+    $planEta = $null
+    $planEtaDisplay = $null
+    $planEtaForSnapshot = $null
+    if ($script:IsCumulativeJob) {
+        $planEta = Get-CoverageDurationSumEta -PlanCoverageIds $planIds -PlanCoverageItems $planItems -CompletedCoverageIds @($script:CompletedCoverageIds | ForEach-Object { [string]$_ }) -CurrentCoverageId ([string]$script:CurrentCoverageId) -CurrentTested ([long]$script:CoverageCandidatesTested) -CurrentTotal $currentTotal -Activity ([string]$script:Activity) -CurrentSpeedPerSecond $currentSpeedForPlan -CurrentSpeedIsStable (Get-WorkerCurrentCoverageSpeedIsStable) -FallbackGpuSpeedPerSecond $script:ConservativeObservedGpuSpeed -SpeedProfiles $script:SpeedClassProfiles
+        $planEtaDisplay = Update-WorkerDisplayedPlanEta -PlanEta $planEta
+        $planEtaForSnapshot = [pscustomobject]@{
+            PlanEtaSeconds = $planEta.PlanEtaSeconds
+            DisplayedPlanEtaSeconds = $planEtaDisplay.DisplayedPlanEtaSeconds
+            OverallEtaReadiness = $planEta.OverallEtaReadiness
+            UnestimatedCoverageCount = $planEta.UnestimatedCoverageCount
+        }
     }
     $overallParameters = @{
         PlanCoverageIds = $planIds
@@ -540,7 +886,7 @@ function Get-WorkerOverallFlowSnapshot {
         OverallCandidatesTested = $effectiveCandidatesTested
         OverallSpeedPerSecond = $overallSpeedForSnapshot
         ProgressInvariantViolation = $ProgressInvariantViolation
-        UseRecentOverallSpeed = $useRecentOverallSpeed
+        PlanEta = $planEtaForSnapshot
     }
     $snapshot = Get-OverallFlowProgress @overallParameters
 
@@ -555,9 +901,17 @@ function Get-WorkerOverallFlowSnapshot {
     $recordLastKnownOverallSpeed = if ($script:LastKnownOverallSpeed -gt 0) { [math]::Round($script:LastKnownOverallSpeed, 2) } else { $null }
     $recordLastKnownOverallSpeedUtc = if ($null -ne $script:LastKnownOverallSpeedUtc) { $script:LastKnownOverallSpeedUtc.ToUniversalTime().ToString('o') } else { $null }
     $recordOverallSpeedSampleUtc = if ($null -ne $recentOverallSpeed) { $recentOverallSpeed.Utc.ToUniversalTime().ToString('o') } else { $null }
+    $snapshot | Add-Member -NotePropertyName PlanEtaSeconds -NotePropertyValue $(if ($null -ne $planEta) { $planEta.PlanEtaSeconds } else { $null }) -Force
+    $snapshot | Add-Member -NotePropertyName DisplayedPlanEtaSeconds -NotePropertyValue $(if ($null -ne $planEtaDisplay) { $planEtaDisplay.DisplayedPlanEtaSeconds } else { $null }) -Force
+    $snapshot | Add-Member -NotePropertyName OverallEtaIsHeld -NotePropertyValue ([bool]$(if ($null -ne $planEtaDisplay) { $planEtaDisplay.OverallEtaIsHeld } else { $false })) -Force
+    $snapshot | Add-Member -NotePropertyName OverallEtaHasValidHistory -NotePropertyValue ([bool]$(if ($null -ne $planEtaDisplay) { $planEtaDisplay.OverallEtaHasValidHistory } else { $false })) -Force
+    $snapshot | Add-Member -NotePropertyName LastValidPlanEtaSeconds -NotePropertyValue $script:LastValidPlanEtaSeconds -Force
+    $snapshot | Add-Member -NotePropertyName LastValidPlanEtaUtc -NotePropertyValue $(if ($null -ne $script:LastValidPlanEtaUtc) { $script:LastValidPlanEtaUtc.ToUniversalTime().ToString('o') } else { $null }) -Force
+    $snapshot | Add-Member -NotePropertyName PlanEtaAdjustmentReason -NotePropertyValue ([string]$(if ($null -ne $planEtaDisplay) { $planEtaDisplay.PlanEtaAdjustmentReason } else { '' })) -Force
+    $snapshot | Add-Member -NotePropertyName UnestimatedCoverageCount -NotePropertyValue ([int]$(if ($null -ne $planEta) { $planEta.UnestimatedCoverageCount } else { 0 })) -Force
     $snapshot | Add-Member -NotePropertyName LastKnownOverallSpeed -NotePropertyValue $recordLastKnownOverallSpeed -Force
     $snapshot | Add-Member -NotePropertyName LastKnownOverallSpeedUtc -NotePropertyValue $recordLastKnownOverallSpeedUtc -Force
-    $snapshot | Add-Member -NotePropertyName OverallSpeedIsRecent -NotePropertyValue $useRecentOverallSpeed -Force
+    $snapshot | Add-Member -NotePropertyName OverallSpeedIsRecent -NotePropertyValue $overallSpeedIsRecent -Force
     $snapshot | Add-Member -NotePropertyName OverallSpeedSampleUtc -NotePropertyValue $recordOverallSpeedSampleUtc -Force
     $snapshot | Add-Member -NotePropertyName OverallStatusMessage -NotePropertyValue (Get-WorkerOverallStatusMessage -OverallFlow $snapshot -CurrentActivity ([string]$script:Activity) -InvariantViolation:$ProgressInvariantViolation) -Force
 
@@ -593,13 +947,26 @@ function Update-EffectiveSpeed {
     $now = [datetime]::UtcNow
     $intervalSeconds = ($now - $script:LastMetricUtc).TotalSeconds
     $observedSpeed = 0.0
+    [long]$candidateDelta = 0
+    $sampleUtc = $now
+    $hasFreshSample = $false
     if ($BackendSpeed -gt 0) {
-        $observedSpeed = $BackendSpeed
+        if ($null -eq $script:LastBackendSpeedSampleUtc) {
+            $script:LastBackendSpeedSampleUtc = $now
+        }
+        if ($null -eq $script:LastConsumedBackendSpeedSampleUtc -or
+            $script:LastBackendSpeedSampleUtc -gt $script:LastConsumedBackendSpeedSampleUtc) {
+            $observedSpeed = $BackendSpeed
+            $sampleUtc = $script:LastBackendSpeedSampleUtc
+            $script:LastConsumedBackendSpeedSampleUtc = $script:LastBackendSpeedSampleUtc
+            $hasFreshSample = $true
+        }
     }
     elseif ($intervalSeconds -gt 0) {
         $candidateDelta = $script:CandidatesTested - $script:LastMetricCandidates
         if ($candidateDelta -gt 0) {
             $observedSpeed = $candidateDelta / $intervalSeconds
+            $hasFreshSample = $true
         }
     }
 
@@ -611,7 +978,10 @@ function Update-EffectiveSpeed {
             (0.35 * $observedSpeed) + (0.65 * $script:EffectiveSpeed)
         }
         $script:LastKnownOverallSpeed = [math]::Round($script:EffectiveSpeed, 2)
-        $script:LastKnownOverallSpeedUtc = $now
+        $script:LastKnownOverallSpeedUtc = $sampleUtc
+        if ($hasFreshSample -and $script:Activity -eq 'RunningCoverage') {
+            Update-WorkerSpeedClassProfile -ObservedSpeed $observedSpeed -SampleUtc $sampleUtc
+        }
     }
 
     $script:LastMetricUtc = $now
@@ -674,6 +1044,13 @@ function Complete-CoverageItem {
     $script:CoverageCandidateTotal = $null
     $script:CoverageCandidatesTested = 0L
     $script:ActivePlanItem = $null
+    $script:CurrentSpeedClassKey = ''
+    $script:CurrentArchiveBackendClass = ''
+    $script:CurrentComputeBackendClass = ''
+    $script:CurrentAttackFamily = ''
+    $script:CurrentCoverageRunningStartedUtc = $null
+    $script:CurrentCoverageSpeedSampleCount = 0
+    $script:CurrentCoverageLastSpeedSampleUtc = $null
     $script:CoverageResult = ''
     $script:ResumeCoverageBase = 0L
     $script:ProgressInvariantViolation = $false
@@ -751,6 +1128,9 @@ function Publish-Progress {
     }
     $script:Activity = $Activity
     $script:ActivityMessage = $ActivityMessage
+    if ($Activity -eq 'RunningCoverage' -and $null -eq $script:CurrentCoverageRunningStartedUtc) {
+        $script:CurrentCoverageRunningStartedUtc = [datetime]::UtcNow
+    }
 
     Update-EffectiveSpeed -BackendSpeed $BackendSpeed
     Update-ProgressTimestamp -InitialSnapshot:$InitialSnapshot
@@ -900,6 +1280,15 @@ function Publish-Progress {
         OverallCandidatesRemainingIsPartial = [bool]$overallFlow.OverallCandidatesRemainingIsPartial
         OverallSpeed = $overallFlow.OverallSpeed
         OverallEtaSeconds = $overallFlow.OverallEtaSeconds
+        PlanEtaSeconds = $overallFlow.PlanEtaSeconds
+        DisplayedPlanEtaSeconds = $overallFlow.DisplayedPlanEtaSeconds
+        OverallEtaReadiness = [string]$overallFlow.OverallEtaReadiness
+        OverallEtaIsHeld = [bool]$overallFlow.OverallEtaIsHeld
+        OverallEtaHasValidHistory = [bool]$overallFlow.OverallEtaHasValidHistory
+        LastValidPlanEtaSeconds = $overallFlow.LastValidPlanEtaSeconds
+        LastValidPlanEtaUtc = $overallFlow.LastValidPlanEtaUtc
+        PlanEtaAdjustmentReason = [string]$overallFlow.PlanEtaAdjustmentReason
+        UnestimatedCoverageCount = [int]$overallFlow.UnestimatedCoverageCount
         LastKnownOverallSpeed = $overallFlow.LastKnownOverallSpeed
         LastKnownOverallSpeedUtc = $overallFlow.LastKnownOverallSpeedUtc
         OverallSpeedIsRecent = [bool]$overallFlow.OverallSpeedIsRecent
@@ -1358,6 +1747,10 @@ function Update-HashcatStatusFromLine {
     }
     if ($combinedSpeed -gt 0) {
         $script:LastBackendSpeed = $combinedSpeed
+        $script:LastBackendSpeedSampleUtc = [datetime]::UtcNow
+        if ($null -ne $script:ActivePlanItem -and $script:Activity -in @('StartingHashcat', 'RestoringHashcat')) {
+            Set-WorkerActivity -Activity 'RunningCoverage' -Message 'Testing local candidates.'
+        }
     }
 }
 
@@ -2069,6 +2462,15 @@ function Set-CumulativeCoverage {
     $script:LastMetricUtc = [datetime]::UtcNow
     $script:LastMetricCandidates = $script:CandidatesTested
     $script:LastBackendSpeed = 0.0
+    $script:LastBackendSpeedSampleUtc = $null
+    $script:LastConsumedBackendSpeedSampleUtc = $null
+    $script:CurrentSpeedClassKey = ''
+    $script:CurrentArchiveBackendClass = ''
+    $script:CurrentComputeBackendClass = ''
+    $script:CurrentAttackFamily = ''
+    $script:CurrentCoverageRunningStartedUtc = $null
+    $script:CurrentCoverageSpeedSampleCount = 0
+    $script:CurrentCoverageLastSpeedSampleUtc = $null
     $script:CurrentCoverageName = [string]$Item.DisplayName
     $script:CoverageCandidateTotal = $Item.CandidateCount
     Set-WorkerOverallCoverageTotal -CoverageId ([string]$Item.CoverageId) -CandidateCount $Item.CandidateCount
@@ -2448,6 +2850,7 @@ function Invoke-CumulativeRecovery {
     Test-RecoveryJobConfiguration -Job $job -RequireArchiveIdentity:$Resume
     $sevenZip = Resolve-SevenZip
     $inspection = Get-ArchiveInspection -ArchivePath ([string]$job.ArchivePath) -SevenZip $sevenZip
+    $script:ArchiveBackendClass = Get-WorkerArchiveBackendClass -Inspection $inspection
     if ($inspection.EncryptionState -eq 'No') {
         $script:TerminalState = 'NotEncrypted'
         Publish-Progress -State 'NotEncrypted' -Message 'The archive metadata indicates that no password is required; recovery was not started.' -Result $null
@@ -2552,6 +2955,8 @@ function Invoke-CumulativeRecovery {
                 }
             }
 
+            if ($null -ne $artifact) { $script:ArchiveBackendClass = Get-WorkerArchiveBackendClass -Inspection $inspection -Artifact $artifact }
+            [void](Set-WorkerCoverageSpeedClass -Item $item -Engine $engine -Artifact $artifact)
             $script:EngineLabel = $engine.Label
             $script:BackendName = $engine.Backend
             $script:ComputeDevice = $engine.ComputeDevice

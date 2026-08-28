@@ -1914,6 +1914,245 @@ function Get-TextDictionaryEntryCount {
     return $count
 }
 
+function Test-PlanEtaProfileCalibrated {
+    [CmdletBinding()]
+    param(
+        $Profile
+    )
+
+    if ($null -eq $Profile) { return $false }
+    if ($Profile.PSObject.Properties.Name -contains 'IsCalibrated') {
+        return [bool]$Profile.IsCalibrated
+    }
+    try { return [int]$Profile.SampleCount -ge 2 } catch { return $false }
+}
+
+function Test-PlanEtaFamilyCompatible {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][string]$TargetFamily,
+        [Parameter(Mandatory = $true)][string]$ProfileFamily
+    )
+
+    if ([string]::Equals($TargetFamily, $ProfileFamily, [System.StringComparison]::Ordinal)) { return $true }
+    if ($TargetFamily -in @('Dictionary', 'Generated') -and $ProfileFamily -in @('Dictionary', 'Generated')) { return $true }
+    if ($TargetFamily -in @('Mask', 'BruteForce') -and $ProfileFamily -in @('Mask', 'BruteForce')) { return $true }
+    if ($TargetFamily -eq 'Hybrid' -and $ProfileFamily -in @('Dictionary', 'Generated', 'Mask', 'BruteForce')) { return $true }
+    return $false
+}
+
+function Get-PlanEtaProfileSpeed {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]$Item,
+        [hashtable]$SpeedProfiles = @{}
+    )
+
+    if ($null -eq $SpeedProfiles -or $SpeedProfiles.Count -eq 0) { return $null }
+    $speedClassKey = [string](Get-ObjectPropertyValue -Object $Item -Name 'SpeedClassKey' -Default '')
+    $targetArchiveClass = [string](Get-ObjectPropertyValue -Object $Item -Name 'ArchiveBackendClass' -Default '')
+    $targetComputeClass = [string](Get-ObjectPropertyValue -Object $Item -Name 'ComputeBackendClass' -Default '')
+    $targetFamily = [string](Get-ObjectPropertyValue -Object $Item -Name 'AttackFamily' -Default '')
+
+    if (-not [string]::IsNullOrWhiteSpace($speedClassKey) -and $SpeedProfiles.ContainsKey($speedClassKey)) {
+        $exact = $SpeedProfiles[$speedClassKey]
+        if ((Test-PlanEtaProfileCalibrated -Profile $exact)) {
+            try {
+                [double]$exactSpeed = $exact.SmoothedSpeed
+                if ($exactSpeed -gt 0) {
+                    return [pscustomobject]@{ Speed = $exactSpeed; Source = 'ExactProfile'; ProfileKey = $speedClassKey }
+                }
+            }
+            catch { }
+        }
+    }
+
+    $compatible = New-Object 'System.Collections.Generic.List[object]'
+    foreach ($profileKey in @($SpeedProfiles.Keys)) {
+        $profile = $SpeedProfiles[$profileKey]
+        if (-not (Test-PlanEtaProfileCalibrated -Profile $profile)) { continue }
+        $profileArchiveClass = [string](Get-ObjectPropertyValue -Object $profile -Name 'ArchiveBackendClass' -Default '')
+        $profileComputeClass = [string](Get-ObjectPropertyValue -Object $profile -Name 'ComputeBackendClass' -Default '')
+        $profileFamily = [string](Get-ObjectPropertyValue -Object $profile -Name 'AttackFamily' -Default '')
+        if ([string]::IsNullOrWhiteSpace($targetArchiveClass) -or [string]::IsNullOrWhiteSpace($targetComputeClass) -or
+            -not [string]::Equals($targetArchiveClass, $profileArchiveClass, [System.StringComparison]::Ordinal) -or
+            -not [string]::Equals($targetComputeClass, $profileComputeClass, [System.StringComparison]::Ordinal) -or
+            -not (Test-PlanEtaFamilyCompatible -TargetFamily $targetFamily -ProfileFamily $profileFamily)) {
+            continue
+        }
+        try {
+            [double]$profileSpeed = $profile.SmoothedSpeed
+            if ($profileSpeed -gt 0) {
+                [void]$compatible.Add([pscustomobject]@{ Speed = $profileSpeed; ProfileKey = [string]$profileKey })
+            }
+        }
+        catch { }
+    }
+    if ($compatible.Count -eq 0) { return $null }
+    $selected = @($compatible | Sort-Object Speed | Select-Object -First 1)[0]
+    return [pscustomobject]@{ Speed = [double]$selected.Speed; Source = 'CompatibleProfile'; ProfileKey = [string]$selected.ProfileKey }
+}
+
+function Get-CoverageDurationSumEta {
+    [CmdletBinding()]
+    param(
+        [string[]]$PlanCoverageIds = @(),
+        [object[]]$PlanCoverageItems = @(),
+        [string[]]$CompletedCoverageIds = @(),
+        [AllowEmptyString()][string]$CurrentCoverageId = '',
+        [long]$CurrentTested = 0,
+        $CurrentTotal = $null,
+        [string]$Activity = 'PreparingCoverage',
+        [double]$CurrentSpeedPerSecond = 0,
+        [bool]$CurrentSpeedIsStable = $false,
+        [double]$FallbackGpuSpeedPerSecond = 0,
+        [hashtable]$SpeedProfiles = @{}
+    )
+
+    $planIds = @($PlanCoverageIds | ForEach-Object {
+            if ($null -ne $_ -and -not [string]::IsNullOrWhiteSpace([string]$_)) { [string]$_ }
+        })
+    if ($planIds.Count -eq 0) {
+        $planIds = @($PlanCoverageItems | ForEach-Object {
+                if ($null -ne $_ -and $_.PSObject.Properties.Name -contains 'CoverageId' -and
+                    -not [string]::IsNullOrWhiteSpace([string]$_.CoverageId)) { [string]$_.CoverageId }
+            })
+    }
+
+    $completedSet = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::Ordinal)
+    foreach ($coverageId in @($CompletedCoverageIds)) {
+        if ($null -ne $coverageId) { [void]$completedSet.Add([string]$coverageId) }
+    }
+    $itemById = @{}
+    foreach ($item in @($PlanCoverageItems)) {
+        if ($null -eq $item -or $item.PSObject.Properties.Name -notcontains 'CoverageId') { continue }
+        $itemId = [string]$item.CoverageId
+        if (-not [string]::IsNullOrWhiteSpace($itemId) -and -not $itemById.ContainsKey($itemId)) { $itemById[$itemId] = $item }
+    }
+
+    [double]$planEta = 0
+    [int]$estimatedCoverageCount = 0
+    [int]$unestimatedCoverageCount = 0
+    [int]$remainingCoverageCount = 0
+    [bool]$requiresCalibration = $false
+    [bool]$usedFallbackSpeed = $false
+    [bool]$usedCompatibleProfile = $false
+    [bool]$currentCoverageSpeedIsStable = $false
+    [string]$currentCoverageSpeedSource = ''
+    $structureParts = New-Object 'System.Collections.Generic.List[string]'
+
+    foreach ($coverageId in $planIds) {
+        if ($completedSet.Contains([string]$coverageId)) {
+            [void]$structureParts.Add(([string]$coverageId + '=completed'))
+            continue
+        }
+
+        $isCurrent = [string]::Equals([string]$coverageId, $CurrentCoverageId, [System.StringComparison]::Ordinal)
+        $item = if ($itemById.ContainsKey([string]$coverageId)) { $itemById[[string]$coverageId] } else { [pscustomobject]@{ CoverageId = [string]$coverageId } }
+        $candidateTotal = if ($isCurrent -and $null -ne $CurrentTotal) { $CurrentTotal } else { Get-ObjectPropertyValue -Object $item -Name 'CandidateCount' -Default $null }
+        $hasCandidateTotal = $false
+        [long]$normalizedTotal = 0
+        if ($null -ne $candidateTotal) {
+            try {
+                $normalizedTotal = [long]$candidateTotal
+                $hasCandidateTotal = $normalizedTotal -ge 0
+            }
+            catch { $hasCandidateTotal = $false }
+        }
+        if (-not $hasCandidateTotal) {
+            $unestimatedCoverageCount++
+            [void]$structureParts.Add(([string]$coverageId + '=unknown-total'))
+            continue
+        }
+
+        [long]$tested = if ($isCurrent) { [math]::Max(0L, $CurrentTested) } else { 0L }
+        [long]$remaining = if ($normalizedTotal -gt $tested) { $normalizedTotal - $tested } else { 0L }
+        if ($remaining -le 0) {
+            [void]$structureParts.Add(([string]$coverageId + '=complete'))
+            if ($isCurrent) { $currentCoverageSpeedIsStable = $true }
+            continue
+        }
+        $remainingCoverageCount++
+
+        $profile = Get-PlanEtaProfileSpeed -Item $item -SpeedProfiles $SpeedProfiles
+        [double]$speed = 0
+        [string]$source = ''
+        [bool]$sourceIsStable = $false
+        if ($isCurrent -and $Activity -eq 'RunningCoverage' -and $CurrentSpeedPerSecond -gt 0) {
+            $speed = $CurrentSpeedPerSecond
+            $source = 'CurrentSpeed'
+            $sourceIsStable = $CurrentSpeedIsStable
+        }
+        elseif ($null -ne $profile) {
+            $speed = [double]$profile.Speed
+            $source = [string]$profile.Source
+            $sourceIsStable = $source -eq 'ExactProfile'
+            if ($source -eq 'CompatibleProfile') {
+                $usedCompatibleProfile = $true
+                $requiresCalibration = $true
+            }
+        }
+        elseif (-not $isCurrent -and $FallbackGpuSpeedPerSecond -gt 0 -and
+            [string](Get-ObjectPropertyValue -Object $item -Name 'ComputeBackendClass' -Default '') -like 'gpu:*') {
+            $speed = $FallbackGpuSpeedPerSecond
+            $source = 'CurrentRunGpuFallback'
+            $usedFallbackSpeed = $true
+            $requiresCalibration = $true
+        }
+
+        if ($isCurrent) {
+            $currentCoverageSpeedSource = $source
+            $currentCoverageSpeedIsStable = $sourceIsStable
+            if ($source -eq 'CurrentSpeed' -and -not $sourceIsStable) { $requiresCalibration = $true }
+        }
+        if ($speed -gt 0) {
+            $planEta += $remaining / $speed
+            $estimatedCoverageCount++
+            [void]$structureParts.Add(('{0}={1}' -f [string]$coverageId, $source))
+        }
+        else {
+            $unestimatedCoverageCount++
+            [void]$structureParts.Add(([string]$coverageId + '=unestimated-speed'))
+        }
+    }
+
+    $planEtaValue = $null
+    if ($planIds.Count -gt 0 -and $remainingCoverageCount -eq 0) {
+        $planEtaValue = 0.0
+    }
+    elseif ($estimatedCoverageCount -gt 0) {
+        $planEtaValue = [math]::Round($planEta, 1)
+    }
+
+    $readiness = 'Unavailable'
+    if ($remainingCoverageCount -eq 0 -and $planIds.Count -gt 0) {
+        $readiness = 'Stable'
+    }
+    elseif ($null -ne $planEtaValue -and $unestimatedCoverageCount -gt 0) {
+        $readiness = 'Partial'
+    }
+    elseif ($null -ne $planEtaValue -and $requiresCalibration) {
+        $readiness = 'Calibrating'
+    }
+    elseif ($null -ne $planEtaValue) {
+        $readiness = 'Stable'
+    }
+
+    [pscustomobject]@{
+        PlanEtaModel                  = 'CoverageDurationSum'
+        PlanEtaSeconds                = $planEtaValue
+        OverallEtaReadiness           = $readiness
+        UnestimatedCoverageCount     = $unestimatedCoverageCount
+        EstimatedCoverageCount       = $estimatedCoverageCount
+        RemainingCoverageCount       = $remainingCoverageCount
+        UsedFallbackSpeed            = $usedFallbackSpeed
+        UsedCompatibleProfile        = $usedCompatibleProfile
+        CurrentCoverageSpeedSource   = $currentCoverageSpeedSource
+        CurrentCoverageSpeedIsStable = $currentCoverageSpeedIsStable
+        PlanEtaStructureKey           = ($structureParts.ToArray() -join ';')
+    }
+}
+
 function Get-OverallFlowProgress {
     [CmdletBinding()]
     param(
@@ -1930,7 +2169,7 @@ function Get-OverallFlowProgress {
         $OverallCandidatesTested = $null,
         [double]$OverallSpeedPerSecond = 0,
         [bool]$ProgressInvariantViolation = $false,
-        [switch]$UseRecentOverallSpeed
+        $PlanEta = $null
     )
 
     $planIds = @($PlanCoverageIds | ForEach-Object {
@@ -2084,11 +2323,17 @@ function Get-OverallFlowProgress {
         $overallSpeed = [math]::Round($OverallSpeedPerSecond, 2)
     }
     $overallEtaSeconds = $null
-    if ($overallTotalReadiness -in @('Exact', 'Partial') -and $null -ne $remainingBaseTotal -and $null -ne $overallCandidatesTestedValue -and
-        $null -ne $overallSpeed -and -not $ProgressInvariantViolation -and
-        ($Activity -eq 'RunningCoverage' -or $UseRecentOverallSpeed) -and
-        $overallCandidatesTestedValue -lt $remainingBaseTotal) {
-        $overallEtaSeconds = [math]::Round(($remainingBaseTotal - $overallCandidatesTestedValue) / $overallSpeed, 1)
+    $planEtaSeconds = $null
+    $displayedPlanEtaSeconds = $null
+    $overallEtaReadiness = 'Unavailable'
+    $unestimatedCoverageCount = 0
+    if ($null -ne $PlanEta) {
+        if ($PlanEta.PSObject.Properties.Name -contains 'PlanEtaSeconds') { $planEtaSeconds = $PlanEta.PlanEtaSeconds }
+        if ($PlanEta.PSObject.Properties.Name -contains 'DisplayedPlanEtaSeconds') { $displayedPlanEtaSeconds = $PlanEta.DisplayedPlanEtaSeconds }
+        if ($null -eq $displayedPlanEtaSeconds) { $displayedPlanEtaSeconds = $planEtaSeconds }
+        $overallEtaSeconds = $displayedPlanEtaSeconds
+        if ($PlanEta.PSObject.Properties.Name -contains 'OverallEtaReadiness') { $overallEtaReadiness = [string]$PlanEta.OverallEtaReadiness }
+        if ($PlanEta.PSObject.Properties.Name -contains 'UnestimatedCoverageCount') { $unestimatedCoverageCount = [int]$PlanEta.UnestimatedCoverageCount }
     }
 
     [double]$currentFraction = 0.0
@@ -2138,6 +2383,10 @@ function Get-OverallFlowProgress {
         OverallCandidatesRemainingIsPartial = ($overallTotalReadiness -eq 'Partial')
         OverallSpeed                        = $overallSpeed
         OverallEtaSeconds                   = $overallEtaSeconds
+        PlanEtaSeconds                      = $planEtaSeconds
+        DisplayedPlanEtaSeconds             = $displayedPlanEtaSeconds
+        OverallEtaReadiness                 = $overallEtaReadiness
+        UnestimatedCoverageCount            = $unestimatedCoverageCount
         OverallCoverageCompleted            = $processedSet.Count
         OverallCoverageTotal                = $planIds.Count
     }
@@ -3496,6 +3745,7 @@ Export-ModuleMember -Function @(
     'Get-GeneratedCoverageCandidates',
     'Write-GeneratedCoverageDictionary',
     'Get-OverallFlowProgress',
+    'Get-CoverageDurationSumEta',
     'Get-PlanYear',
     'Get-CustomMaskPlanItem',
     'Get-RecoveryLevel4PlanItems',

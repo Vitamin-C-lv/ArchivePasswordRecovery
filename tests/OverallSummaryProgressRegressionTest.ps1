@@ -52,7 +52,7 @@ Assert-Equal -Actual $running.OverallCandidatesTested -Expected 150L -Message 'o
 Assert-Equal -Actual $running.OverallCandidatesTotal -Expected 1000L -Message 'overall total did not include every planned coverage'
 Assert-Equal -Actual $running.OverallCandidatesRemaining -Expected 850L -Message 'overall remaining count is incorrect'
 Assert-Equal -Actual $running.OverallSpeed -Expected 25.0 -Message 'overall speed is incorrect'
-Assert-Equal -Actual $running.OverallEtaSeconds -Expected 34.0 -Message 'overall ETA is incorrect'
+Assert-True ($null -eq $running.OverallEtaSeconds) 'flow progress derived an ETA without a plan ETA model'
 Assert-Equal -Actual $running.OverallTotalReadiness -Expected 'Exact' -Message 'exact plan readiness was not reported'
 
 # B: a coverage transition keeps the task-level counters moving forward.
@@ -98,9 +98,6 @@ Assert-Equal -Actual $partial.OverallCandidatesRemaining -Expected 95L -Message 
 Assert-True ($null -eq $partial.OverallEtaSeconds) 'partial plan exposed an unreliable ETA'
 Assert-Equal -Actual $partial.OverallCandidatesKnownTotal -Expected 100L -Message 'partial plan known subtotal is incorrect'
 Assert-Equal -Actual $partial.OverallTotalReadiness -Expected 'Partial' -Message 'partial plan readiness was not reported'
-
-$partialRecent = Get-OverallFlowProgress -PlanCoverageIds @('C1', 'C2') -PlanCoverageItems $partialItems -CompletedCoverageIds @() -CurrentCoverageId C2 -CurrentTested 5 -CurrentTotal $null -Activity PreparingDictionary -OverallSpeedPerSecond 25 -UseRecentOverallSpeed
-Assert-Equal -Actual $partialRecent.OverallEtaSeconds -Expected 3.8 -Message 'partial known-range ETA is incorrect'
 
 # G: pause/resume preserves the same task-level counters.
 $paused = Get-Summary -Completed @('C1') -Current C2 -Tested 50 -CurrentTotal 200 -Activity Paused -PreviousFlow $running.OverallFlowProgress -PreviousKey $planKey
