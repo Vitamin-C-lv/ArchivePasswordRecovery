@@ -203,13 +203,77 @@ function Write-LocalJsonAtomic {
     $temporaryPath = Join-Path $directory ('.' + [System.IO.Path]::GetFileName($Path) + '.' + [guid]::NewGuid().ToString('N') + '.tmp')
     try {
         $Value | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $temporaryPath -Encoding UTF8
-        Move-Item -LiteralPath $temporaryPath -Destination $Path -Force
+        $moveError = $null
+        for ($attempt = 0; $attempt -lt 3; $attempt++) {
+            try {
+                Move-Item -LiteralPath $temporaryPath -Destination $Path -Force
+                $moveError = $null
+                break
+            }
+            catch {
+                $moveError = $_
+                if ($attempt -lt 2) { Start-Sleep -Milliseconds 25 }
+            }
+        }
+        if ($null -ne $moveError) { throw $moveError }
     }
     finally {
         if (Test-Path -LiteralPath $temporaryPath) {
             Remove-Item -LiteralPath $temporaryPath -Force -ErrorAction SilentlyContinue
         }
     }
+}
+
+function Resolve-CoverageProgress {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][long]$ReportedTested,
+        [object]$CandidateTotal = $null,
+        [ValidateSet('Absolute', 'Relative')][string]$Mode = 'Absolute',
+        [long]$ResumeBase = 0
+    )
+
+    [long]$resolvedTested = if ($Mode -eq 'Relative') {
+        $ResumeBase + $ReportedTested
+    }
+    else {
+        $ReportedTested
+    }
+
+    $hasKnownTotal = $null -ne $CandidateTotal
+    [long]$knownTotal = 0
+    if ($hasKnownTotal) {
+        $knownTotal = [long]$CandidateTotal
+    }
+    $violation = ($ReportedTested -lt 0) -or ($ResumeBase -lt 0) -or ($resolvedTested -lt 0) -or ($hasKnownTotal -and ($knownTotal -lt 0 -or $resolvedTested -gt $knownTotal))
+
+    return [pscustomobject]@{
+        Mode                       = $Mode
+        ResumeBase                = $ResumeBase
+        ReportedTested            = $ReportedTested
+        ResolvedTested            = $resolvedTested
+        CandidateTotal            = if ($hasKnownTotal) { $knownTotal } else { $null }
+        ProgressInvariantViolation = [bool]$violation
+    }
+}
+
+function Get-CoverageEtaSeconds {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][string]$Activity,
+        [object]$CandidateTotal = $null,
+        [long]$Tested = 0,
+        [double]$SpeedPerSecond = 0,
+        [bool]$ProgressInvariantViolation = $false
+    )
+
+    if ($Activity -ne 'RunningCoverage' -or $ProgressInvariantViolation -or
+        $null -eq $CandidateTotal -or [long]$CandidateTotal -le 0 -or
+        $Tested -lt 0 -or $Tested -ge [long]$CandidateTotal -or $SpeedPerSecond -le 0) {
+        return $null
+    }
+
+    return [math]::Round(([long]$CandidateTotal - $Tested) / $SpeedPerSecond, 1)
 }
 
 function Read-LocalJson {
@@ -534,6 +598,105 @@ function Merge-RecoveryJobForLevelUpgrade {
 
     $merged['SchemaVersion'] = 4
     return [pscustomobject]$merged
+}
+
+function Get-RecoveryLevelUpgradeIntent {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]$ExistingJob,
+        [Parameter(Mandatory = $true)]$NewControlJob,
+        [AllowNull()]$ExistingProgress = $null,
+        [string]$JobDirectory = '',
+        [string[]]$AvailableCoverageIds = @()
+    )
+
+    if ($ExistingJob.PSObject.Properties.Name -notcontains 'ArchiveIdentity' -or
+        $NewControlJob.PSObject.Properties.Name -notcontains 'ArchiveIdentity' -or
+        -not (Test-ArchiveIdentityMatch -Expected $ExistingJob.ArchiveIdentity -Actual $NewControlJob.ArchiveIdentity)) {
+        throw 'ARCHIVE_CHANGED: The selected archive does not match the existing local job.'
+    }
+
+    [int]$existingLevel = Get-RecoveryLevel -Job $ExistingJob
+    [int]$newLevel = Get-RecoveryLevel -Job $NewControlJob
+    if ($newLevel -le $existingLevel) {
+        return [pscustomobject]@{
+            Intent              = 'NewJob'
+            CanReuseExistingJob = $false
+            ResumeCurrentCoverage = $false
+            Message             = 'The requested recovery level does not extend the existing job.'
+        }
+    }
+
+    $state = ''
+    if ($null -ne $ExistingProgress -and $ExistingProgress.PSObject.Properties.Name -contains 'State') {
+        $state = [string]$ExistingProgress.State
+    }
+    if ($state -eq 'Recovered') {
+        return [pscustomobject]@{
+            Intent = 'BlockedRecovered'; CanReuseExistingJob = $false; ResumeCurrentCoverage = $false
+            Message = '该压缩包已经恢复成功，无需继续提高恢复级别。'
+        }
+    }
+    if ($state -eq 'NotEncrypted') {
+        return [pscustomobject]@{
+            Intent = 'BlockedNotEncrypted'; CanReuseExistingJob = $false; ResumeCurrentCoverage = $false
+            Message = '该压缩包未检测到密码保护，无需执行密码恢复。'
+        }
+    }
+
+    if ($state -eq 'Exhausted') {
+        return [pscustomobject]@{
+            Intent = 'UpgradeAfterTerminal'; CanReuseExistingJob = $true; ResumeCurrentCoverage = $false
+            Message = 'The previous level was exhausted; the upgrade will start at the first new coverage.'
+        }
+    }
+
+    if ($state -in @('Paused', 'Stopped')) {
+        $currentCoverageId = ''
+        if ($null -ne $ExistingProgress -and $ExistingProgress.PSObject.Properties.Name -contains 'CurrentCoverageId') {
+            $currentCoverageId = [string]$ExistingProgress.CurrentCoverageId
+        }
+        $hasCheckpoint = $false
+        if ($null -ne $ExistingProgress -and $ExistingProgress.PSObject.Properties.Name -contains 'CurrentCheckpoint' -and
+            $null -ne $ExistingProgress.CurrentCheckpoint -and
+            $ExistingProgress.CurrentCheckpoint.PSObject.Properties.Name -contains 'Position') {
+            try {
+                [long]$checkpointPosition = $ExistingProgress.CurrentCheckpoint.Position
+                $hasCheckpoint = $checkpointPosition -ge 0
+            }
+            catch { $hasCheckpoint = $false }
+        }
+        if (-not $hasCheckpoint -and $null -ne $ExistingProgress -and $ExistingProgress.PSObject.Properties.Name -contains 'CoveragePosition' -and
+            $null -ne $ExistingProgress.CoveragePosition -and -not [string]::IsNullOrWhiteSpace($currentCoverageId)) {
+            try {
+                [long]$coveragePosition = $ExistingProgress.CoveragePosition
+                $hasCheckpoint = $coveragePosition -ge 0
+            }
+            catch { $hasCheckpoint = $false }
+        }
+        if (-not $hasCheckpoint -and -not [string]::IsNullOrWhiteSpace($JobDirectory) -and
+            (Test-Path -LiteralPath $JobDirectory -PathType Container)) {
+            $hasCheckpoint = @(Get-ChildItem -LiteralPath $JobDirectory -Filter 'hashcat*.restore' -File -ErrorAction SilentlyContinue).Count -gt 0
+        }
+
+        $coverageKnown = $AvailableCoverageIds.Count -eq 0 -or $AvailableCoverageIds -contains $currentCoverageId
+        if (-not [string]::IsNullOrWhiteSpace($currentCoverageId) -and $hasCheckpoint -and $coverageKnown) {
+            return [pscustomobject]@{
+                Intent = 'UpgradeAndResume'; CanReuseExistingJob = $true; ResumeCurrentCoverage = $true
+                Message = 'The paused or stopped coverage has a local checkpoint and will resume after the level upgrade.'
+            }
+        }
+
+        return [pscustomobject]@{
+            Intent = 'UpgradeAfterTerminal'; CanReuseExistingJob = $true; ResumeCurrentCoverage = $false
+            Message = 'The paused or stopped job has no reusable current-coverage checkpoint; the upgrade will continue from the next unfinished coverage.'
+        }
+    }
+
+    return [pscustomobject]@{
+        Intent = 'NewJob'; CanReuseExistingJob = $false; ResumeCurrentCoverage = $false
+        Message = 'The existing job is not in a resumable paused or stopped state.'
+    }
 }
 
 function Get-LocalComputeDevices {
@@ -1008,6 +1171,91 @@ function New-ArchiveHashcatArtifact {
     }
 }
 
+function Test-LocalProcessIdActive {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][int]$ProcessId
+    )
+
+    try {
+        [void](Get-Process -Id $ProcessId -ErrorAction Stop)
+        return $true
+    }
+    catch {
+        if ([string]$_.FullyQualifiedErrorId -match 'NoProcessFoundForGivenId|NoProcessFound') {
+            return $false
+        }
+        # An unknown process-query failure is not safe grounds for deleting a
+        # file that may belong to a live Hashcat process.
+        return $true
+    }
+}
+
+function Clear-AppOwnedHashcatResidue {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][string]$HashcatDirectory
+    )
+
+    $removed = New-Object 'System.Collections.Generic.List[string]'
+    $remaining = New-Object 'System.Collections.Generic.List[string]'
+    $activePidFiles = New-Object 'System.Collections.Generic.List[string]'
+    if (-not (Test-Path -LiteralPath $HashcatDirectory -PathType Container)) {
+        return [pscustomobject]@{
+            HashcatDirectory = $HashcatDirectory
+            RemovedPaths = @()
+            RemainingPaths = @()
+            ActivePidFiles = @()
+            RemovedCount = 0
+            RemainingCount = 0
+        }
+    }
+
+    $files = New-Object 'System.Collections.Generic.List[object]'
+    foreach ($pattern in @('ArchivePasswordRecovery-*.log', 'ArchivePasswordRecovery-*.pid')) {
+        foreach ($file in @(Get-ChildItem -LiteralPath $HashcatDirectory -Filter $pattern -File -ErrorAction Stop)) {
+            [void]$files.Add($file)
+        }
+    }
+    $protected = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
+    foreach ($pidFile in @($files | Where-Object { [string]$_.Extension -ieq '.pid' })) {
+        $pidText = ''
+        try { $pidText = [System.IO.File]::ReadAllText($pidFile.FullName).Trim() } catch { $pidText = '' }
+        [int]$processId = 0
+        $parsed = [int]::TryParse($pidText, [ref]$processId)
+        $active = $parsed -and $processId -gt 0 -and (Test-LocalProcessIdActive -ProcessId $processId)
+        if ($active) {
+            [void]$activePidFiles.Add([string]$pidFile.FullName)
+            [void]$protected.Add([string]$pidFile.FullName)
+            $logPath = Join-Path $HashcatDirectory ($pidFile.BaseName + '.log')
+            [void]$protected.Add($logPath)
+        }
+    }
+
+    foreach ($file in @($files | Sort-Object FullName -Unique)) {
+        if ($protected.Contains([string]$file.FullName)) {
+            [void]$remaining.Add([string]$file.FullName)
+            continue
+        }
+        try {
+            Remove-Item -LiteralPath $file.FullName -Force -ErrorAction Stop
+            [void]$removed.Add([string]$file.FullName)
+        }
+        catch {
+            [void]$remaining.Add([string]$file.FullName)
+        }
+    }
+
+    return [pscustomobject]@{
+        HashcatDirectory = $HashcatDirectory
+        RemovedPaths = $removed.ToArray()
+        RemainingPaths = $remaining.ToArray()
+        ActivePidFiles = $activePidFiles.ToArray()
+        RemovedCount = $removed.Count
+        RemainingCount = $remaining.Count
+    }
+}
+
 function ConvertTo-HashcatCustomCharset {
     [CmdletBinding()]
     param(
@@ -1173,17 +1421,26 @@ function Get-RecoveryRuntimeDirectory {
     [CmdletBinding()]
     param(
         [Parameter(Mandatory = $true)][string]$JobDirectory,
-        [string]$JobId = ''
+        [string]$JobId = '',
+        [string]$RunId = ''
     )
 
     if ([string]::IsNullOrWhiteSpace($JobId)) {
         $JobId = [System.IO.Path]::GetFileName(([System.IO.Path]::GetFullPath($JobDirectory).TrimEnd('\')))
     }
-    if ([string]::IsNullOrWhiteSpace($JobId) -or $JobId -match '[\\/]') {
+    if ([string]::IsNullOrWhiteSpace($JobId) -or $JobId -match '[\\/]|\.\.') {
         throw 'The local job id is invalid for a Runtime directory.'
     }
 
-    return (Join-Path (Get-RecoveryRuntimeRoot) $JobId)
+    $jobRuntimeDirectory = Join-Path (Get-RecoveryRuntimeRoot) $JobId
+    if ([string]::IsNullOrWhiteSpace($RunId)) {
+        return $jobRuntimeDirectory
+    }
+    if ($RunId -match '[\\/]|\.\.') {
+        throw 'The local Runtime run id is invalid.'
+    }
+
+    return (Join-Path $jobRuntimeDirectory $RunId)
 }
 
 function Get-RecoveryRuntimeActivity {
@@ -1235,6 +1492,16 @@ function Clear-RecoveryRuntime {
     }
 
     [System.IO.Directory]::Delete($targetFull, $true)
+
+    # A run directory is disposable. Remove its now-empty JobId container too,
+    # but never remove the Runtime root itself.
+    $parentFull = [System.IO.Directory]::GetParent($targetFull).FullName.TrimEnd('\')
+    if ($parentFull -ne $rootFull.TrimEnd('\') -and
+        $parentFull.StartsWith($rootFull, [System.StringComparison]::OrdinalIgnoreCase) -and
+        (Test-Path -LiteralPath $parentFull -PathType Container) -and
+        @([System.IO.Directory]::EnumerateFileSystemEntries($parentFull)).Count -eq 0) {
+        [System.IO.Directory]::Delete($parentFull, $false)
+    }
     return $true
 }
 
@@ -1252,8 +1519,22 @@ function Cleanup-StaleRecoveryRuntime {
         $activity = Get-RecoveryRuntimeActivity -JobId ([string]$directory.Name)
         if (-not $activity.Known -or $activity.Active) { continue }
         try {
-            if (Clear-RecoveryRuntime -RuntimeDirectory ([string]$directory.FullName)) {
-                [void]$removed.Add([string]$directory.Name)
+            $runDirectories = @(Get-ChildItem -LiteralPath $directory.FullName -Directory -ErrorAction SilentlyContinue)
+            if ($runDirectories.Count -eq 0) {
+                if (Clear-RecoveryRuntime -RuntimeDirectory ([string]$directory.FullName)) {
+                    [void]$removed.Add([string]$directory.Name)
+                }
+                continue
+            }
+
+            foreach ($runDirectory in $runDirectories) {
+                if (Clear-RecoveryRuntime -RuntimeDirectory ([string]$runDirectory.FullName)) {
+                    [void]$removed.Add(('{0}\{1}' -f $directory.Name, $runDirectory.Name))
+                }
+            }
+            if ((Test-Path -LiteralPath $directory.FullName -PathType Container) -and
+                @([System.IO.Directory]::EnumerateFileSystemEntries($directory.FullName)).Count -eq 0) {
+                [System.IO.Directory]::Delete($directory.FullName, $false)
             }
         }
         catch {
@@ -1446,6 +1727,424 @@ function Get-CapitalInitialVariantCount {
     return [long]$seen.Count
 }
 
+function Invoke-DictionaryPreparationProgress {
+    [CmdletBinding()]
+    param(
+        [scriptblock]$ProgressCallback,
+        [Parameter(Mandatory = $true)][long]$Processed,
+        $Total,
+        [Parameter(Mandatory = $true)][double]$Elapsed,
+        [Parameter(Mandatory = $true)][long]$SourceEntriesProcessed,
+        [Parameter(Mandatory = $true)][long]$BytesProcessed,
+        [Parameter(Mandatory = $true)][long]$BytesTotal
+    )
+
+    if ($null -eq $ProgressCallback) { return }
+    & $ProgressCallback ([pscustomobject]@{
+            Processed             = $Processed
+            Total                 = $Total
+            Elapsed               = [math]::Round($Elapsed, 3)
+            SourceEntriesProcessed = $SourceEntriesProcessed
+            BytesProcessed        = $BytesProcessed
+            BytesTotal            = $BytesTotal
+        })
+}
+
+function New-GeneratedDictionaryFile {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][string]$OutputPath,
+        [Parameter(Mandatory = $true)][scriptblock]$CandidateGenerator,
+        [long]$ProgressTotal = -1,
+        [scriptblock]$ProgressCallback,
+        [ValidateSet('Entries', 'Bytes')][string]$ProgressUnit = 'Entries'
+    )
+
+    $outputDirectory = Split-Path $OutputPath -Parent
+    if (-not [string]::IsNullOrWhiteSpace($outputDirectory)) {
+        New-Item -ItemType Directory -Path $outputDirectory -Force | Out-Null
+    }
+    $total = if ($ProgressTotal -ge 0) { [long]$ProgressTotal } else { $null }
+    $temporaryPath = $OutputPath + '.' + [guid]::NewGuid().ToString('N') + '.tmp'
+    $writer = New-Object System.IO.StreamWriter($temporaryPath, $false, (New-Object System.Text.UTF8Encoding($false)))
+    $startedUtc = [datetime]::UtcNow
+    [long]$processed = 0
+    [long]$lastReported = 0
+    try {
+        try {
+            Invoke-DictionaryPreparationProgress -ProgressCallback $ProgressCallback -Processed 0 -Total $total -Elapsed 0.0 -SourceEntriesProcessed 0 -BytesProcessed 0 -BytesTotal 0
+            foreach ($candidate in & $CandidateGenerator) {
+                $writer.WriteLine([string]$candidate)
+                $processed++
+                if ($processed - $lastReported -ge 1000) {
+                    $progressValue = if ($ProgressUnit -eq 'Bytes') { [long]$writer.BaseStream.Position } else { $processed }
+                    Invoke-DictionaryPreparationProgress -ProgressCallback $ProgressCallback -Processed $progressValue -Total $total -Elapsed (([datetime]::UtcNow - $startedUtc).TotalSeconds) -SourceEntriesProcessed $processed -BytesProcessed ([long]$writer.BaseStream.Position) -BytesTotal 0
+                    $lastReported = $processed
+                }
+            }
+        }
+        finally {
+            $writer.Dispose()
+        }
+
+        $temporaryInfo = Get-Item -LiteralPath $temporaryPath -Force
+        $finalProcessed = if ($ProgressUnit -eq 'Bytes') { [long]$temporaryInfo.Length } else { $processed }
+        Invoke-DictionaryPreparationProgress -ProgressCallback $ProgressCallback -Processed $finalProcessed -Total $total -Elapsed (([datetime]::UtcNow - $startedUtc).TotalSeconds) -SourceEntriesProcessed $processed -BytesProcessed ([long]$temporaryInfo.Length) -BytesTotal 0
+        Move-Item -LiteralPath $temporaryPath -Destination $OutputPath -Force
+    }
+    finally {
+        if (Test-Path -LiteralPath $temporaryPath) { Remove-Item -LiteralPath $temporaryPath -Force -ErrorAction SilentlyContinue }
+    }
+    return [pscustomobject]@{ Path = $OutputPath; OutputCount = $processed }
+}
+
+function Get-GeneratedCoverageSourceLines {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]$Source
+    )
+
+    if ([string]$Source.SourceType -eq 'Builtin') {
+        $inputStream = [System.IO.File]::Open([string]$Source.Path, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::Read)
+        try {
+            $gzip = New-Object System.IO.Compression.GZipStream($inputStream, [System.IO.Compression.CompressionMode]::Decompress)
+            try {
+                $reader = New-Object System.IO.StreamReader($gzip, $true)
+                try {
+                    while ($null -ne ($line = $reader.ReadLine())) {
+                        Write-Output $line
+                    }
+                }
+                finally { $reader.Dispose() }
+            }
+            finally { $gzip.Dispose() }
+        }
+        finally { $inputStream.Dispose() }
+        return
+    }
+
+    if (-not (Test-Path -LiteralPath ([string]$Source.Path) -PathType Leaf)) {
+        throw 'The local generated coverage dictionary source is missing.'
+    }
+    $reader = New-Object System.IO.StreamReader(([string]$Source.Path), $true)
+    try {
+        while ($null -ne ($line = $reader.ReadLine())) {
+            Write-Output $line
+        }
+    }
+    finally { $reader.Dispose() }
+}
+
+function Get-GeneratedCoverageCandidates {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]$PlanItem,
+        $Job
+    )
+
+    $generatorKind = [string](Get-ObjectPropertyValue -Object $PlanItem -Name 'GeneratorKind' -Default ([string](Get-ObjectPropertyValue -Object $PlanItem -Name 'Kind' -Default '')))
+    switch ($generatorKind) {
+        'DateRange' {
+            foreach ($candidate in Get-DateRangeCandidates -StartYear ([int]$PlanItem.StartYear) -EndYear ([int]$PlanItem.EndYear)) {
+                Write-Output ([string]$candidate)
+            }
+            return
+        }
+        'CommonSymbols' {
+            $sources = @(Get-PlanItemDictionarySources -PlanItem $PlanItem -Job $Job)
+            if ($sources.Count -ne 1) {
+                throw 'PLAN_DICTIONARY_SOURCE_INVALID: 计划项的字典来源定义不完整。'
+            }
+            $symbols = @($PlanItem.Symbols)
+            if ($symbols.Count -eq 0) {
+                throw 'PLAN_GENERATOR_INVALID: CommonSymbols coverage has no symbols.'
+            }
+            foreach ($word in Get-GeneratedCoverageSourceLines -Source $sources[0]) {
+                if ([string]$word.Length -eq 0) { continue }
+                foreach ($symbol in $symbols) {
+                    Write-Output ([string]$word + [string]$symbol)
+                }
+            }
+            return
+        }
+        default {
+            throw ('PLAN_GENERATOR_INVALID: Unsupported finite generated coverage kind: {0}.' -f $generatorKind)
+        }
+    }
+}
+
+function Write-GeneratedCoverageDictionary {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]$PlanItem,
+        $Job,
+        [Parameter(Mandatory = $true)][string]$OutputPath,
+        [scriptblock]$ProgressCallback
+    )
+
+    $candidateGenerator = {
+        Get-GeneratedCoverageCandidates -PlanItem $PlanItem -Job $Job
+    }.GetNewClosure()
+    $progressTotal = -1L
+    if ($PlanItem.PSObject.Properties.Name -contains 'CandidateCount' -and $null -ne $PlanItem.CandidateCount) {
+        $progressTotal = [long]$PlanItem.CandidateCount
+    }
+    $result = New-GeneratedDictionaryFile -OutputPath $OutputPath -CandidateGenerator $candidateGenerator -ProgressTotal $progressTotal -ProgressCallback $ProgressCallback -ProgressUnit 'Entries'
+    return [pscustomobject]@{
+        Path = [string]$result.Path
+        GeneratedCount = [long]$result.OutputCount
+        OutputCount = [long]$result.OutputCount
+    }
+}
+
+function Get-TextDictionaryEntryCount {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][string]$Path
+    )
+
+    [long]$count = 0
+    $reader = New-Object System.IO.StreamReader($Path, $true)
+    try {
+        while ($null -ne ($line = $reader.ReadLine())) {
+            if ($line.Length -gt 0) { $count++ }
+        }
+    }
+    finally { $reader.Dispose() }
+    return $count
+}
+
+function Get-OverallFlowProgress {
+    [CmdletBinding()]
+    param(
+        [string[]]$PlanCoverageIds = @(),
+        [string[]]$CompletedCoverageIds = @(),
+        [string[]]$SkippedCoverageIds = @(),
+        [AllowEmptyString()][string]$CurrentCoverageId = '',
+        [long]$CurrentTested = 0,
+        $CurrentTotal = $null,
+        [string]$Activity = 'PreparingCoverage',
+        [double]$PreviousFlowProgress = 0.0,
+        [AllowEmptyString()][string]$PreviousPlanKey = ''
+    )
+
+    $planIds = @($PlanCoverageIds | ForEach-Object {
+            if ($null -ne $_ -and -not [string]::IsNullOrWhiteSpace([string]$_)) { [string]$_ }
+        })
+    $planKey = $planIds -join "`n"
+    if ($planIds.Count -eq 0) {
+        return [pscustomobject]@{
+            PlanKey = $planKey
+            PlanCoverageCount = 0
+            ProcessedCoverageCount = 0
+            CurrentCoverageOrdinal = $null
+            OverallFlowProgress = 0.0
+            OverallFlowPercent = 0.0
+        }
+    }
+
+    $planSet = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::Ordinal)
+    foreach ($planId in $planIds) { [void]$planSet.Add([string]$planId) }
+    $processedSet = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::Ordinal)
+    foreach ($coverageId in @($CompletedCoverageIds) + @($SkippedCoverageIds)) {
+        if ($null -ne $coverageId -and $planSet.Contains([string]$coverageId)) {
+            [void]$processedSet.Add([string]$coverageId)
+        }
+    }
+
+    [int]$currentIndex = -1
+    for ($index = 0; $index -lt $planIds.Count; $index++) {
+        if ([string]::Equals([string]$planIds[$index], $CurrentCoverageId, [System.StringComparison]::Ordinal)) {
+            $currentIndex = $index
+            break
+        }
+    }
+
+    [double]$currentFraction = 0.0
+    if ($currentIndex -ge 0 -and -not $processedSet.Contains([string]$CurrentCoverageId) -and $Activity -notlike 'Preparing*' -and $null -ne $CurrentTotal) {
+        try {
+            [long]$knownTotal = $CurrentTotal
+            if ($knownTotal -gt 0 -and $CurrentTested -ge 0) {
+                $tested = [math]::Min([long]$CurrentTested, $knownTotal)
+                $currentFraction = $tested / [double]$knownTotal
+            }
+        }
+        catch {
+            $currentFraction = 0.0
+        }
+    }
+
+    [double]$flowUnits = [double]$processedSet.Count + $currentFraction
+    if ([string]::Equals($PreviousPlanKey, $planKey, [System.StringComparison]::Ordinal) -and $PreviousFlowProgress -gt $flowUnits) {
+        $flowUnits = $PreviousFlowProgress
+    }
+    if ($flowUnits -gt $planIds.Count) { $flowUnits = [double]$planIds.Count }
+    if ($Activity -eq 'Recovered' -and $flowUnits -ge $planIds.Count) {
+        # Recovery stops inside the current coverage and therefore must not
+        # masquerade as exhaustive completion of the whole plan, even when a
+        # backend reports its final dictionary position together with a hit.
+        $flowUnits = [math]::Max(0.0, [double]$planIds.Count - 0.0001)
+    }
+    if ($flowUnits -lt 0) { $flowUnits = 0.0 }
+    $ordinal = if ($currentIndex -ge 0 -and -not $processedSet.Contains([string]$CurrentCoverageId)) { $currentIndex + 1 } else { $null }
+    [double]$flowPercent = [math]::Round((100.0 * $flowUnits) / $planIds.Count, 2)
+    if ($Activity -eq 'Recovered' -and $flowUnits -lt $planIds.Count -and $flowPercent -ge 100) { $flowPercent = 99.99 }
+    return [pscustomobject]@{
+        PlanKey = $planKey
+        PlanCoverageCount = $planIds.Count
+        ProcessedCoverageCount = $processedSet.Count
+        CurrentCoverageOrdinal = $ordinal
+        OverallFlowProgress = [math]::Round($flowUnits, 4)
+        OverallFlowPercent = $flowPercent
+    }
+}
+
+function Expand-CaseVariantDictionaryFile {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][string]$SourcePath,
+        [Parameter(Mandatory = $true)][string]$OutputPath,
+        [Parameter(Mandatory = $true)][int]$RecoveryPlanYear,
+        [scriptblock]$ProgressCallback,
+        [long]$ProgressTotal = -1,
+        [ValidateSet('Entries', 'Bytes')][string]$ProgressUnit = 'Entries',
+        [switch]$DeduplicateVariants
+    )
+
+    if (-not (Test-Path -LiteralPath $SourcePath -PathType Leaf)) {
+        throw ('The local rule dictionary source is missing: {0}' -f $SourcePath)
+    }
+    $sourceInfo = Get-Item -LiteralPath $SourcePath -Force
+    [long]$bytesTotal = $sourceInfo.Length
+    $total = if ($ProgressTotal -ge 0) { [long]$ProgressTotal } elseif ($ProgressUnit -eq 'Bytes') { $bytesTotal } else { $null }
+    $outputDirectory = Split-Path $OutputPath -Parent
+    if (-not [string]::IsNullOrWhiteSpace($outputDirectory)) {
+        New-Item -ItemType Directory -Path $outputDirectory -Force | Out-Null
+    }
+
+    if (Test-Path -LiteralPath $OutputPath -PathType Leaf) {
+        [long]$outputCount = Get-TextDictionaryEntryCount -Path $OutputPath
+        $processed = if ($ProgressUnit -eq 'Bytes') { $bytesTotal } elseif ($null -ne $total) { [long]$total } else { $outputCount }
+        Invoke-DictionaryPreparationProgress -ProgressCallback $ProgressCallback -Processed $processed -Total $total -Elapsed 0 -SourceEntriesProcessed $processed -BytesProcessed $bytesTotal -BytesTotal $bytesTotal
+        return [pscustomobject]@{ Path = $OutputPath; OutputCount = $outputCount }
+    }
+
+    $temporaryPath = $OutputPath + '.' + [guid]::NewGuid().ToString('N') + '.tmp'
+    $globalSeen = if ($DeduplicateVariants) { New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::Ordinal) } else { $null }
+    $reader = New-Object System.IO.StreamReader($SourcePath, $true)
+    $writer = New-Object System.IO.StreamWriter($temporaryPath, $false, (New-Object System.Text.UTF8Encoding($false)))
+    $startedUtc = [datetime]::UtcNow
+    [long]$sourceEntriesProcessed = 0
+    [long]$outputCount = 0
+    [long]$lastReportedEntries = 0
+    try {
+        Invoke-DictionaryPreparationProgress -ProgressCallback $ProgressCallback -Processed 0 -Total $total -Elapsed 0 -SourceEntriesProcessed 0 -BytesProcessed 0 -BytesTotal $bytesTotal
+        while ($null -ne ($word = $reader.ReadLine())) {
+            $sourceEntriesProcessed++
+            if ($word.Length -gt 0) {
+                $lower = $word.ToLowerInvariant()
+                if (-not [string]::Equals($lower, $word, [System.StringComparison]::Ordinal) -and
+                    ($null -eq $globalSeen -or $globalSeen.Add($lower))) {
+                    $writer.WriteLine($lower)
+                    $outputCount++
+                }
+                $upper = $word.ToUpperInvariant()
+                if (-not [string]::Equals($upper, $word, [System.StringComparison]::Ordinal) -and
+                    -not [string]::Equals($upper, $lower, [System.StringComparison]::Ordinal) -and
+                    ($null -eq $globalSeen -or $globalSeen.Add($upper))) {
+                    $writer.WriteLine($upper)
+                    $outputCount++
+                }
+            }
+
+            if ($sourceEntriesProcessed - $lastReportedEntries -ge 1000) {
+                $processed = if ($ProgressUnit -eq 'Bytes') { [long]$reader.BaseStream.Position } else { $sourceEntriesProcessed }
+                Invoke-DictionaryPreparationProgress -ProgressCallback $ProgressCallback -Processed $processed -Total $total -Elapsed (([datetime]::UtcNow - $startedUtc).TotalSeconds) -SourceEntriesProcessed $sourceEntriesProcessed -BytesProcessed ([long]$reader.BaseStream.Position) -BytesTotal $bytesTotal
+                $lastReportedEntries = $sourceEntriesProcessed
+            }
+        }
+    }
+    finally {
+        $writer.Dispose()
+        $reader.Dispose()
+    }
+
+    $finalProcessed = if ($ProgressUnit -eq 'Bytes') { $bytesTotal } else { $sourceEntriesProcessed }
+    Invoke-DictionaryPreparationProgress -ProgressCallback $ProgressCallback -Processed $finalProcessed -Total $total -Elapsed (([datetime]::UtcNow - $startedUtc).TotalSeconds) -SourceEntriesProcessed $sourceEntriesProcessed -BytesProcessed $bytesTotal -BytesTotal $bytesTotal
+    try {
+        Move-Item -LiteralPath $temporaryPath -Destination $OutputPath -Force
+    }
+    finally {
+        if (Test-Path -LiteralPath $temporaryPath) { Remove-Item -LiteralPath $temporaryPath -Force -ErrorAction SilentlyContinue }
+    }
+    return [pscustomobject]@{ Path = $OutputPath; OutputCount = $outputCount }
+}
+
+function Expand-CapitalInitialDictionaryFile {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][string]$SourcePath,
+        [Parameter(Mandatory = $true)][string]$OutputPath,
+        [scriptblock]$ProgressCallback,
+        [long]$ProgressTotal = -1
+    )
+
+    if (-not (Test-Path -LiteralPath $SourcePath -PathType Leaf)) {
+        throw ('The built-in dictionary resource is missing: {0}' -f $SourcePath)
+    }
+    $sourceInfo = Get-Item -LiteralPath $SourcePath -Force
+    [long]$bytesTotal = $sourceInfo.Length
+    $total = if ($ProgressTotal -ge 0) { [long]$ProgressTotal } else { $null }
+    $outputDirectory = Split-Path $OutputPath -Parent
+    if (-not [string]::IsNullOrWhiteSpace($outputDirectory)) {
+        New-Item -ItemType Directory -Path $outputDirectory -Force | Out-Null
+    }
+
+    if (Test-Path -LiteralPath $OutputPath -PathType Leaf) {
+        [long]$outputCount = Get-TextDictionaryEntryCount -Path $OutputPath
+        Invoke-DictionaryPreparationProgress -ProgressCallback $ProgressCallback -Processed $total -Total $total -Elapsed 0 -SourceEntriesProcessed $total -BytesProcessed $bytesTotal -BytesTotal $bytesTotal
+        return [pscustomobject]@{ Path = $OutputPath; OutputCount = $outputCount }
+    }
+
+    $temporaryPath = $OutputPath + '.' + [guid]::NewGuid().ToString('N') + '.tmp'
+    $seen = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::Ordinal)
+    $reader = New-Object System.IO.StreamReader($SourcePath, $true)
+    $writer = New-Object System.IO.StreamWriter($temporaryPath, $false, (New-Object System.Text.UTF8Encoding($false)))
+    $startedUtc = [datetime]::UtcNow
+    [long]$sourceEntriesProcessed = 0
+    [long]$outputCount = 0
+    [long]$lastReportedEntries = 0
+    try {
+        Invoke-DictionaryPreparationProgress -ProgressCallback $ProgressCallback -Processed 0 -Total $total -Elapsed 0 -SourceEntriesProcessed 0 -BytesProcessed 0 -BytesTotal $bytesTotal
+        while ($null -ne ($word = $reader.ReadLine())) {
+            $sourceEntriesProcessed++
+            if ($word.Length -gt 0) {
+                $capitalized = ConvertTo-CapitalInitialVariant -Word $word
+                if ($null -ne $capitalized -and $seen.Add([string]$capitalized)) {
+                    $writer.WriteLine([string]$capitalized)
+                    $outputCount++
+                }
+            }
+            if ($sourceEntriesProcessed - $lastReportedEntries -ge 1000) {
+                Invoke-DictionaryPreparationProgress -ProgressCallback $ProgressCallback -Processed $sourceEntriesProcessed -Total $total -Elapsed (([datetime]::UtcNow - $startedUtc).TotalSeconds) -SourceEntriesProcessed $sourceEntriesProcessed -BytesProcessed ([long]$reader.BaseStream.Position) -BytesTotal $bytesTotal
+                $lastReportedEntries = $sourceEntriesProcessed
+            }
+        }
+    }
+    finally {
+        $writer.Dispose()
+        $reader.Dispose()
+    }
+    Invoke-DictionaryPreparationProgress -ProgressCallback $ProgressCallback -Processed $sourceEntriesProcessed -Total $total -Elapsed (([datetime]::UtcNow - $startedUtc).TotalSeconds) -SourceEntriesProcessed $sourceEntriesProcessed -BytesProcessed $bytesTotal -BytesTotal $bytesTotal
+    try {
+        Move-Item -LiteralPath $temporaryPath -Destination $OutputPath -Force
+    }
+    finally {
+        if (Test-Path -LiteralPath $temporaryPath) { Remove-Item -LiteralPath $temporaryPath -Force -ErrorAction SilentlyContinue }
+    }
+    return [pscustomobject]@{ Path = $OutputPath; OutputCount = $outputCount }
+}
+
 function Get-PlanYear {
     [CmdletBinding()]
     param(
@@ -1495,6 +2194,24 @@ function Get-ValidDateCandidateCount {
     return $count
 }
 
+function Get-DateRangeCandidates {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][int]$StartYear,
+        [Parameter(Mandatory = $true)][int]$EndYear
+    )
+
+    if ($StartYear -gt $EndYear) { return }
+    for ($year = $StartYear; $year -le $EndYear; $year++) {
+        $date = [datetime]::ParseExact(('{0:D4}0101' -f $year), 'yyyyMMdd', [System.Globalization.CultureInfo]::InvariantCulture)
+        $end = $date.AddYears(1)
+        while ($date -lt $end) {
+            $date.ToString('yyyyMMdd', [System.Globalization.CultureInfo]::InvariantCulture)
+            $date = $date.AddDays(1)
+        }
+    }
+}
+
 function Get-CustomMaskPlanItem {
     [CmdletBinding()]
     param(
@@ -1540,6 +2257,178 @@ function Get-CustomMaskPlanItem {
     }
 }
 
+function Test-ObjectProperty {
+    [CmdletBinding()]
+    param(
+        [AllowNull()]$Object,
+        [Parameter(Mandatory = $true)][string]$Name
+    )
+
+    return $null -ne $Object -and $null -ne $Object.PSObject.Properties[$Name]
+}
+
+function Get-ObjectPropertyValue {
+    [CmdletBinding()]
+    param(
+        [AllowNull()]$Object,
+        [Parameter(Mandatory = $true)][string]$Name,
+        $Default = $null
+    )
+
+    if (Test-ObjectProperty -Object $Object -Name $Name) {
+        return $Object.PSObject.Properties[$Name].Value
+    }
+    return $Default
+}
+
+function Throw-PlanDictionarySourceInvalid {
+    [CmdletBinding()]
+    param()
+
+    throw 'PLAN_DICTIONARY_SOURCE_INVALID: 计划项的字典来源定义不完整。'
+}
+
+function Get-PlanItemDictionarySources {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]$PlanItem,
+        $Job
+    )
+
+    $sources = New-Object 'System.Collections.Generic.List[object]'
+    $kind = [string](Get-ObjectPropertyValue -Object $PlanItem -Name 'Kind' -Default '')
+
+    $addBuiltin = {
+        param($Language, $Level)
+        if ([string]::IsNullOrWhiteSpace([string]$Language) -or $null -eq $Level) {
+            Throw-PlanDictionarySourceInvalid
+        }
+        try {
+            [int]$normalizedLevel = $Level
+            $definition = Get-BuiltinDictionaryDefinition -Language ([string]$Language) -Level $normalizedLevel
+            $projectRoot = Split-Path $PSScriptRoot -Parent
+            $sourcePath = Join-Path $projectRoot ([string]$definition.RelativePath.Replace('/', '\'))
+        }
+        catch {
+            Throw-PlanDictionarySourceInvalid
+        }
+        [void]$sources.Add([pscustomobject]@{
+                Language   = [string]$Language
+                Level      = $normalizedLevel
+                Path       = $sourcePath
+                SourceType = 'Builtin'
+            })
+    }
+
+    $addCustom = {
+        param($Path)
+        if ([string]::IsNullOrWhiteSpace([string]$Path)) {
+            Throw-PlanDictionarySourceInvalid
+        }
+        try { $normalizedPath = [System.IO.Path]::GetFullPath([string]$Path) }
+        catch { Throw-PlanDictionarySourceInvalid }
+        [void]$sources.Add([pscustomobject]@{
+                Language   = ''
+                Level      = $null
+                Path       = $normalizedPath
+                SourceType = 'Custom'
+            })
+    }
+
+    $getLanguages = {
+        $value = Get-ObjectPropertyValue -Object $PlanItem -Name 'Languages' -Default $null
+        if ($null -eq $value) {
+            $value = Get-ObjectPropertyValue -Object $PlanItem -Name 'Language' -Default $null
+        }
+        return @($value | Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_) })
+    }
+
+    $getLevels = {
+        $value = Get-ObjectPropertyValue -Object $PlanItem -Name 'DictionaryLevels' -Default $null
+        if ($null -eq $value) {
+            $value = Get-ObjectPropertyValue -Object $PlanItem -Name 'DictionaryLevel' -Default $null
+        }
+        return @($value | Where-Object { $null -ne $_ -and [string]::IsNullOrWhiteSpace([string]$_) -eq $false })
+    }
+
+    switch ($kind) {
+        'BuiltinDictionary' {
+            & $addBuiltin (Get-ObjectPropertyValue -Object $PlanItem -Name 'Language' -Default '') (Get-ObjectPropertyValue -Object $PlanItem -Name 'DictionaryLevel' -Default $null)
+        }
+        'Dictionary' {
+            $path = Get-ObjectPropertyValue -Object $PlanItem -Name 'DictionaryPath' -Default ''
+            if (-not [string]::IsNullOrWhiteSpace([string]$path)) {
+                & $addCustom $path
+            }
+            else {
+                & $addBuiltin (Get-ObjectPropertyValue -Object $PlanItem -Name 'Language' -Default '') (Get-ObjectPropertyValue -Object $PlanItem -Name 'DictionaryLevel' -Default $null)
+            }
+        }
+        'CustomDictionary' { & $addCustom (Get-ObjectPropertyValue -Object $PlanItem -Name 'DictionaryPath' -Default '') }
+        'CustomRules' { & $addCustom (Get-ObjectPropertyValue -Object $PlanItem -Name 'DictionaryPath' -Default '') }
+        'RulesDictionary' {
+            & $addBuiltin (Get-ObjectPropertyValue -Object $PlanItem -Name 'Language' -Default '') (Get-ObjectPropertyValue -Object $PlanItem -Name 'DictionaryLevel' -Default $null)
+        }
+        'RuleCaseVariants' {
+            $path = Get-ObjectPropertyValue -Object $PlanItem -Name 'DictionaryPath' -Default ''
+            if (-not [string]::IsNullOrWhiteSpace([string]$path)) {
+                & $addCustom $path
+            }
+            else {
+                & $addBuiltin (Get-ObjectPropertyValue -Object $PlanItem -Name 'Language' -Default '') (Get-ObjectPropertyValue -Object $PlanItem -Name 'DictionaryLevel' -Default $null)
+            }
+        }
+        'RuleAppendVariants' {
+            $path = Get-ObjectPropertyValue -Object $PlanItem -Name 'DictionaryPath' -Default ''
+            if (-not [string]::IsNullOrWhiteSpace([string]$path)) {
+                & $addCustom $path
+            }
+            else {
+                & $addBuiltin (Get-ObjectPropertyValue -Object $PlanItem -Name 'Language' -Default '') (Get-ObjectPropertyValue -Object $PlanItem -Name 'DictionaryLevel' -Default $null)
+            }
+        }
+        'CapitalInitialDigits' {
+            & $addBuiltin (Get-ObjectPropertyValue -Object $PlanItem -Name 'Language' -Default '') (Get-ObjectPropertyValue -Object $PlanItem -Name 'DictionaryLevel' -Default $null)
+        }
+        'HybridDictionary' {
+            $languages = @(& $getLanguages)
+            $levels = @(& $getLevels)
+            if ($languages.Count -eq 0 -or $levels.Count -eq 0) {
+                Throw-PlanDictionarySourceInvalid
+            }
+            foreach ($level in $levels) {
+                foreach ($language in $languages) {
+                    & $addBuiltin $language $level
+                }
+            }
+        }
+        'CommonSymbols' {
+            $path = Get-ObjectPropertyValue -Object $PlanItem -Name 'DictionaryPath' -Default ''
+            if (-not [string]::IsNullOrWhiteSpace([string]$path)) {
+                & $addCustom $path
+            }
+            else {
+                & $addBuiltin (Get-ObjectPropertyValue -Object $PlanItem -Name 'Language' -Default '') (Get-ObjectPropertyValue -Object $PlanItem -Name 'DictionaryLevel' -Default $null)
+            }
+        }
+        'CustomMask' {
+            $mask = [string](Get-ObjectPropertyValue -Object $PlanItem -Name 'Mask' -Default '')
+            if (-not [string]::IsNullOrWhiteSpace($mask)) {
+                $tokens = @(Get-MaskTokens -Mask $mask)
+                $hasWord = $false
+                foreach ($token in $tokens) {
+                    if ([string]$token.Kind -eq 'Word') { $hasWord = $true; break }
+                }
+                if ($hasWord) {
+                    & $addCustom (Get-ObjectPropertyValue -Object $PlanItem -Name 'DictionaryPath' -Default '')
+                }
+            }
+        }
+    }
+
+    return $sources.ToArray()
+}
+
 function Get-RecoveryLevel4PlanItems {
     [CmdletBinding()]
     param(
@@ -1567,7 +2456,7 @@ function Get-RecoveryLevel4PlanItems {
     }
     $items.Add([pscustomobject]@{
             CoverageId = ('mask:L4-dates-{0}-{1}:v2' -f $startYear, $planYear); Kind = 'DateRange'; DisplayName = ('日期 {0}–{1}' -f $startYear, $planYear);
-            StartYear = $startYear; EndYear = $planYear; CandidateCount = [long]$dateCount; GpuSupported = $false
+            StartYear = $startYear; EndYear = $planYear; CandidateCount = [long]$dateCount; GeneratorKind = 'DateRange'; EngineStrategy = 'GeneratedDictionary'; GpuSupported = $true
         })
     $items.Add([pscustomobject]@{
             CoverageId = ('mask:L4-year-combinations-{0}:v2' -f $planYear); Kind = 'YearCombination'; DisplayName = '常见年份组合';
@@ -1588,8 +2477,8 @@ function Get-RecoveryLevel4PlanItems {
         # suffix coverage above. Keep only the independent symbol and case
         # transformations, each as a single-language GPU-capable coverage.
         $items.Add([pscustomobject]@{
-                CoverageId = ('hybrid:L4-word-symbol-{0}:v2' -f $language); Kind = 'HybridDictionary'; DisplayName = ('字典词 + 常见符号（{0}）' -f $language); Language = $language; Languages = @($language); DictionaryLevels = @(1);
-                SuffixKind = 'Symbols'; Symbols = @('!', '@', '#', '$', '_', '-'); CandidateCount = ($l1Count * 6); GpuSupported = $false
+                CoverageId = ('hybrid:L4-word-symbol-{0}:v3' -f $language); Kind = 'CommonSymbols'; DisplayName = ('字典词 + 常见符号（{0}）' -f $language); Language = $language; Languages = @($language); DictionaryLevels = @(1); DictionaryLevel = 1;
+                GeneratorKind = 'CommonSymbols'; SuffixKind = 'Symbols'; Symbols = @('@', '#', '$', '_', '-'); CandidateCount = ($l1Count * 5); EngineStrategy = 'GeneratedDictionary'; GpuSupported = $true
             })
         [long]$capitalVariantCount = Get-CapitalInitialVariantCount -Language $language -Level 1
         if ($capitalVariantCount -gt 0) {
@@ -1861,6 +2750,9 @@ function Get-HashcatStrategySupport {
         'Dictionary' {
             return [pscustomobject]@{ Supported = $true; Message = 'Dictionary candidates can use the local Hashcat GPU backend.' }
         }
+        'GeneratedDictionary' {
+            return [pscustomobject]@{ Supported = $true; Message = 'Generated dictionary candidates can use the local Hashcat GPU backend.' }
+        }
         'Rules' {
             return [pscustomobject]@{ Supported = $true; Message = 'Dictionary rules can use the local Hashcat GPU backend.' }
         }
@@ -1930,6 +2822,12 @@ function New-HashcatAttackPlan {
 
     switch ($Strategy) {
         'Dictionary' {
+            return [pscustomobject]@{
+                Supported = $true
+                Arguments = @('-a', '0', $HashPath, [string]$Job.DictionaryPath)
+            }
+        }
+        'GeneratedDictionary' {
             return [pscustomobject]@{
                 Supported = $true
                 Arguments = @('-a', '0', $HashPath, [string]$Job.DictionaryPath)
@@ -2402,6 +3300,8 @@ Export-ModuleMember -Function @(
     'Get-ArchiveInspection',
     'Test-ArchivePassword',
     'Write-LocalJsonAtomic',
+    'Resolve-CoverageProgress',
+    'Get-CoverageEtaSeconds',
     'Read-LocalJson',
     'Read-HashcatStatusIncremental',
     'Get-ArchiveIdentity',
@@ -2410,6 +3310,7 @@ Export-ModuleMember -Function @(
     'Get-CustomMaskCoverageIdentity',
     'Test-CustomMaskCoverageIdentityMatch',
     'Merge-RecoveryJobForLevelUpgrade',
+    'Get-RecoveryLevelUpgradeIntent',
     'Get-LocalComputeDevices',
     'Resolve-LocalHashcat',
     'Resolve-LocalZip2John',
@@ -2421,6 +3322,7 @@ Export-ModuleMember -Function @(
     'New-ZipHashcatArtifact',
     'New-SevenZipHashcatArtifact',
     'New-ArchiveHashcatArtifact',
+    'Clear-AppOwnedHashcatResidue',
     'Get-RecoveryLevel',
     'Get-RecoveryStages',
     'Get-BuiltinQuickCandidates',
@@ -2437,8 +3339,19 @@ Export-ModuleMember -Function @(
     'Expand-BuiltinDictionary',
     'Get-CustomDictionaryIdentity',
     'Get-BuiltinDictionaryCount',
+    'Get-ValidDateCandidateCount',
+    'Get-DateRangeCandidates',
     'ConvertTo-CapitalInitialVariant',
     'Get-CapitalInitialVariantCount',
+    'Test-ObjectProperty',
+    'Get-ObjectPropertyValue',
+    'Get-PlanItemDictionarySources',
+    'Expand-CaseVariantDictionaryFile',
+    'Expand-CapitalInitialDictionaryFile',
+    'New-GeneratedDictionaryFile',
+    'Get-GeneratedCoverageCandidates',
+    'Write-GeneratedCoverageDictionary',
+    'Get-OverallFlowProgress',
     'Get-PlanYear',
     'Get-CustomMaskPlanItem',
     'Get-RecoveryLevel4PlanItems',

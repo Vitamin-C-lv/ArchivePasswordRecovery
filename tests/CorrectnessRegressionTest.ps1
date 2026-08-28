@@ -121,6 +121,12 @@ try {
     $l4Items = @(Get-RecoveryPlanItems -Job $l4Job -StageNumber 4)
     $gpuWordItems = @($l4Items | Where-Object { $_.Kind -eq 'HybridDictionary' -and $_.GpuSupported })
     Assert-Equal -Actual $gpuWordItems.Count -Expected 8 -Message 'zh L4 word-digit coverages were not split into global/zh GPU items'
+    $commonSymbolItems = @($l4Items | Where-Object { $_.Kind -eq 'CommonSymbols' })
+    Assert-Equal -Actual $commonSymbolItems.Count -Expected 2 -Message 'zh L4 CommonSymbols coverages were not split per language'
+    Assert-Equal -Actual @($commonSymbolItems | Where-Object { [long]$_.CandidateCount -ne 5000 }).Count -Expected 0 -Message 'CommonSymbols candidate total is not the five-symbol L1 total'
+    Assert-Equal -Actual @($commonSymbolItems | Where-Object { $_.Symbols -contains '!' }).Count -Expected 0 -Message 'CommonSymbols still includes the removed exclamation-mark suffix'
+    Assert-Equal -Actual @($commonSymbolItems | Where-Object { -not $_.GpuSupported -or [string]$_.EngineStrategy -ne 'GeneratedDictionary' }).Count -Expected 0 -Message 'CommonSymbols GPU generated-set adapter is not enabled'
+    Assert-Equal -Actual @($commonSymbolItems | Where-Object { [string]$_.CoverageId -notmatch ':v3$' }).Count -Expected 0 -Message 'CommonSymbols v3 CoverageId is missing'
     Assert-Equal -Actual @($l4Items | Where-Object { $_.Kind -eq 'YearRange' }).Count -Expected 0 -Message 'redundant L4 year range still exists'
     Assert-Equal -Actual @($l4Items | Where-Object { [string]$_.CoverageId -match 'word-year' }).Count -Expected 0 -Message 'redundant word-year coverage still exists'
     Assert-Equal -Actual @($gpuWordItems | Where-Object { @($_.Languages).Count -ne 1 }).Count -Expected 0 -Message 'a GPU dictionary coverage still combines multiple language streams'

@@ -76,6 +76,62 @@ function Wait-ForSpeedSample {
     throw 'The running GPU task did not publish a real local speed sample.'
 }
 
+function Wait-ForKnownCandidateTotal {
+    param(
+        [Parameter(Mandatory = $true)][string]$ProgressPath,
+        [int]$TimeoutSeconds = 30
+    )
+
+    $deadline = [datetime]::UtcNow.AddSeconds($TimeoutSeconds)
+    while ([datetime]::UtcNow -lt $deadline) {
+        if (Test-Path -LiteralPath $ProgressPath -PathType Leaf) {
+            try {
+                $progress = Read-LocalJson -Path $ProgressPath
+                if ($progress.State -eq 'Failed') {
+                    throw ('GPU worker failed before publishing its candidate total: ' + $progress.Message)
+                }
+                if ($progress.State -eq 'Running' -and $progress.CandidateTotal -gt 0) {
+                    return $progress
+                }
+            }
+            catch {
+                if ($_.Exception.Message -match '^GPU worker failed') { throw }
+            }
+        }
+        Start-Sleep -Milliseconds 150
+    }
+    throw 'The running GPU task did not publish a reliable candidate total.'
+}
+
+function Wait-ForNewWorkerBackend {
+    param(
+        [Parameter(Mandatory = $true)][string]$ProgressPath,
+        [Parameter(Mandatory = $true)][string]$PreviousRunId,
+        [int]$TimeoutSeconds = 30
+    )
+
+    $deadline = [datetime]::UtcNow.AddSeconds($TimeoutSeconds)
+    while ([datetime]::UtcNow -lt $deadline) {
+        if (Test-Path -LiteralPath $ProgressPath -PathType Leaf) {
+            try {
+                $progress = Read-LocalJson -Path $ProgressPath
+                if ($progress.State -eq 'Failed') {
+                    throw ('GPU worker failed before the new backend became controllable: ' + $progress.Message)
+                }
+                if ([string]$progress.RunId -ne $PreviousRunId -and
+                    [string]$progress.Activity -in @('StartingHashcat', 'RestoringHashcat', 'RunningCoverage')) {
+                    return $progress
+                }
+            }
+            catch {
+                if ($_.Exception.Message -match '^GPU worker failed') { throw }
+            }
+        }
+        Start-Sleep -Milliseconds 150
+    }
+    throw 'Timed out waiting for the new Worker Hashcat backend state.'
+}
+
 $testRoot = Join-Path ([System.IO.Path]::GetTempPath()) ('ArchivePasswordRecoveryGpuControl-' + [guid]::NewGuid().ToString('N'))
 $worker = $null
 $resumedWorker = $null
@@ -128,7 +184,8 @@ try {
     $progressPath = Join-Path $jobDirectory 'progress.json'
 
     $worker = Start-LocalWorker -JobDirectory $jobDirectory
-    $running = Wait-ForWorkerState -ProgressPath $progressPath -ExpectedStates @('Running')
+    [void](Wait-ForWorkerState -ProgressPath $progressPath -ExpectedStates @('Running'))
+    $running = Wait-ForKnownCandidateTotal -ProgressPath $progressPath
     $sampled = Wait-ForSpeedSample -ProgressPath $progressPath
     [System.IO.File]::WriteAllText($stopPath, 'stop')
     $stopped = Wait-ForWorkerState -ProgressPath $progressPath -ExpectedStates @('Stopped')
@@ -145,10 +202,7 @@ try {
 
     [System.IO.File]::Delete($stopPath)
     $resumedWorker = Start-LocalWorker -JobDirectory $jobDirectory -Resume
-    $restored = Wait-ForWorkerState -ProgressPath $progressPath -ExpectedStates @('Running', 'Failed')
-    if ($restored.State -eq 'Failed') {
-        throw ('Hashcat restore launch failed: ' + $restored.Message)
-    }
+    $restored = Wait-ForNewWorkerBackend -ProgressPath $progressPath -PreviousRunId ([string]$stopped.RunId)
     $resumed = $restored
     $newWorkerStarted = ($resumedWorker.Id -ne $worker.Id)
     if (-not $newWorkerStarted) { throw 'Resume unexpectedly reused the old Worker process.' }
@@ -160,7 +214,10 @@ try {
     if (-not $resumedWorker.WaitForExit(20000)) {
         throw 'Restored GPU worker did not stop in time.'
     }
-    $finalStopped = Wait-ForWorkerState -ProgressPath $progressPath -ExpectedStates @('Stopped')
+    $finalStopped = Read-LocalJson -Path $progressPath
+    if ($finalStopped.State -ne 'Stopped') {
+        throw ('Restored GPU worker ended in unexpected state: ' + $finalStopped.State + '. Message: ' + $finalStopped.Message)
+    }
 
     if ($running.CandidateTotal -le 0 -or $stopped.CandidateTotal -le 0) {
         throw 'The known brute-force range did not publish a reliable candidate total.'

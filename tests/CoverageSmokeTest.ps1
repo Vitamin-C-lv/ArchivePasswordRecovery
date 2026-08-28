@@ -65,7 +65,7 @@ function Invoke-CoverageWorker {
     )
 
     $worker = Join-Path $srcRoot 'RecoveryWorker.ps1'
-    $arguments = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', ('"{0}"' -f $worker), '-JobDirectory', ('"{0}"' -f $JobDirectory))
+    $arguments = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $worker, '-JobDirectory', $JobDirectory)
     if ($Resume) { $arguments += '-Resume' }
     & (Resolve-WindowsPowerShell) @arguments | Out-Null
     if ($LASTEXITCODE -ne 0) { throw "Coverage worker failed with exit code $LASTEXITCODE." }

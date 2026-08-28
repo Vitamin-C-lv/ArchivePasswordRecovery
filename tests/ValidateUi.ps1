@@ -21,11 +21,16 @@ if (-not $match.Success) {
 $reader = New-Object System.Xml.XmlNodeReader $xaml
 $window = [Windows.Markup.XamlReader]::Load($reader)
 try {
-    foreach ($name in @('ArchivePathBox', 'StrategyBox', 'DeviceBox', 'StartButton', 'PauseButton', 'ResumeButton', 'StopButton', 'ResultValue')) {
+    foreach ($name in @('ArchivePathBox', 'StrategyBox', 'DeviceBox', 'OverallProgressBar', 'OverallProgressPercent', 'OverallProgressSummary', 'OverallProgressCurrent', 'StartButton', 'PauseButton', 'ResumeButton', 'StopButton', 'ResultValue')) {
         if ($null -eq $window.FindName($name)) {
             throw "Required WPF control missing: $name"
         }
     }
+    $overallBar = $window.FindName('OverallProgressBar')
+    if ($overallBar.Height -lt 8 -or $overallBar.Height -gt 10) { throw 'Overall progress bar height is outside the requested 8-10px range.' }
+    if ([string]$overallBar.Foreground -notmatch '2F75C9') { throw 'Overall progress bar is not using the primary blue foreground.' }
+    $xamlText = $match.Groups[1].Value
+    if ($xamlText.IndexOf('OverallProgressBar') -lt $xamlText.IndexOf('StrategyHelpText')) { throw 'Overall progress bar is not placed below the recovery-level explanation.' }
 
     'UI_XAML: PASS'
 }

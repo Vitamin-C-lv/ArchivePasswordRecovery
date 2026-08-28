@@ -128,6 +128,9 @@ try {
         if ($preference -eq 'Auto' -and [string]$progress.Backend -notmatch 'Hashcat') {
             throw "Auto did not select the available local Hashcat GPU backend: $($progress.Backend)"
         }
+        if ([int]$progress.ArchiveArtifactExtractionCalls -ne 1 -or [string]$progress.ArchiveArtifactState -ne 'Ready') {
+            throw "$preference worker did not use exactly one cached 7z Hashcat artifact extraction. Calls: $($progress.ArchiveArtifactExtractionCalls); State: $($progress.ArchiveArtifactState)"
+        }
 
         $runs.Add([pscustomobject]@{
                 Preference       = $preference
@@ -137,6 +140,7 @@ try {
                 CandidatesTested = [long]$progress.CandidatesTested
                 SpeedPerSecond   = [double]$progress.SpeedPerSecond
                 LocalVerification = [bool]$progress.Result.LocallyVerified
+                ArtifactExtractionCalls = [int]$progress.ArchiveArtifactExtractionCalls
             })
     }
 
