@@ -1531,6 +1531,192 @@ function Get-CapitalInitialVariantCount {
     return [long]$seen.Count
 }
 
+function Invoke-DictionaryPreparationProgress {
+    [CmdletBinding()]
+    param(
+        [scriptblock]$ProgressCallback,
+        [Parameter(Mandatory = $true)][long]$Processed,
+        $Total,
+        [Parameter(Mandatory = $true)][double]$Elapsed,
+        [Parameter(Mandatory = $true)][long]$SourceEntriesProcessed,
+        [Parameter(Mandatory = $true)][long]$BytesProcessed,
+        [Parameter(Mandatory = $true)][long]$BytesTotal
+    )
+
+    if ($null -eq $ProgressCallback) { return }
+    & $ProgressCallback ([pscustomobject]@{
+            Processed             = $Processed
+            Total                 = $Total
+            Elapsed               = [math]::Round($Elapsed, 3)
+            SourceEntriesProcessed = $SourceEntriesProcessed
+            BytesProcessed        = $BytesProcessed
+            BytesTotal            = $BytesTotal
+        })
+}
+
+function Get-TextDictionaryEntryCount {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][string]$Path
+    )
+
+    [long]$count = 0
+    $reader = New-Object System.IO.StreamReader($Path, $true)
+    try {
+        while ($null -ne ($line = $reader.ReadLine())) {
+            if ($line.Length -gt 0) { $count++ }
+        }
+    }
+    finally { $reader.Dispose() }
+    return $count
+}
+
+function Expand-CaseVariantDictionaryFile {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][string]$SourcePath,
+        [Parameter(Mandatory = $true)][string]$OutputPath,
+        [Parameter(Mandatory = $true)][int]$RecoveryPlanYear,
+        [scriptblock]$ProgressCallback,
+        [long]$ProgressTotal = -1,
+        [ValidateSet('Entries', 'Bytes')][string]$ProgressUnit = 'Entries',
+        [switch]$DeduplicateVariants
+    )
+
+    if (-not (Test-Path -LiteralPath $SourcePath -PathType Leaf)) {
+        throw ('The local rule dictionary source is missing: {0}' -f $SourcePath)
+    }
+    $sourceInfo = Get-Item -LiteralPath $SourcePath -Force
+    [long]$bytesTotal = $sourceInfo.Length
+    $total = if ($ProgressTotal -ge 0) { [long]$ProgressTotal } elseif ($ProgressUnit -eq 'Bytes') { $bytesTotal } else { $null }
+    $outputDirectory = Split-Path $OutputPath -Parent
+    if (-not [string]::IsNullOrWhiteSpace($outputDirectory)) {
+        New-Item -ItemType Directory -Path $outputDirectory -Force | Out-Null
+    }
+
+    if (Test-Path -LiteralPath $OutputPath -PathType Leaf) {
+        [long]$outputCount = Get-TextDictionaryEntryCount -Path $OutputPath
+        $processed = if ($ProgressUnit -eq 'Bytes') { $bytesTotal } elseif ($null -ne $total) { [long]$total } else { $outputCount }
+        Invoke-DictionaryPreparationProgress -ProgressCallback $ProgressCallback -Processed $processed -Total $total -Elapsed 0 -SourceEntriesProcessed $processed -BytesProcessed $bytesTotal -BytesTotal $bytesTotal
+        return [pscustomobject]@{ Path = $OutputPath; OutputCount = $outputCount }
+    }
+
+    $temporaryPath = $OutputPath + '.' + [guid]::NewGuid().ToString('N') + '.tmp'
+    $globalSeen = if ($DeduplicateVariants) { New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::Ordinal) } else { $null }
+    $reader = New-Object System.IO.StreamReader($SourcePath, $true)
+    $writer = New-Object System.IO.StreamWriter($temporaryPath, $false, (New-Object System.Text.UTF8Encoding($false)))
+    $startedUtc = [datetime]::UtcNow
+    [long]$sourceEntriesProcessed = 0
+    [long]$outputCount = 0
+    [long]$lastReportedEntries = 0
+    try {
+        Invoke-DictionaryPreparationProgress -ProgressCallback $ProgressCallback -Processed 0 -Total $total -Elapsed 0 -SourceEntriesProcessed 0 -BytesProcessed 0 -BytesTotal $bytesTotal
+        while ($null -ne ($word = $reader.ReadLine())) {
+            $sourceEntriesProcessed++
+            if ($word.Length -gt 0) {
+                $lower = $word.ToLowerInvariant()
+                if (-not [string]::Equals($lower, $word, [System.StringComparison]::Ordinal) -and
+                    ($null -eq $globalSeen -or $globalSeen.Add($lower))) {
+                    $writer.WriteLine($lower)
+                    $outputCount++
+                }
+                $upper = $word.ToUpperInvariant()
+                if (-not [string]::Equals($upper, $word, [System.StringComparison]::Ordinal) -and
+                    -not [string]::Equals($upper, $lower, [System.StringComparison]::Ordinal) -and
+                    ($null -eq $globalSeen -or $globalSeen.Add($upper))) {
+                    $writer.WriteLine($upper)
+                    $outputCount++
+                }
+            }
+
+            if ($sourceEntriesProcessed - $lastReportedEntries -ge 1000) {
+                $processed = if ($ProgressUnit -eq 'Bytes') { [long]$reader.BaseStream.Position } else { $sourceEntriesProcessed }
+                Invoke-DictionaryPreparationProgress -ProgressCallback $ProgressCallback -Processed $processed -Total $total -Elapsed (([datetime]::UtcNow - $startedUtc).TotalSeconds) -SourceEntriesProcessed $sourceEntriesProcessed -BytesProcessed ([long]$reader.BaseStream.Position) -BytesTotal $bytesTotal
+                $lastReportedEntries = $sourceEntriesProcessed
+            }
+        }
+    }
+    finally {
+        $writer.Dispose()
+        $reader.Dispose()
+    }
+
+    $finalProcessed = if ($ProgressUnit -eq 'Bytes') { $bytesTotal } else { $sourceEntriesProcessed }
+    Invoke-DictionaryPreparationProgress -ProgressCallback $ProgressCallback -Processed $finalProcessed -Total $total -Elapsed (([datetime]::UtcNow - $startedUtc).TotalSeconds) -SourceEntriesProcessed $sourceEntriesProcessed -BytesProcessed $bytesTotal -BytesTotal $bytesTotal
+    try {
+        Move-Item -LiteralPath $temporaryPath -Destination $OutputPath -Force
+    }
+    finally {
+        if (Test-Path -LiteralPath $temporaryPath) { Remove-Item -LiteralPath $temporaryPath -Force -ErrorAction SilentlyContinue }
+    }
+    return [pscustomobject]@{ Path = $OutputPath; OutputCount = $outputCount }
+}
+
+function Expand-CapitalInitialDictionaryFile {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][string]$SourcePath,
+        [Parameter(Mandatory = $true)][string]$OutputPath,
+        [scriptblock]$ProgressCallback,
+        [long]$ProgressTotal = -1
+    )
+
+    if (-not (Test-Path -LiteralPath $SourcePath -PathType Leaf)) {
+        throw ('The built-in dictionary resource is missing: {0}' -f $SourcePath)
+    }
+    $sourceInfo = Get-Item -LiteralPath $SourcePath -Force
+    [long]$bytesTotal = $sourceInfo.Length
+    $total = if ($ProgressTotal -ge 0) { [long]$ProgressTotal } else { $null }
+    $outputDirectory = Split-Path $OutputPath -Parent
+    if (-not [string]::IsNullOrWhiteSpace($outputDirectory)) {
+        New-Item -ItemType Directory -Path $outputDirectory -Force | Out-Null
+    }
+
+    if (Test-Path -LiteralPath $OutputPath -PathType Leaf) {
+        [long]$outputCount = Get-TextDictionaryEntryCount -Path $OutputPath
+        Invoke-DictionaryPreparationProgress -ProgressCallback $ProgressCallback -Processed $total -Total $total -Elapsed 0 -SourceEntriesProcessed $total -BytesProcessed $bytesTotal -BytesTotal $bytesTotal
+        return [pscustomobject]@{ Path = $OutputPath; OutputCount = $outputCount }
+    }
+
+    $temporaryPath = $OutputPath + '.' + [guid]::NewGuid().ToString('N') + '.tmp'
+    $seen = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::Ordinal)
+    $reader = New-Object System.IO.StreamReader($SourcePath, $true)
+    $writer = New-Object System.IO.StreamWriter($temporaryPath, $false, (New-Object System.Text.UTF8Encoding($false)))
+    $startedUtc = [datetime]::UtcNow
+    [long]$sourceEntriesProcessed = 0
+    [long]$outputCount = 0
+    [long]$lastReportedEntries = 0
+    try {
+        Invoke-DictionaryPreparationProgress -ProgressCallback $ProgressCallback -Processed 0 -Total $total -Elapsed 0 -SourceEntriesProcessed 0 -BytesProcessed 0 -BytesTotal $bytesTotal
+        while ($null -ne ($word = $reader.ReadLine())) {
+            $sourceEntriesProcessed++
+            if ($word.Length -gt 0) {
+                $capitalized = ConvertTo-CapitalInitialVariant -Word $word
+                if ($null -ne $capitalized -and $seen.Add([string]$capitalized)) {
+                    $writer.WriteLine([string]$capitalized)
+                    $outputCount++
+                }
+            }
+            if ($sourceEntriesProcessed - $lastReportedEntries -ge 1000) {
+                Invoke-DictionaryPreparationProgress -ProgressCallback $ProgressCallback -Processed $sourceEntriesProcessed -Total $total -Elapsed (([datetime]::UtcNow - $startedUtc).TotalSeconds) -SourceEntriesProcessed $sourceEntriesProcessed -BytesProcessed ([long]$reader.BaseStream.Position) -BytesTotal $bytesTotal
+                $lastReportedEntries = $sourceEntriesProcessed
+            }
+        }
+    }
+    finally {
+        $writer.Dispose()
+        $reader.Dispose()
+    }
+    Invoke-DictionaryPreparationProgress -ProgressCallback $ProgressCallback -Processed $sourceEntriesProcessed -Total $total -Elapsed (([datetime]::UtcNow - $startedUtc).TotalSeconds) -SourceEntriesProcessed $sourceEntriesProcessed -BytesProcessed $bytesTotal -BytesTotal $bytesTotal
+    try {
+        Move-Item -LiteralPath $temporaryPath -Destination $OutputPath -Force
+    }
+    finally {
+        if (Test-Path -LiteralPath $temporaryPath) { Remove-Item -LiteralPath $temporaryPath -Force -ErrorAction SilentlyContinue }
+    }
+    return [pscustomobject]@{ Path = $OutputPath; OutputCount = $outputCount }
+}
+
 function Get-PlanYear {
     [CmdletBinding()]
     param(
@@ -1623,6 +1809,169 @@ function Get-CustomMaskPlanItem {
         CandidateCount = $candidateCount
         GpuSupported = $gpuSupported
     }
+}
+
+function Test-ObjectProperty {
+    [CmdletBinding()]
+    param(
+        [AllowNull()]$Object,
+        [Parameter(Mandatory = $true)][string]$Name
+    )
+
+    return $null -ne $Object -and $null -ne $Object.PSObject.Properties[$Name]
+}
+
+function Get-ObjectPropertyValue {
+    [CmdletBinding()]
+    param(
+        [AllowNull()]$Object,
+        [Parameter(Mandatory = $true)][string]$Name,
+        $Default = $null
+    )
+
+    if (Test-ObjectProperty -Object $Object -Name $Name) {
+        return $Object.PSObject.Properties[$Name].Value
+    }
+    return $Default
+}
+
+function Throw-PlanDictionarySourceInvalid {
+    [CmdletBinding()]
+    param()
+
+    throw 'PLAN_DICTIONARY_SOURCE_INVALID: 计划项的字典来源定义不完整。'
+}
+
+function Get-PlanItemDictionarySources {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]$PlanItem,
+        $Job
+    )
+
+    $sources = New-Object 'System.Collections.Generic.List[object]'
+    $kind = [string](Get-ObjectPropertyValue -Object $PlanItem -Name 'Kind' -Default '')
+
+    $addBuiltin = {
+        param($Language, $Level)
+        if ([string]::IsNullOrWhiteSpace([string]$Language) -or $null -eq $Level) {
+            Throw-PlanDictionarySourceInvalid
+        }
+        try {
+            [int]$normalizedLevel = $Level
+            $definition = Get-BuiltinDictionaryDefinition -Language ([string]$Language) -Level $normalizedLevel
+            $projectRoot = Split-Path $PSScriptRoot -Parent
+            $sourcePath = Join-Path $projectRoot ([string]$definition.RelativePath.Replace('/', '\'))
+        }
+        catch {
+            Throw-PlanDictionarySourceInvalid
+        }
+        [void]$sources.Add([pscustomobject]@{
+                Language   = [string]$Language
+                Level      = $normalizedLevel
+                Path       = $sourcePath
+                SourceType = 'Builtin'
+            })
+    }
+
+    $addCustom = {
+        param($Path)
+        if ([string]::IsNullOrWhiteSpace([string]$Path)) {
+            Throw-PlanDictionarySourceInvalid
+        }
+        try { $normalizedPath = [System.IO.Path]::GetFullPath([string]$Path) }
+        catch { Throw-PlanDictionarySourceInvalid }
+        [void]$sources.Add([pscustomobject]@{
+                Language   = ''
+                Level      = $null
+                Path       = $normalizedPath
+                SourceType = 'Custom'
+            })
+    }
+
+    $getLanguages = {
+        $value = Get-ObjectPropertyValue -Object $PlanItem -Name 'Languages' -Default $null
+        if ($null -eq $value) {
+            $value = Get-ObjectPropertyValue -Object $PlanItem -Name 'Language' -Default $null
+        }
+        return @($value | Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_) })
+    }
+
+    $getLevels = {
+        $value = Get-ObjectPropertyValue -Object $PlanItem -Name 'DictionaryLevels' -Default $null
+        if ($null -eq $value) {
+            $value = Get-ObjectPropertyValue -Object $PlanItem -Name 'DictionaryLevel' -Default $null
+        }
+        return @($value | Where-Object { $null -ne $_ -and [string]::IsNullOrWhiteSpace([string]$_) -eq $false })
+    }
+
+    switch ($kind) {
+        'BuiltinDictionary' {
+            & $addBuiltin (Get-ObjectPropertyValue -Object $PlanItem -Name 'Language' -Default '') (Get-ObjectPropertyValue -Object $PlanItem -Name 'DictionaryLevel' -Default $null)
+        }
+        'Dictionary' {
+            $path = Get-ObjectPropertyValue -Object $PlanItem -Name 'DictionaryPath' -Default ''
+            if (-not [string]::IsNullOrWhiteSpace([string]$path)) {
+                & $addCustom $path
+            }
+            else {
+                & $addBuiltin (Get-ObjectPropertyValue -Object $PlanItem -Name 'Language' -Default '') (Get-ObjectPropertyValue -Object $PlanItem -Name 'DictionaryLevel' -Default $null)
+            }
+        }
+        'CustomDictionary' { & $addCustom (Get-ObjectPropertyValue -Object $PlanItem -Name 'DictionaryPath' -Default '') }
+        'CustomRules' { & $addCustom (Get-ObjectPropertyValue -Object $PlanItem -Name 'DictionaryPath' -Default '') }
+        'RulesDictionary' {
+            & $addBuiltin (Get-ObjectPropertyValue -Object $PlanItem -Name 'Language' -Default '') (Get-ObjectPropertyValue -Object $PlanItem -Name 'DictionaryLevel' -Default $null)
+        }
+        'RuleCaseVariants' {
+            $path = Get-ObjectPropertyValue -Object $PlanItem -Name 'DictionaryPath' -Default ''
+            if (-not [string]::IsNullOrWhiteSpace([string]$path)) {
+                & $addCustom $path
+            }
+            else {
+                & $addBuiltin (Get-ObjectPropertyValue -Object $PlanItem -Name 'Language' -Default '') (Get-ObjectPropertyValue -Object $PlanItem -Name 'DictionaryLevel' -Default $null)
+            }
+        }
+        'RuleAppendVariants' {
+            $path = Get-ObjectPropertyValue -Object $PlanItem -Name 'DictionaryPath' -Default ''
+            if (-not [string]::IsNullOrWhiteSpace([string]$path)) {
+                & $addCustom $path
+            }
+            else {
+                & $addBuiltin (Get-ObjectPropertyValue -Object $PlanItem -Name 'Language' -Default '') (Get-ObjectPropertyValue -Object $PlanItem -Name 'DictionaryLevel' -Default $null)
+            }
+        }
+        'CapitalInitialDigits' {
+            & $addBuiltin (Get-ObjectPropertyValue -Object $PlanItem -Name 'Language' -Default '') (Get-ObjectPropertyValue -Object $PlanItem -Name 'DictionaryLevel' -Default $null)
+        }
+        'HybridDictionary' {
+            $languages = @(& $getLanguages)
+            $levels = @(& $getLevels)
+            if ($languages.Count -eq 0 -or $levels.Count -eq 0) {
+                Throw-PlanDictionarySourceInvalid
+            }
+            foreach ($level in $levels) {
+                foreach ($language in $languages) {
+                    & $addBuiltin $language $level
+                }
+            }
+        }
+        'CustomMask' {
+            $mask = [string](Get-ObjectPropertyValue -Object $PlanItem -Name 'Mask' -Default '')
+            if (-not [string]::IsNullOrWhiteSpace($mask)) {
+                $tokens = @(Get-MaskTokens -Mask $mask)
+                $hasWord = $false
+                foreach ($token in $tokens) {
+                    if ([string]$token.Kind -eq 'Word') { $hasWord = $true; break }
+                }
+                if ($hasWord) {
+                    & $addCustom (Get-ObjectPropertyValue -Object $PlanItem -Name 'DictionaryPath' -Default '')
+                }
+            }
+        }
+    }
+
+    return $sources.ToArray()
 }
 
 function Get-RecoveryLevel4PlanItems {
@@ -2526,6 +2875,11 @@ Export-ModuleMember -Function @(
     'Get-BuiltinDictionaryCount',
     'ConvertTo-CapitalInitialVariant',
     'Get-CapitalInitialVariantCount',
+    'Test-ObjectProperty',
+    'Get-ObjectPropertyValue',
+    'Get-PlanItemDictionarySources',
+    'Expand-CaseVariantDictionaryFile',
+    'Expand-CapitalInitialDictionaryFile',
     'Get-PlanYear',
     'Get-CustomMaskPlanItem',
     'Get-RecoveryLevel4PlanItems',

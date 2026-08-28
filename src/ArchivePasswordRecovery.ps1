@@ -231,15 +231,15 @@ try { $startupJobCleanup = @(Cleanup-TerminalRecoveryJobs -JobsRoot $jobsRoot) }
                     <TextBlock x:Name="DeviceValue" Grid.Row="2" Grid.Column="1" TextWrapping="Wrap" />
                     <TextBlock Grid.Row="2" Grid.Column="2" Text="当前 Backend" />
                     <TextBlock x:Name="EngineValue" Grid.Row="2" Grid.Column="3" TextWrapping="Wrap" />
-                    <TextBlock Grid.Row="4" Grid.Column="0" Text="已测试数量" />
+                    <TextBlock x:Name="ProgressMetricLabel" Grid.Row="4" Grid.Column="0" Text="已测试数量" />
                     <TextBlock x:Name="CandidatesValue" Grid.Row="4" Grid.Column="1" />
-                    <TextBlock Grid.Row="4" Grid.Column="2" Text="速度（平滑）" />
+                    <TextBlock x:Name="SpeedLabel" Grid.Row="4" Grid.Column="2" Text="速度（平滑）" />
                     <TextBlock x:Name="SpeedValue" Grid.Row="4" Grid.Column="3" FontWeight="SemiBold" Foreground="#526579" />
                     <TextBlock Grid.Row="6" Grid.Column="0" Text="预计剩余" />
                     <TextBlock x:Name="EstimatedRemainingValue" Grid.Row="6" Grid.Column="1" FontSize="16" FontWeight="SemiBold" Foreground="#202733" />
                     <TextBlock Grid.Row="6" Grid.Column="2" Text="当前范围最坏时间" />
                     <TextBlock x:Name="WorstCaseValue" Grid.Row="6" Grid.Column="3" TextWrapping="Wrap" FontSize="16" FontWeight="SemiBold" Foreground="#202733" />
-                    <TextBlock Grid.Row="8" Grid.Column="0" VerticalAlignment="Center" Text="搜索进度" />
+                    <TextBlock x:Name="ProgressBarLabel" Grid.Row="8" Grid.Column="0" VerticalAlignment="Center" Text="搜索进度" />
                     <ProgressBar x:Name="SearchProgressBar" Grid.Row="8" Grid.Column="1" Height="17" Minimum="0" Maximum="100" />
                     <TextBlock x:Name="ProgressPercentValue" Grid.Row="8" Grid.Column="2" Grid.ColumnSpan="2" Margin="10,0,0,0" VerticalAlignment="Center" />
                     <Border x:Name="ResultCard" Grid.Row="10" Grid.Column="0" Grid.ColumnSpan="4" Background="#EFF9F1" BorderBrush="#A8D5B0" BorderThickness="1" CornerRadius="6" Padding="12" Visibility="Collapsed">
@@ -323,8 +323,9 @@ foreach ($name in @(
         'QuickCandidatesBox', 'DictionaryPathBox', 'BrowseDictionaryButton', 'TryEmptyPasswordBox',
         'MaskBox', 'CharacterSetBox', 'CustomCharacterSetBox', 'MinLengthBox', 'MaxLengthBox',
         'StartButton', 'PauseButton', 'ResumeButton', 'StopButton', 'OpenJobButton', 'AdvancedSettingsExpander',
-        'StateValue', 'StageValue', 'EngineValue', 'DeviceValue', 'CandidatesValue', 'SpeedValue', 'ElapsedValue',
-        'EstimatedRemainingValue', 'WorstCaseValue', 'SearchProgressBar', 'ProgressPercentValue', 'ResultCard', 'ResultStatusText', 'ResultValue',
+'StateValue', 'StageValue', 'EngineValue', 'DeviceValue', 'ProgressMetricLabel', 'CandidatesValue', 'SpeedLabel', 'SpeedValue', 'ElapsedValue',
+'EstimatedRemainingValue', 'WorstCaseValue', 'SearchProgressBar', 'ProgressPercentValue', 'ResultCard', 'ResultStatusText', 'ResultValue',
+'ProgressBarLabel',
         'ProgressMessageText', 'AdvancedDeviceInfoText', 'LogBox'
     )) {
     $controls[$name] = $window.FindName($name)
@@ -499,6 +500,7 @@ function Convert-UiMessage {
         'Preparing local coverage: ' = '正在准备本地覆盖范围：'
         'Preparing local coverage for stage ' = '正在准备当前阶段的本地覆盖范围：'
         'Preparing local dictionary data for coverage: ' = '正在准备当前覆盖范围的本地字典数据：'
+        'PLAN_DICTIONARY_SOURCE_INVALID: 计划项的字典来源定义不完整。' = '计划项的字典来源定义不完整。'
         'Preparing local attack data for stage ' = '正在准备当前阶段的本地攻击数据：'
         'Starting the local Hashcat backend.' = '正在启动本地 Hashcat 后端。'
         'Restoring the saved local Hashcat checkpoint.' = '正在恢复已保存的本地 Hashcat 断点。'
@@ -554,6 +556,9 @@ function Convert-UiMessage {
     }
     if ($Message -match '^Preparing local dictionary data for coverage: (.+)\.$') {
         return ('正在准备当前覆盖范围的本地字典数据：{0}。' -f $Matches[1])
+    }
+    if ($Message -match '^Stage (\d+)/(\d+): Preparing local dictionary: (.+)\.$') {
+        return ('阶段 {0}/{1} · 正在准备本地字典：{2}' -f $Matches[1], $Matches[2], $Matches[3])
     }
     if ($Message -match '^Preparing local attack data for stage (.+)\.$') {
         return ('正在准备当前阶段的本地攻击数据：{0}。' -f $Matches[1])
@@ -630,7 +635,7 @@ function Format-LocalCount {
     param($Value)
 
     if ($null -eq $Value) {
-        return '未知'
+        return '暂无法预估总量'
     }
     try {
         return ('{0:N0}' -f [long]$Value)
@@ -638,6 +643,28 @@ function Format-LocalCount {
     catch {
         return [string]$Value
     }
+}
+
+function Format-LocalBytes {
+    param($Value)
+
+    if ($null -eq $Value) { return '等待文件大小采样' }
+    try { [double]$bytes = [double]$Value } catch { return '等待文件大小采样' }
+    if ($bytes -lt 1024) { return ('{0:N0} B' -f $bytes) }
+    if ($bytes -lt 1MB) { return ('{0:N1} KB' -f ($bytes / 1KB)) }
+    if ($bytes -lt 1GB) { return ('{0:N1} MB' -f ($bytes / 1MB)) }
+    return ('{0:N2} GB' -f ($bytes / 1GB))
+}
+
+function Format-PreparationProgress {
+    param($Current, $Total, [string]$Unit)
+
+    if ($null -eq $Current) { return '等待准备进度采样' }
+    if ($Unit -eq 'Bytes') {
+        return ('{0} / {1}' -f (Format-LocalBytes -Value $Current), (Format-LocalBytes -Value $Total))
+    }
+    if ($null -eq $Total) { return ('已处理 {0} 词条' -f (Format-LocalCount -Value $Current)) }
+    return ('{0} / {1} 词条' -f (Format-LocalCount -Value $Current), (Format-LocalCount -Value $Total))
 }
 
 function Format-LocalDuration {
@@ -778,11 +805,11 @@ function Inspect-SelectedArchive {
     }
 
     $script:CurrentInspection = $inspection
-    $methods = if (@($inspection.Methods).Count -gt 0) { @($inspection.Methods) -join ' / ' } else { '方法未知' }
+    $methods = if (@($inspection.Methods).Count -gt 0) { @($inspection.Methods) -join ' / ' } else { '方法未能识别' }
     $encryption = switch ([string]$inspection.EncryptionState) {
         'Yes' { '已加密' }
         'No' { '未加密' }
-        default { '加密状态未知' }
+        default { '加密状态未能识别' }
     }
     $metadataStatus = if ($inspection.ListingExitCode -eq 0) { '已在本机检查' } else { '仅能在本机部分检查' }
     $controls.ArchiveFileNameText.Text = [System.IO.Path]::GetFileName($archivePath)
@@ -970,14 +997,17 @@ function Reset-LiveTaskDisplay {
     $controls.StageValue.Text = '等待阶段信息'
     $controls.EngineValue.Text = '尚未启动本地后端'
     $controls.DeviceValue.Text = '尚未启动'
-    $controls.CandidatesValue.Text = '0 / 未知'
-    $controls.SpeedValue.Text = '正在准备本地任务…'
+    $controls.ProgressMetricLabel.Text = '准备进度'
+    $controls.CandidatesValue.Text = '等待准备开始'
+    $controls.SpeedLabel.Text = '准备速度'
+    $controls.SpeedValue.Text = '等待准备采样'
     $controls.ElapsedValue.Text = '约 0 秒'
-    $controls.EstimatedRemainingValue.Text = '正在准备本地任务…'
-    $controls.WorstCaseValue.Text = '正在准备本地任务…'
+    $controls.EstimatedRemainingValue.Text = '准备阶段尚未开始'
+    $controls.WorstCaseValue.Text = '准备完成后估算'
+    $controls.ProgressBarLabel.Text = '准备进度'
     $controls.SearchProgressBar.IsIndeterminate = $true
     $controls.SearchProgressBar.Value = 0
-    $controls.ProgressPercentValue.Text = '正在准备本地恢复任务…'
+    $controls.ProgressPercentValue.Text = '等待本地准备进度采样…'
     $controls.ProgressMessageText.Text = '正在准备本地恢复任务。压缩包数据不会离开此电脑。'
     $controls.ResultValue.Text = ''
     $controls.ResultCard.Visibility = [System.Windows.Visibility]::Collapsed
@@ -1197,33 +1227,90 @@ function Update-ProgressFromDisk {
             Convert-StrategyName -Value ([string]$progress.Strategy)
         }
         $backendText = if ($progress.PSObject.Properties.Name -contains 'Backend') { Convert-BackendName -Value ([string]$progress.Backend) } else { Convert-BackendName -Value ([string]$progress.Engine) }
-        $controls.StageValue.Text = $stageText
         $activity = if ($progress.PSObject.Properties.Name -contains 'Activity' -and -not [string]::IsNullOrWhiteSpace([string]$progress.Activity)) { [string]$progress.Activity } else { $displayState }
         $activityMessage = if ($progress.PSObject.Properties.Name -contains 'ActivityMessage' -and -not [string]::IsNullOrWhiteSpace([string]$progress.ActivityMessage)) { [string]$progress.ActivityMessage } else { [string]$progress.Message }
+        $currentCoverageName = if ($progress.PSObject.Properties.Name -contains 'CurrentCoverageName' -and -not [string]::IsNullOrWhiteSpace([string]$progress.CurrentCoverageName)) { [string]$progress.CurrentCoverageName } else { '' }
+        if (-not [string]::IsNullOrWhiteSpace($currentCoverageName)) {
+            $coverageContext = if ($activity -eq 'AdvancingCoverage') { '当前范围已完成：' } else { '当前范围：' }
+            $stageText += [Environment]::NewLine + $coverageContext + $currentCoverageName
+        }
+        $controls.StageValue.Text = $stageText
         $controls.EngineValue.Text = $backendText
         $controls.DeviceValue.Text = if ($progress.PSObject.Properties.Name -contains 'ComputeDevice') { Convert-ComputeDeviceName -Value ([string]$progress.ComputeDevice) } else { 'CPU' }
-        $totalValue = if ($progress.PSObject.Properties.Name -contains 'CoverageTotal' -and $null -ne $progress.CoverageTotal) { $progress.CoverageTotal } else { $progress.CandidateTotal }
+        $isPreparation = $activity -like 'Preparing*'
+        $preparationCurrent = if ($progress.PSObject.Properties.Name -contains 'PreparationCurrent') { $progress.PreparationCurrent } else { $null }
+        $preparationTotal = if ($progress.PSObject.Properties.Name -contains 'PreparationTotal') { $progress.PreparationTotal } else { $null }
+        $preparationUnit = if ($progress.PSObject.Properties.Name -contains 'PreparationUnit') { [string]$progress.PreparationUnit } else { '' }
+        $controls.ProgressMetricLabel.Text = if ($isPreparation) { '准备进度' } else { '已测试数量' }
+        $controls.SpeedLabel.Text = if ($isPreparation) { '准备速度' } else { '速度（平滑）' }
+        $controls.ProgressBarLabel.Text = if ($isPreparation) { '准备进度' } else { '搜索进度' }
+
+        [double]$preparationSpeed = 0
+        try { if ($progress.PSObject.Properties.Name -contains 'PreparationSpeed' -and $null -ne $progress.PreparationSpeed) { $preparationSpeed = [double]$progress.PreparationSpeed } } catch { $preparationSpeed = 0 }
+        if ($isPreparation) {
+            $controls.CandidatesValue.Text = Format-PreparationProgress -Current $preparationCurrent -Total $preparationTotal -Unit $preparationUnit
+            if ($preparationSpeed -gt 0) {
+                $controls.SpeedValue.Text = if ($preparationUnit -eq 'Bytes') { ('{0}/秒' -f (Format-LocalBytes -Value $preparationSpeed)) } else { ('{0:N2} 词条/秒' -f $preparationSpeed) }
+            }
+            else { $controls.SpeedValue.Text = '正在采样准备速度…' }
+        }
+        else {
+            $totalValue = if ($progress.PSObject.Properties.Name -contains 'CoverageTotal' -and $null -ne $progress.CoverageTotal) { $progress.CoverageTotal } elseif ($progress.PSObject.Properties.Name -contains 'CandidateTotal') { $progress.CandidateTotal } else { $null }
+            $testedValue = if ($progress.PSObject.Properties.Name -contains 'CoverageTested' -and $null -ne $progress.CoverageTested) {
+                $progress.CoverageTested
+            }
+            elseif ($progress.PSObject.Properties.Name -contains 'StageCandidatesTested' -and $null -ne $progress.StageCandidatesTested) {
+                $progress.StageCandidatesTested
+            }
+            elseif ($progress.PSObject.Properties.Name -contains 'CandidatesTested' -and $null -ne $progress.CandidatesTested) {
+                $progress.CandidatesTested
+            }
+            else { 0L }
+            if ($null -eq $totalValue) {
+                $controls.CandidatesValue.Text = '已测试 {0} 个候选' -f (Format-LocalCount -Value $testedValue)
+            }
+            else {
+                $controls.CandidatesValue.Text = '{0} / {1}' -f (Format-LocalCount -Value $testedValue), (Format-LocalCount -Value $totalValue)
+            }
+        }
+
+        [double]$speed = 0
+        try { if ($progress.PSObject.Properties.Name -contains 'SpeedPerSecond' -and $null -ne $progress.SpeedPerSecond) { $speed = [double]$progress.SpeedPerSecond } } catch { $speed = 0 }
+        if (-not $isPreparation) {
+            $controls.SpeedValue.Text = if ($activity -eq 'RunningCoverage' -and $speed -gt 0) { ('{0:N2} 候选/秒' -f $speed) } elseif ($activity -in @('Paused', 'Pausing', 'Stopping', 'Stopped')) { '当前执行未采样速度' } else { '正在根据本地工作估算…' }
+        }
+        $elapsedValue = if ($progress.PSObject.Properties.Name -contains 'ElapsedSeconds') { $progress.ElapsedSeconds } else { $null }
+        $controls.ElapsedValue.Text = Format-LocalDuration -Seconds $elapsedValue
+
+        $totalValue = if ($progress.PSObject.Properties.Name -contains 'CoverageTotal' -and $null -ne $progress.CoverageTotal) { $progress.CoverageTotal } elseif ($progress.PSObject.Properties.Name -contains 'CandidateTotal') { $progress.CandidateTotal } else { $null }
         $testedValue = if ($progress.PSObject.Properties.Name -contains 'CoverageTested' -and $null -ne $progress.CoverageTested) {
             $progress.CoverageTested
         }
-        elseif ($progress.PSObject.Properties.Name -contains 'StageCandidatesTested') {
+        elseif ($progress.PSObject.Properties.Name -contains 'StageCandidatesTested' -and $null -ne $progress.StageCandidatesTested) {
             $progress.StageCandidatesTested
         }
-        else {
+        elseif ($progress.PSObject.Properties.Name -contains 'CandidatesTested' -and $null -ne $progress.CandidatesTested) {
             $progress.CandidatesTested
         }
+        else { 0L }
         $total = Format-LocalCount -Value $totalValue
-        $controls.CandidatesValue.Text = ('{0} / {1}' -f (Format-LocalCount -Value $testedValue), $total)
-
-        [double]$speed = 0
-        try { $speed = [double]$progress.SpeedPerSecond } catch { $speed = 0 }
-        $controls.SpeedValue.Text = if ($activity -eq 'RunningCoverage' -and $speed -gt 0) { ('{0:N2} 候选/秒' -f $speed) } elseif ($activity -in @('Paused', 'Pausing', 'Stopping', 'Stopped')) { '当前执行未采样速度' } else { '正在根据本地工作估算…' }
-        $controls.ElapsedValue.Text = Format-LocalDuration -Seconds $progress.ElapsedSeconds
-
         $hasKnownTotal = ($null -ne $totalValue -and [long]$totalValue -gt 0)
         $invariantViolation = ($progress.PSObject.Properties.Name -contains 'ProgressInvariantViolation' -and [bool]$progress.ProgressInvariantViolation)
         $hasProgress = (-not $invariantViolation -and $progress.PSObject.Properties.Name -contains 'ProgressPercent' -and $null -ne $progress.ProgressPercent)
-        if ($hasProgress) {
+        $preparationHasTotal = $null -ne $preparationTotal -and [long]$preparationTotal -gt 0
+        $preparationHasProgress = $isPreparation -and $null -ne $preparationCurrent -and $preparationHasTotal -and [long]$preparationCurrent -le [long]$preparationTotal
+        if ($preparationHasProgress) {
+            [double]$preparationPercent = [math]::Round((100.0 * [long]$preparationCurrent) / [long]$preparationTotal, 2)
+            $controls.SearchProgressBar.IsIndeterminate = $false
+            $controls.SearchProgressBar.Value = $preparationPercent
+            $controls.ProgressPercentValue.Text = '{0:N2}%（{1}）' -f $preparationPercent, (Format-PreparationProgress -Current $preparationCurrent -Total $preparationTotal -Unit $preparationUnit)
+        }
+        elseif ($isPreparation) {
+            $controls.SearchProgressBar.IsIndeterminate = $true
+            $controls.SearchProgressBar.Value = 0
+            $controls.ProgressPercentValue.Text = if ($null -ne $preparationCurrent) { Format-PreparationProgress -Current $preparationCurrent -Total $preparationTotal -Unit $preparationUnit } else { Convert-UiMessage -Message $activityMessage }
+        }
+        elseif ($hasProgress) {
             [double]$percent = [double]$progress.ProgressPercent
             $controls.SearchProgressBar.IsIndeterminate = $false
             $controls.SearchProgressBar.Value = $percent
@@ -1232,13 +1319,26 @@ function Update-ProgressFromDisk {
         else {
             $controls.SearchProgressBar.IsIndeterminate = $true
             $controls.SearchProgressBar.Value = 0
-            $controls.ProgressPercentValue.Text = if ($invariantViolation) { '正在同步当前搜索进度…' } elseif ($activity -ne 'RunningCoverage') { Convert-UiMessage -Message $activityMessage } elseif ($hasKnownTotal) { '正在根据当前本地速度估算进度…' } else { '当前搜索空间无法可靠计算，不显示百分比。' }
+            $controls.ProgressPercentValue.Text = if ($invariantViolation) { '正在同步当前搜索进度…' } elseif ($activity -ne 'RunningCoverage') { Convert-UiMessage -Message $activityMessage } elseif ($hasKnownTotal) { '正在根据当前本地速度估算进度…' } else { '当前搜索空间无法预先计算总量；总量将在执行过程中估算。' }
         }
 
         $estimated = if ($progress.PSObject.Properties.Name -contains 'EstimatedRemainingSeconds') { $progress.EstimatedRemainingSeconds } else { $null }
         $worstCase = if ($progress.PSObject.Properties.Name -contains 'WorstCaseRemainingSeconds') { $progress.WorstCaseRemainingSeconds } else { $null }
-        $etaAllowed = $activity -eq 'RunningCoverage' -and $hasKnownTotal -and -not $invariantViolation -and [long]$testedValue -lt [long]$totalValue -and $speed -gt 0
-        if ($etaAllowed) {
+        $preparationEta = if ($progress.PSObject.Properties.Name -contains 'PreparationEtaSeconds') { $progress.PreparationEtaSeconds } else { $null }
+        $etaAllowed = -not $isPreparation -and $activity -eq 'RunningCoverage' -and $hasKnownTotal -and -not $invariantViolation -and [long]$testedValue -lt [long]$totalValue -and $speed -gt 0
+        if ($isPreparation) {
+            if ($null -ne $preparationEta -and [double]$preparationEta -gt 0) {
+                $controls.EstimatedRemainingValue.Text = '准备' + (Format-LocalDuration -Seconds $preparationEta)
+            }
+            elseif ($null -ne $preparationCurrent -and $preparationHasTotal -and [long]$preparationCurrent -ge [long]$preparationTotal) {
+                $controls.EstimatedRemainingValue.Text = '准备已完成'
+            }
+            else {
+                $controls.EstimatedRemainingValue.Text = '正在估算准备剩余时间…'
+            }
+            $controls.WorstCaseValue.Text = '准备完成后估算'
+        }
+        elseif ($etaAllowed) {
             $controls.EstimatedRemainingValue.Text = Format-LocalDuration -Seconds $estimated
             $controls.WorstCaseValue.Text = Format-LocalDuration -Seconds $worstCase
         }
@@ -1246,7 +1346,7 @@ function Update-ProgressFromDisk {
             $controls.EstimatedRemainingValue.Text = '正在同步当前搜索进度…'
             $controls.WorstCaseValue.Text = '正在同步当前搜索进度…'
         }
-        elseif ($activity -in @('PreparingBackend', 'PreparingDictionary', 'PreparingCoverage', 'StartingHashcat', 'RestoringHashcat', 'AdvancingCoverage', 'Finalizing')) {
+        elseif ($activity -in @('StartingHashcat', 'RestoringHashcat', 'Finalizing')) {
             $controls.EstimatedRemainingValue.Text = '正在准备本地任务…'
             $controls.WorstCaseValue.Text = '正在准备本地任务…'
         }
@@ -1274,7 +1374,23 @@ function Update-ProgressFromDisk {
             $controls.EstimatedRemainingValue.Text = Format-LocalDuration -Seconds $estimated
             $controls.WorstCaseValue.Text = Format-LocalDuration -Seconds $worstCase
         }
-        $controls.ProgressMessageText.Text = Convert-UiMessage -Message $activityMessage
+        $displayActivityMessage = Convert-UiMessage -Message $activityMessage
+        if ($activity -like 'Preparing*' -or $activity -eq 'RunningCoverage') {
+            $lastProgressUtc = $null
+            if ($progress.PSObject.Properties.Name -contains 'LastProgressUtc' -and -not [string]::IsNullOrWhiteSpace([string]$progress.LastProgressUtc)) {
+                try { $lastProgressUtc = [datetime]::Parse([string]$progress.LastProgressUtc, [System.Globalization.CultureInfo]::InvariantCulture, [System.Globalization.DateTimeStyles]::RoundtripKind) } catch { $lastProgressUtc = $null }
+            }
+            if ($null -ne $lastProgressUtc) {
+                $progressAge = ([datetime]::UtcNow - $lastProgressUtc.ToUniversalTime()).TotalSeconds
+                if ($progressAge -gt 30) {
+                    $displayActivityMessage += ' 当前步骤仍在处理中，暂未收到新的进度更新。'
+                }
+                elseif ($progressAge -gt 10) {
+                    $displayActivityMessage += (' 正在处理当前本地任务，最近 {0:N0} 秒暂无新的进度采样…' -f $progressAge)
+                }
+            }
+        }
+        $controls.ProgressMessageText.Text = $displayActivityMessage
 
         $password = ''
         if ($null -ne $progress.Result -and $progress.Result.PSObject.Properties.Name -contains 'Password') {
@@ -1318,11 +1434,14 @@ $controls.StateValue.Text = '空闲'
 $controls.StageValue.Text = '等待开始'
 $controls.EngineValue.Text = '—'
 $controls.DeviceValue.Text = '尚未开始'
-$controls.CandidatesValue.Text = '0 / 未知'
+$controls.ProgressMetricLabel.Text = '准备进度'
+$controls.CandidatesValue.Text = '等待准备开始'
+$controls.SpeedLabel.Text = '准备速度'
 $controls.SpeedValue.Text = '暂无本地速度采样'
 $controls.ElapsedValue.Text = '约 0 秒'
-$controls.EstimatedRemainingValue.Text = '无法可靠估算'
-$controls.WorstCaseValue.Text = '无法可靠估算'
+$controls.EstimatedRemainingValue.Text = '准备阶段尚未开始'
+$controls.WorstCaseValue.Text = '准备完成后估算'
+$controls.ProgressBarLabel.Text = '准备进度'
 $controls.SearchProgressBar.IsIndeterminate = $false
 $controls.SearchProgressBar.Value = 0
 $controls.ProgressPercentValue.Text = '当前没有本地任务正在运行。'
