@@ -1929,7 +1929,8 @@ function Get-OverallFlowProgress {
         [object[]]$PlanCoverageItems = @(),
         $OverallCandidatesTested = $null,
         [double]$OverallSpeedPerSecond = 0,
-        [bool]$ProgressInvariantViolation = $false
+        [bool]$ProgressInvariantViolation = $false,
+        [switch]$UseRecentOverallSpeed
     )
 
     $planIds = @($PlanCoverageIds | ForEach-Object {
@@ -1999,6 +2000,15 @@ function Get-OverallFlowProgress {
     }
 
     $overallCandidatesTotal = if ($hasKnownCandidateTotal) { [long]$knownCandidateTotal } else { $null }
+    $overallTotalReadiness = if ($planIds.Count -eq 0) {
+        'Unavailable'
+    }
+    elseif ($hasKnownCandidateTotal) {
+        'Exact'
+    }
+    else {
+        'Partial'
+    }
 
     $overallCandidatesTestedValue = $null
     if ($null -ne $OverallCandidatesTested) {
@@ -2054,10 +2064,15 @@ function Get-OverallFlowProgress {
         }
     }
 
+    $remainingBaseTotal = $overallCandidatesTotal
+    $hasAnyKnownCandidateTotal = $planIds.Count -gt 0 -and $unknownCandidateCoverageCount -lt $planIds.Count
+    if ($null -eq $remainingBaseTotal -and $overallTotalReadiness -eq 'Partial' -and $hasAnyKnownCandidateTotal) {
+        $remainingBaseTotal = [long]$knownCandidateTotal
+    }
     $overallCandidatesRemaining = $null
-    if ($null -ne $overallCandidatesTotal -and $null -ne $overallCandidatesTestedValue) {
-        $overallCandidatesRemaining = if ($overallCandidatesTotal -gt $overallCandidatesTestedValue) {
-            [long]($overallCandidatesTotal - $overallCandidatesTestedValue)
+    if ($null -ne $remainingBaseTotal -and $null -ne $overallCandidatesTestedValue) {
+        $overallCandidatesRemaining = if ($remainingBaseTotal -gt $overallCandidatesTestedValue) {
+            [long]($remainingBaseTotal - $overallCandidatesTestedValue)
         }
         else {
             0L
@@ -2069,11 +2084,11 @@ function Get-OverallFlowProgress {
         $overallSpeed = [math]::Round($OverallSpeedPerSecond, 2)
     }
     $overallEtaSeconds = $null
-    if ($null -ne $overallCandidatesTotal -and $null -ne $overallCandidatesTestedValue -and
+    if ($overallTotalReadiness -in @('Exact', 'Partial') -and $null -ne $remainingBaseTotal -and $null -ne $overallCandidatesTestedValue -and
         $null -ne $overallSpeed -and -not $ProgressInvariantViolation -and
-        $Activity -eq 'RunningCoverage' -and
-        $overallCandidatesTestedValue -lt $overallCandidatesTotal) {
-        $overallEtaSeconds = [math]::Round(($overallCandidatesTotal - $overallCandidatesTestedValue) / $overallSpeed, 1)
+        ($Activity -eq 'RunningCoverage' -or $UseRecentOverallSpeed) -and
+        $overallCandidatesTestedValue -lt $remainingBaseTotal) {
+        $overallEtaSeconds = [math]::Round(($remainingBaseTotal - $overallCandidatesTestedValue) / $overallSpeed, 1)
     }
 
     [double]$currentFraction = 0.0
@@ -2117,8 +2132,10 @@ function Get-OverallFlowProgress {
         OverallCandidatesTotal              = $overallCandidatesTotal
         OverallCandidatesKnownTotal         = if ($planIds.Count -gt 0) { [long]$knownCandidateTotal } else { $null }
         OverallCandidatesTotalIsPartial     = ($planIds.Count -gt 0 -and -not $hasKnownCandidateTotal)
+        OverallTotalReadiness               = $overallTotalReadiness
         OverallCandidatesUnknownCoverageCount = $unknownCandidateCoverageCount
         OverallCandidatesRemaining          = $overallCandidatesRemaining
+        OverallCandidatesRemainingIsPartial = ($overallTotalReadiness -eq 'Partial')
         OverallSpeed                        = $overallSpeed
         OverallEtaSeconds                   = $overallEtaSeconds
         OverallCoverageCompleted            = $processedSet.Count

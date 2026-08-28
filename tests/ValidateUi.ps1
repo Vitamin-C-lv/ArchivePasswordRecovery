@@ -21,7 +21,7 @@ if (-not $match.Success) {
 $reader = New-Object System.Xml.XmlNodeReader $xaml
 $window = [Windows.Markup.XamlReader]::Load($reader)
 try {
-    foreach ($name in @('ArchivePathBox', 'StrategyBox', 'DeviceBox', 'OverallProgressBar', 'OverallProgressPercent', 'OverallProgressStatsGrid', 'OverallCandidatesTestedValue', 'OverallCandidatesRemainingValue', 'OverallSpeedValue', 'OverallEtaValue', 'OverallProgressSummary', 'OverallProgressContextGrid', 'OverallStageValue', 'OverallCoverageValue', 'OverallProgressCurrent', 'StartButton', 'PauseButton', 'ResumeButton', 'StopButton', 'CoverageValue', 'ResultValue')) {
+    foreach ($name in @('ArchivePathBox', 'StrategyBox', 'DeviceBox', 'OverallProgressPanel', 'OverallProgressTitle', 'OverallProgressSubtitle', 'OverallProgressBar', 'OverallProgressPercent', 'OverallProgressStatsGrid', 'OverallEtaLabel', 'OverallCandidatesTestedLabel', 'OverallCandidatesRemainingLabel', 'OverallSpeedLabel', 'OverallCandidatesTestedValue', 'OverallCandidatesRemainingValue', 'OverallSpeedValue', 'OverallEtaValue', 'OverallProgressSummary', 'OverallProgressContextGrid', 'OverallStageValue', 'OverallCoverageValue', 'OverallProgressCurrent', 'OverallProgressHelper', 'StartButton', 'PauseButton', 'ResumeButton', 'StopButton', 'CoverageValue', 'ResultValue')) {
         if ($null -eq $window.FindName($name)) {
             throw "Required WPF control missing: $name"
         }
@@ -30,11 +30,14 @@ try {
     if ($overallBar.Height -lt 8 -or $overallBar.Height -gt 10) { throw 'Overall progress bar height is outside the requested 8-10px range.' }
     if ([string]$overallBar.Foreground -notmatch '2F75C9') { throw 'Overall progress bar is not using the primary blue foreground.' }
     $xamlText = $match.Groups[1].Value
+    if ($xamlText.IndexOf('整体恢复进度') -lt 0) { throw 'Overall summary title is not user-facing.' }
+    if ($xamlText.IndexOf('按已选择恢复级别统计整体搜索进展') -lt 0) { throw 'Overall summary subtitle is missing.' }
     if ($xamlText.IndexOf('OverallProgressBar') -lt $xamlText.IndexOf('StrategyHelpText')) { throw 'Overall progress bar is not placed below the recovery-level explanation.' }
     foreach ($label in @('已累计测试', '剩余待尝试', '整体速度', '预计完成', '当前阶段', '当前范围')) {
         if ($xamlText.IndexOf($label) -lt 0) { throw "Overall progress label missing: $label" }
     }
     if ($xamlText.IndexOf('OverallProgressStatsGrid') -lt $xamlText.IndexOf('OverallProgressBar')) { throw 'Overall candidate summary is not placed below the overall progress bar.' }
+    if ($xamlText.IndexOf('OverallEtaLabel') -gt $xamlText.IndexOf('OverallCandidatesTestedLabel')) { throw 'Overall ETA is not the first primary KPI.' }
     if ($xamlText.IndexOf('当前范围详情') -lt 0) { throw 'Bottom progress panel is not labeled as current coverage detail.' }
 
     'UI_XAML: PASS'

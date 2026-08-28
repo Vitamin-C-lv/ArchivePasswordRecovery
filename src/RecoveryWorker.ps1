@@ -142,6 +142,36 @@ $script:EffectiveSpeed = 0.0
 $script:LastMetricUtc = [datetime]::UtcNow
 $script:LastMetricCandidates = $script:CandidatesTested
 $script:LastBackendSpeed = 0.0
+$script:LastKnownOverallSpeed = 0.0
+$script:LastKnownOverallSpeedUtc = $null
+if ($null -ne $previous) {
+    $previousOverallSpeed = $null
+    if ($previous.PSObject.Properties.Name -contains 'LastKnownOverallSpeed') {
+        $previousOverallSpeed = $previous.LastKnownOverallSpeed
+    }
+    elseif ($previous.PSObject.Properties.Name -contains 'OverallSpeed') {
+        $previousOverallSpeed = $previous.OverallSpeed
+    }
+    $previousOverallSpeedUtc = $null
+    if ($previous.PSObject.Properties.Name -contains 'LastKnownOverallSpeedUtc') {
+        $previousOverallSpeedUtc = $previous.LastKnownOverallSpeedUtc
+    }
+    elseif ($previous.PSObject.Properties.Name -contains 'UpdatedUtc') {
+        $previousOverallSpeedUtc = $previous.UpdatedUtc
+    }
+    if ($null -ne $previousOverallSpeed -and -not [string]::IsNullOrWhiteSpace([string]$previousOverallSpeedUtc)) {
+        try {
+            [double]$previousSpeed = $previousOverallSpeed
+            [datetime]$previousSpeedUtc = [datetime]::Parse([string]$previousOverallSpeedUtc, [System.Globalization.CultureInfo]::InvariantCulture, [System.Globalization.DateTimeStyles]::RoundtripKind)
+            $previousSpeedAge = ([datetime]::UtcNow - $previousSpeedUtc.ToUniversalTime()).TotalSeconds
+            if ($previousSpeed -gt 0 -and $previousSpeedAge -ge 0 -and $previousSpeedAge -le 30) {
+                $script:LastKnownOverallSpeed = [math]::Round($previousSpeed, 2)
+                $script:LastKnownOverallSpeedUtc = $previousSpeedUtc.ToUniversalTime()
+            }
+        }
+        catch { }
+    }
+}
 $script:ActiveHashcatProcess = $null
 $script:StatusFileOffset = 0L
 $script:StatusFileRemainder = ''
@@ -424,6 +454,23 @@ function Get-WorkerOverallPlanItems {
     return $items.ToArray()
 }
 
+function Get-WorkerRecentOverallSpeed {
+    [CmdletBinding()]
+    param()
+
+    if ($script:LastKnownOverallSpeed -le 0 -or $null -eq $script:LastKnownOverallSpeedUtc) {
+        return $null
+    }
+    $ageSeconds = ([datetime]::UtcNow - $script:LastKnownOverallSpeedUtc.ToUniversalTime()).TotalSeconds
+    if ($ageSeconds -lt 0 -or $ageSeconds -gt 30) {
+        return $null
+    }
+    return [pscustomobject]@{
+        Speed = [math]::Round($script:LastKnownOverallSpeed, 2)
+        Utc = $script:LastKnownOverallSpeedUtc.ToUniversalTime()
+    }
+}
+
 function Get-WorkerOverallStatusMessage {
     [CmdletBinding()]
     param(
@@ -433,15 +480,12 @@ function Get-WorkerOverallStatusMessage {
     )
 
     if ($InvariantViolation) { return 'Synchronizing current search progress.' }
-    if ([bool]$OverallFlow.OverallCandidatesTotalIsPartial -and $CurrentActivity -in @('PreparingCoverage', 'PreparingBackend', 'PreparingDictionary', 'StartingHashcat', 'RestoringHashcat', 'RunningCoverage')) {
-        return 'Overall total will continue to be estimated while the task runs.'
-    }
     switch ($CurrentActivity) {
-        'PreparingCoverage' { return 'Preparing the current coverage; overall ETA will update when preparation completes.' }
-        'PreparingBackend' { return 'Preparing the local search; overall ETA will update when search starts.' }
-        'PreparingDictionary' { return 'Preparing the current coverage; overall ETA will update when preparation completes.' }
-        'StartingHashcat' { return 'Starting the local search backend; overall ETA will update when search starts.' }
-        'RestoringHashcat' { return 'Restoring the saved local search checkpoint; overall ETA will update when search starts.' }
+        'PreparingCoverage' { return 'Preparing the next coverage.' }
+        'PreparingBackend' { return 'Preparing the local search.' }
+        'PreparingDictionary' { return 'Preparing the next coverage.' }
+        'StartingHashcat' { return 'Starting the local search backend.' }
+        'RestoringHashcat' { return 'Restoring the saved local search checkpoint.' }
         'RunningCoverage' { return 'Searching the current coverage.' }
         'VerifyingCandidate' { return 'Verifying the current candidate locally.' }
         'Pausing' { return 'Overall progress is pausing; the current checkpoint will remain available.' }
@@ -474,6 +518,14 @@ function Get-WorkerOverallFlowSnapshot {
     $planItems = if ($script:IsCumulativeJob) { @(Get-WorkerOverallPlanItems) } else { @() }
     $currentTotal = if ($script:IsCumulativeJob -and $null -ne $script:ActivePlanItem) { $script:CoverageCandidateTotal } else { $null }
     $effectiveCandidatesTested = if ($null -ne $CandidatesTested) { $CandidatesTested } else { $script:CandidatesTested }
+    $recentOverallSpeed = Get-WorkerRecentOverallSpeed
+    [double]$overallSpeedForSnapshot = $SpeedPerSecond
+    [bool]$useRecentOverallSpeed = $false
+    $canUseRecentOverallSpeed = $script:Activity -in @('PreparingCoverage', 'PreparingBackend', 'PreparingDictionary', 'StartingHashcat', 'RestoringHashcat', 'RunningCoverage')
+    if ($overallSpeedForSnapshot -le 0 -and $canUseRecentOverallSpeed -and $null -ne $recentOverallSpeed) {
+        $overallSpeedForSnapshot = [double]$recentOverallSpeed.Speed
+        $useRecentOverallSpeed = $true
+    }
     $overallParameters = @{
         PlanCoverageIds = $planIds
         CompletedCoverageIds = @($script:CompletedCoverageIds | ForEach-Object { [string]$_ })
@@ -486,8 +538,9 @@ function Get-WorkerOverallFlowSnapshot {
         PreviousPlanKey = $script:OverallProgressPlanKey
         PlanCoverageItems = $planItems
         OverallCandidatesTested = $effectiveCandidatesTested
-        OverallSpeedPerSecond = $SpeedPerSecond
+        OverallSpeedPerSecond = $overallSpeedForSnapshot
         ProgressInvariantViolation = $ProgressInvariantViolation
+        UseRecentOverallSpeed = $useRecentOverallSpeed
     }
     $snapshot = Get-OverallFlowProgress @overallParameters
 
@@ -499,6 +552,13 @@ function Get-WorkerOverallFlowSnapshot {
     $snapshot | Add-Member -NotePropertyName OverallStageNumber -NotePropertyValue ([int]$script:StageNumber) -Force
     $snapshot | Add-Member -NotePropertyName OverallStageCount -NotePropertyValue ([int]$script:StageCount) -Force
     $snapshot | Add-Member -NotePropertyName OverallCoverageDisplayName -NotePropertyValue ([string]$script:CurrentCoverageName) -Force
+    $recordLastKnownOverallSpeed = if ($script:LastKnownOverallSpeed -gt 0) { [math]::Round($script:LastKnownOverallSpeed, 2) } else { $null }
+    $recordLastKnownOverallSpeedUtc = if ($null -ne $script:LastKnownOverallSpeedUtc) { $script:LastKnownOverallSpeedUtc.ToUniversalTime().ToString('o') } else { $null }
+    $recordOverallSpeedSampleUtc = if ($null -ne $recentOverallSpeed) { $recentOverallSpeed.Utc.ToUniversalTime().ToString('o') } else { $null }
+    $snapshot | Add-Member -NotePropertyName LastKnownOverallSpeed -NotePropertyValue $recordLastKnownOverallSpeed -Force
+    $snapshot | Add-Member -NotePropertyName LastKnownOverallSpeedUtc -NotePropertyValue $recordLastKnownOverallSpeedUtc -Force
+    $snapshot | Add-Member -NotePropertyName OverallSpeedIsRecent -NotePropertyValue $useRecentOverallSpeed -Force
+    $snapshot | Add-Member -NotePropertyName OverallSpeedSampleUtc -NotePropertyValue $recordOverallSpeedSampleUtc -Force
     $snapshot | Add-Member -NotePropertyName OverallStatusMessage -NotePropertyValue (Get-WorkerOverallStatusMessage -OverallFlow $snapshot -CurrentActivity ([string]$script:Activity) -InvariantViolation:$ProgressInvariantViolation) -Force
 
     # The initial progress snapshot is written before a cumulative plan has
@@ -550,6 +610,8 @@ function Update-EffectiveSpeed {
         else {
             (0.35 * $observedSpeed) + (0.65 * $script:EffectiveSpeed)
         }
+        $script:LastKnownOverallSpeed = [math]::Round($script:EffectiveSpeed, 2)
+        $script:LastKnownOverallSpeedUtc = $now
     }
 
     $script:LastMetricUtc = $now
@@ -832,10 +894,16 @@ function Publish-Progress {
         OverallCandidatesTotal = $overallFlow.OverallCandidatesTotal
         OverallCandidatesKnownTotal = $overallFlow.OverallCandidatesKnownTotal
         OverallCandidatesTotalIsPartial = [bool]$overallFlow.OverallCandidatesTotalIsPartial
+        OverallTotalReadiness = [string]$overallFlow.OverallTotalReadiness
         OverallCandidatesUnknownCoverageCount = $overallFlow.OverallCandidatesUnknownCoverageCount
         OverallCandidatesRemaining = $overallFlow.OverallCandidatesRemaining
+        OverallCandidatesRemainingIsPartial = [bool]$overallFlow.OverallCandidatesRemainingIsPartial
         OverallSpeed = $overallFlow.OverallSpeed
         OverallEtaSeconds = $overallFlow.OverallEtaSeconds
+        LastKnownOverallSpeed = $overallFlow.LastKnownOverallSpeed
+        LastKnownOverallSpeedUtc = $overallFlow.LastKnownOverallSpeedUtc
+        OverallSpeedIsRecent = [bool]$overallFlow.OverallSpeedIsRecent
+        OverallSpeedSampleUtc = $overallFlow.OverallSpeedSampleUtc
         OverallCoverageCompleted = $overallFlow.OverallCoverageCompleted
         OverallCoverageTotal = $overallFlow.OverallCoverageTotal
         OverallStageDisplayName = [string]$overallFlow.OverallStageDisplayName
@@ -1826,6 +1894,27 @@ function Expand-CaseVariantDictionary {
     return (Expand-CaseVariantDictionaryFile -SourcePath $sourcePath -OutputPath $outputPath -RecoveryPlanYear $script:RecoveryPlanYear -ProgressCallback $ProgressCallback -ProgressTotal $progressTotal -ProgressUnit $unit -DeduplicateVariants:$isBuiltin)
 }
 
+function Get-RuleCandidateCountFromDictionaryPath {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][string]$Path,
+        [Parameter(Mandatory = $true)][ValidateSet('All', 'Case', 'Append')][string]$Family
+    )
+
+    [long]$count = 0
+    $reader = New-Object System.IO.StreamReader($Path, $true)
+    try {
+        while ($null -ne ($word = $reader.ReadLine())) {
+            if ($word.Length -eq 0) { continue }
+            [long]$variantCount = @((Get-RuleVariants -Word $word -RecoveryPlanYear $script:RecoveryPlanYear -Family $Family)).Count
+            if ($variantCount -gt [long]::MaxValue - $count) { throw 'rule candidate count is outside the local display range' }
+            $count += $variantCount
+        }
+    }
+    finally { $reader.Dispose() }
+    return $count
+}
+
 function Get-PlanDictionaryPaths {
     [CmdletBinding()]
     param(
@@ -1833,6 +1922,9 @@ function Get-PlanDictionaryPaths {
     )
 
     $paths = New-Object 'System.Collections.Generic.List[string]'
+    if ($null -eq $Item.CandidateCount -and $script:OverallCoverageTotals.ContainsKey([string]$Item.CoverageId)) {
+        $Item.CandidateCount = $script:OverallCoverageTotals[[string]$Item.CoverageId]
+    }
     if ([string]$Item.Kind -in @('DateRange', 'CommonSymbols')) {
         $callback = New-PreparationProgressCallback -CoverageName ([string]$Item.DisplayName) -Unit 'Entries'
         $dictionaryDirectory = Join-Path $script:RuntimeDirectory 'dictionaries'
@@ -1843,6 +1935,7 @@ function Get-PlanDictionaryPaths {
         $result = Write-GeneratedCoverageDictionary -PlanItem $Item -Job $job -OutputPath $outputPath -ProgressCallback $callback
         [void]$paths.Add([string]$result.Path)
         $Item.CandidateCount = [long]$result.GeneratedCount
+        Set-WorkerOverallCoverageTotal -CoverageId ([string]$Item.CoverageId) -CandidateCount $Item.CandidateCount
         return $paths.ToArray()
     }
     $sources = @(Get-PlanItemDictionarySources -PlanItem $Item -Job $job)
@@ -1854,6 +1947,7 @@ function Get-PlanDictionaryPaths {
             $result = Expand-CaseVariantDictionary -Item $Item -Source $source -ProgressCallback $callback
             [void]$paths.Add([string]$result.Path)
             $Item.CandidateCount = [long]$result.OutputCount
+            Set-WorkerOverallCoverageTotal -CoverageId ([string]$Item.CoverageId) -CandidateCount $Item.CandidateCount
             continue
         }
         if ([string]$Item.Kind -eq 'CapitalInitialDigits') {
@@ -1874,6 +1968,10 @@ function Get-PlanDictionaryPaths {
             [long](Get-Item -LiteralPath $path -Force).Length
         }
         Publish-PreparationSample -Sample ([pscustomobject]@{ Processed = $total; Total = $total; Elapsed = 0.0 }) -CoverageName ([string]$Item.DisplayName) -Unit $unit
+        if ([string]$Item.Kind -eq 'RuleAppendVariants' -and $sourceType -eq 'Builtin' -and -not $script:OverallCoverageTotals.ContainsKey([string]$Item.CoverageId)) {
+            $Item.CandidateCount = Get-RuleCandidateCountFromDictionaryPath -Path $path -Family ([string]$Item.RuleFamily)
+            Set-WorkerOverallCoverageTotal -CoverageId ([string]$Item.CoverageId) -CandidateCount $Item.CandidateCount
+        }
     }
     return $paths.ToArray()
 }
@@ -2368,6 +2466,8 @@ function Invoke-CumulativeRecovery {
     }
     $script:RequestedCoverageIds = $requested.ToArray()
     Save-CoverageState
+    Set-WorkerActivity -Activity 'PreparingBackend' -Message 'The overall recovery plan is ready; preparing the local recovery backend.'
+    Publish-Progress -State 'Running' -Message 'The overall recovery plan is ready; preparing the local recovery backend.' -Result $null
 
     [int]$resumeStageNumber = 0
     if ($script:ResumeStage -and $null -ne $previous -and $previous.PSObject.Properties.Name -contains 'StageNumber') {
