@@ -1925,24 +1925,17 @@ function Get-OverallFlowProgress {
         $CurrentTotal = $null,
         [string]$Activity = 'PreparingCoverage',
         [double]$PreviousFlowProgress = 0.0,
-        [AllowEmptyString()][string]$PreviousPlanKey = ''
+        [AllowEmptyString()][string]$PreviousPlanKey = '',
+        [object[]]$PlanCoverageItems = @(),
+        $OverallCandidatesTested = $null,
+        [double]$OverallSpeedPerSecond = 0,
+        [bool]$ProgressInvariantViolation = $false
     )
 
     $planIds = @($PlanCoverageIds | ForEach-Object {
             if ($null -ne $_ -and -not [string]::IsNullOrWhiteSpace([string]$_)) { [string]$_ }
         })
     $planKey = $planIds -join "`n"
-    if ($planIds.Count -eq 0) {
-        return [pscustomobject]@{
-            PlanKey = $planKey
-            PlanCoverageCount = 0
-            ProcessedCoverageCount = 0
-            CurrentCoverageOrdinal = $null
-            OverallFlowProgress = 0.0
-            OverallFlowPercent = 0.0
-        }
-    }
-
     $planSet = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::Ordinal)
     foreach ($planId in $planIds) { [void]$planSet.Add([string]$planId) }
     $processedSet = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::Ordinal)
@@ -1958,6 +1951,129 @@ function Get-OverallFlowProgress {
             $currentIndex = $index
             break
         }
+    }
+
+    $planItemById = @{}
+    foreach ($item in @($PlanCoverageItems)) {
+        if ($null -eq $item -or $item.PSObject.Properties.Name -notcontains 'CoverageId') { continue }
+        $itemId = [string]$item.CoverageId
+        if ([string]::IsNullOrWhiteSpace($itemId) -or $planItemById.ContainsKey($itemId)) { continue }
+        $planItemById[$itemId] = $item
+    }
+
+    [decimal]$knownCandidateTotal = 0
+    [int]$unknownCandidateCoverageCount = 0
+    $hasKnownCandidateTotal = $planIds.Count -gt 0
+    foreach ($planId in $planIds) {
+        $candidateValue = $null
+        $hasCandidateValue = $false
+        if ([string]::Equals([string]$planId, $CurrentCoverageId, [System.StringComparison]::Ordinal) -and $null -ne $CurrentTotal) {
+            $candidateValue = $CurrentTotal
+            $hasCandidateValue = $true
+        }
+        elseif ($planItemById.ContainsKey([string]$planId)) {
+            $planItem = $planItemById[[string]$planId]
+            if ($planItem.PSObject.Properties.Name -contains 'CandidateCount') {
+                $candidateValue = $planItem.CandidateCount
+                $hasCandidateValue = $true
+            }
+        }
+
+        if (-not $hasCandidateValue -or $null -eq $candidateValue) {
+            $hasKnownCandidateTotal = $false
+            $unknownCandidateCoverageCount++
+            continue
+        }
+
+        try {
+            [long]$candidateCount = $candidateValue
+            if ($candidateCount -lt 0 -or $knownCandidateTotal + $candidateCount -gt [long]::MaxValue) {
+                throw 'candidate total is outside the local display range'
+            }
+            $knownCandidateTotal += $candidateCount
+        }
+        catch {
+            $hasKnownCandidateTotal = $false
+            $unknownCandidateCoverageCount++
+        }
+    }
+
+    $overallCandidatesTotal = if ($hasKnownCandidateTotal) { [long]$knownCandidateTotal } else { $null }
+
+    $overallCandidatesTestedValue = $null
+    if ($null -ne $OverallCandidatesTested) {
+        try {
+            [long]$overallCandidatesTestedValue = $OverallCandidatesTested
+            if ($overallCandidatesTestedValue -lt 0) { $overallCandidatesTestedValue = 0L }
+        }
+        catch {
+            $overallCandidatesTestedValue = $null
+        }
+    }
+    else {
+        [decimal]$derivedCandidatesTested = 0
+        $canDeriveCandidatesTested = $true
+        $completedForCount = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::Ordinal)
+        foreach ($coverageId in @($CompletedCoverageIds)) {
+            if ($null -ne $coverageId -and $planSet.Contains([string]$coverageId)) {
+                [void]$completedForCount.Add([string]$coverageId)
+            }
+        }
+        foreach ($coverageId in @($completedForCount)) {
+            if (-not $planItemById.ContainsKey([string]$coverageId)) {
+                $canDeriveCandidatesTested = $false
+                break
+            }
+            $completedItem = $planItemById[[string]$coverageId]
+            if ($completedItem.PSObject.Properties.Name -notcontains 'CandidateCount' -or $null -eq $completedItem.CandidateCount) {
+                $canDeriveCandidatesTested = $false
+                break
+            }
+            try {
+                [long]$completedCount = $completedItem.CandidateCount
+                if ($completedCount -lt 0 -or $derivedCandidatesTested + $completedCount -gt [long]::MaxValue) {
+                    throw 'completed candidate total is outside the local display range'
+                }
+                $derivedCandidatesTested += $completedCount
+            }
+            catch {
+                $canDeriveCandidatesTested = $false
+                break
+            }
+        }
+        if ($canDeriveCandidatesTested -and $currentIndex -ge 0 -and -not $processedSet.Contains([string]$CurrentCoverageId)) {
+            if ($CurrentTested -lt 0) {
+                $canDeriveCandidatesTested = $false
+            }
+            else {
+                $derivedCandidatesTested += $CurrentTested
+            }
+        }
+        if ($canDeriveCandidatesTested -and $derivedCandidatesTested -le [long]::MaxValue) {
+            $overallCandidatesTestedValue = [long]$derivedCandidatesTested
+        }
+    }
+
+    $overallCandidatesRemaining = $null
+    if ($null -ne $overallCandidatesTotal -and $null -ne $overallCandidatesTestedValue) {
+        $overallCandidatesRemaining = if ($overallCandidatesTotal -gt $overallCandidatesTestedValue) {
+            [long]($overallCandidatesTotal - $overallCandidatesTestedValue)
+        }
+        else {
+            0L
+        }
+    }
+
+    $overallSpeed = $null
+    if ($OverallSpeedPerSecond -gt 0) {
+        $overallSpeed = [math]::Round($OverallSpeedPerSecond, 2)
+    }
+    $overallEtaSeconds = $null
+    if ($null -ne $overallCandidatesTotal -and $null -ne $overallCandidatesTestedValue -and
+        $null -ne $overallSpeed -and -not $ProgressInvariantViolation -and
+        $Activity -eq 'RunningCoverage' -and
+        $overallCandidatesTestedValue -lt $overallCandidatesTotal) {
+        $overallEtaSeconds = [math]::Round(($overallCandidatesTotal - $overallCandidatesTestedValue) / $overallSpeed, 1)
     }
 
     [double]$currentFraction = 0.0
@@ -1987,15 +2103,26 @@ function Get-OverallFlowProgress {
     }
     if ($flowUnits -lt 0) { $flowUnits = 0.0 }
     $ordinal = if ($currentIndex -ge 0 -and -not $processedSet.Contains([string]$CurrentCoverageId)) { $currentIndex + 1 } else { $null }
-    [double]$flowPercent = [math]::Round((100.0 * $flowUnits) / $planIds.Count, 2)
+    [double]$flowPercent = if ($planIds.Count -gt 0) { [math]::Round((100.0 * $flowUnits) / $planIds.Count, 2) } else { 0.0 }
     if ($Activity -eq 'Recovered' -and $flowUnits -lt $planIds.Count -and $flowPercent -ge 100) { $flowPercent = 99.99 }
     return [pscustomobject]@{
-        PlanKey = $planKey
-        PlanCoverageCount = $planIds.Count
-        ProcessedCoverageCount = $processedSet.Count
-        CurrentCoverageOrdinal = $ordinal
-        OverallFlowProgress = [math]::Round($flowUnits, 4)
-        OverallFlowPercent = $flowPercent
+        PlanKey                            = $planKey
+        PlanCoverageCount                  = $planIds.Count
+        ProcessedCoverageCount              = $processedSet.Count
+        CurrentCoverageOrdinal              = $ordinal
+        OverallFlowProgress                 = [math]::Round($flowUnits, 4)
+        OverallFlowPercent                  = $flowPercent
+        OverallProgressPercent              = $flowPercent
+        OverallCandidatesTested             = $overallCandidatesTestedValue
+        OverallCandidatesTotal              = $overallCandidatesTotal
+        OverallCandidatesKnownTotal         = if ($planIds.Count -gt 0) { [long]$knownCandidateTotal } else { $null }
+        OverallCandidatesTotalIsPartial     = ($planIds.Count -gt 0 -and -not $hasKnownCandidateTotal)
+        OverallCandidatesUnknownCoverageCount = $unknownCandidateCoverageCount
+        OverallCandidatesRemaining          = $overallCandidatesRemaining
+        OverallSpeed                        = $overallSpeed
+        OverallEtaSeconds                   = $overallEtaSeconds
+        OverallCoverageCompleted            = $processedSet.Count
+        OverallCoverageTotal                = $planIds.Count
     }
 }
 

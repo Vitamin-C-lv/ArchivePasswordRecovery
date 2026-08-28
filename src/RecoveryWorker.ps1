@@ -171,11 +171,29 @@ else {
 }
 $script:OverallProgressPlanKey = ''
 $script:LastOverallFlowProgress = 0.0
+$script:OverallPlanItems = New-Object 'System.Collections.Generic.List[object]'
+$script:OverallCoverageTotals = @{}
 if ($null -ne $previous -and $previous.PSObject.Properties.Name -contains 'RequestedCoverage') {
     $script:OverallProgressPlanKey = @($previous.RequestedCoverage | ForEach-Object { [string]$_ }) -join "`n"
 }
 if ($null -ne $previous -and $previous.PSObject.Properties.Name -contains 'OverallFlowProgress' -and $null -ne $previous.OverallFlowProgress) {
     try { $script:LastOverallFlowProgress = [double]$previous.OverallFlowProgress } catch { $script:LastOverallFlowProgress = 0.0 }
+}
+if ($null -ne $previous -and $previous.PSObject.Properties.Name -contains 'OverallCoverageTotals') {
+    foreach ($knownCoverageTotal in @($previous.OverallCoverageTotals)) {
+        if ($null -eq $knownCoverageTotal -or
+            $knownCoverageTotal.PSObject.Properties.Name -notcontains 'CoverageId' -or
+            $knownCoverageTotal.PSObject.Properties.Name -notcontains 'CandidateCount' -or
+            [string]::IsNullOrWhiteSpace([string]$knownCoverageTotal.CoverageId) -or
+            $null -eq $knownCoverageTotal.CandidateCount) {
+            continue
+        }
+        try {
+            [long]$knownCount = $knownCoverageTotal.CandidateCount
+            if ($knownCount -ge 0) { $script:OverallCoverageTotals[[string]$knownCoverageTotal.CoverageId] = $knownCount }
+        }
+        catch { }
+    }
 }
 $cursorSources = if ($Resume) { @($previous, $job) } else { @() }
 foreach ($cursorSource in $cursorSources) {
@@ -352,9 +370,98 @@ function Update-ProgressTimestamp {
     $script:LastProgressCoveragePosition = $currentCoveragePosition
 }
 
-function Get-WorkerOverallFlowSnapshot {
+function Set-WorkerOverallCoverageTotal {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][string]$CoverageId,
+        $CandidateCount
+    )
+
+    if ([string]::IsNullOrWhiteSpace($CoverageId) -or $null -eq $CandidateCount) { return }
+    try {
+        [long]$normalizedCount = $CandidateCount
+        if ($normalizedCount -ge 0) { $script:OverallCoverageTotals[$CoverageId] = $normalizedCount }
+    }
+    catch { }
+}
+
+function Get-WorkerOverallPlanItems {
     [CmdletBinding()]
     param()
+
+    $items = New-Object 'System.Collections.Generic.List[object]'
+    $sourceItems = $script:OverallPlanItems.ToArray()
+    $requestedCoverageIds = @($script:RequestedCoverageIds)
+    if ($sourceItems.Count -eq 0 -and $requestedCoverageIds.Count -gt 0) {
+        foreach ($coverageId in $requestedCoverageIds) {
+            $sourceItems += [pscustomobject]@{
+                CoverageId = [string]$coverageId
+                CandidateCount = if ($script:OverallCoverageTotals.ContainsKey([string]$coverageId)) { $script:OverallCoverageTotals[[string]$coverageId] } else { $null }
+            }
+        }
+    }
+    foreach ($item in $sourceItems) {
+        if ($null -eq $item -or $item.PSObject.Properties.Name -notcontains 'CoverageId') { continue }
+        $coverageId = [string]$item.CoverageId
+        if ([string]::IsNullOrWhiteSpace($coverageId)) { continue }
+
+        $candidateCount = $null
+        if ($item.PSObject.Properties.Name -contains 'CandidateCount' -and $null -ne $item.CandidateCount) {
+            $candidateCount = $item.CandidateCount
+        }
+        if ([string]::Equals($coverageId, [string]$script:CurrentCoverageId, [System.StringComparison]::Ordinal) -and
+            $null -ne $script:CoverageCandidateTotal) {
+            $candidateCount = $script:CoverageCandidateTotal
+        }
+        if ($null -eq $candidateCount -and $script:OverallCoverageTotals.ContainsKey($coverageId)) {
+            $candidateCount = $script:OverallCoverageTotals[$coverageId]
+        }
+        [void]$items.Add([pscustomobject]@{
+                CoverageId    = $coverageId
+                CandidateCount = $candidateCount
+            })
+    }
+    return $items.ToArray()
+}
+
+function Get-WorkerOverallStatusMessage {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]$OverallFlow,
+        [Parameter(Mandatory = $true)][string]$CurrentActivity,
+        [Parameter(Mandatory = $true)][bool]$InvariantViolation
+    )
+
+    if ($InvariantViolation) { return 'Synchronizing current search progress.' }
+    if ([bool]$OverallFlow.OverallCandidatesTotalIsPartial -and $CurrentActivity -in @('PreparingCoverage', 'PreparingBackend', 'PreparingDictionary', 'StartingHashcat', 'RestoringHashcat', 'RunningCoverage')) {
+        return 'Overall total will continue to be estimated while the task runs.'
+    }
+    switch ($CurrentActivity) {
+        'PreparingCoverage' { return 'Preparing the current coverage; overall ETA will update when preparation completes.' }
+        'PreparingBackend' { return 'Preparing the local search; overall ETA will update when search starts.' }
+        'PreparingDictionary' { return 'Preparing the current coverage; overall ETA will update when preparation completes.' }
+        'StartingHashcat' { return 'Starting the local search backend; overall ETA will update when search starts.' }
+        'RestoringHashcat' { return 'Restoring the saved local search checkpoint; overall ETA will update when search starts.' }
+        'RunningCoverage' { return 'Searching the current coverage.' }
+        'VerifyingCandidate' { return 'Verifying the current candidate locally.' }
+        'Pausing' { return 'Overall progress is pausing; the current checkpoint will remain available.' }
+        'Paused' { return 'Overall progress is paused; resume to continue searching.' }
+        'Stopping' { return 'Overall progress is stopping; the current checkpoint will remain available.' }
+        'Stopped' { return 'Overall progress stopped; resume to continue searching.' }
+        'Recovered' { return 'Password recovered; subsequent search stopped.' }
+        'Exhausted' { return 'All selected coverage completed without a verified password.' }
+        'Failed' { return 'The task failed; overall ETA is unavailable.' }
+        default { return 'Overall progress is being prepared.' }
+    }
+}
+
+function Get-WorkerOverallFlowSnapshot {
+    [CmdletBinding()]
+    param(
+        $CandidatesTested = $null,
+        [double]$SpeedPerSecond = 0,
+        [bool]$ProgressInvariantViolation = $false
+    )
 
     $skippedCoverageIds = New-Object 'System.Collections.Generic.List[string]'
     foreach ($skipped in @($script:SkippedStages.ToArray())) {
@@ -363,9 +470,12 @@ function Get-WorkerOverallFlowSnapshot {
             [void]$skippedCoverageIds.Add([string]$skipped.CoverageId)
         }
     }
+    $planIds = if ($script:IsCumulativeJob) { @($script:RequestedCoverageIds) } else { @() }
+    $planItems = if ($script:IsCumulativeJob) { @(Get-WorkerOverallPlanItems) } else { @() }
     $currentTotal = if ($script:IsCumulativeJob -and $null -ne $script:ActivePlanItem) { $script:CoverageCandidateTotal } else { $null }
+    $effectiveCandidatesTested = if ($null -ne $CandidatesTested) { $CandidatesTested } else { $script:CandidatesTested }
     $overallParameters = @{
-        PlanCoverageIds = @($script:RequestedCoverageIds)
+        PlanCoverageIds = $planIds
         CompletedCoverageIds = @($script:CompletedCoverageIds | ForEach-Object { [string]$_ })
         SkippedCoverageIds = $skippedCoverageIds.ToArray()
         CurrentCoverageId = [string]$script:CurrentCoverageId
@@ -374,8 +484,22 @@ function Get-WorkerOverallFlowSnapshot {
         Activity = [string]$script:Activity
         PreviousFlowProgress = $script:LastOverallFlowProgress
         PreviousPlanKey = $script:OverallProgressPlanKey
+        PlanCoverageItems = $planItems
+        OverallCandidatesTested = $effectiveCandidatesTested
+        OverallSpeedPerSecond = $SpeedPerSecond
+        ProgressInvariantViolation = $ProgressInvariantViolation
     }
     $snapshot = Get-OverallFlowProgress @overallParameters
+
+    $stageDisplayName = if ($script:StageNumber -gt 0) {
+        if (-not [string]::IsNullOrWhiteSpace([string]$script:StageName)) { [string]$script:StageName } else { [string]$script:Strategy }
+    }
+    else { '' }
+    $snapshot | Add-Member -NotePropertyName OverallStageDisplayName -NotePropertyValue $stageDisplayName -Force
+    $snapshot | Add-Member -NotePropertyName OverallStageNumber -NotePropertyValue ([int]$script:StageNumber) -Force
+    $snapshot | Add-Member -NotePropertyName OverallStageCount -NotePropertyValue ([int]$script:StageCount) -Force
+    $snapshot | Add-Member -NotePropertyName OverallCoverageDisplayName -NotePropertyValue ([string]$script:CurrentCoverageName) -Force
+    $snapshot | Add-Member -NotePropertyName OverallStatusMessage -NotePropertyValue (Get-WorkerOverallStatusMessage -OverallFlow $snapshot -CurrentActivity ([string]$script:Activity) -InvariantViolation:$ProgressInvariantViolation) -Force
 
     # The initial progress snapshot is written before a cumulative plan has
     # been enumerated. Keep the resumable plan key/cursor until that plan is
@@ -573,6 +697,7 @@ function Publish-Progress {
     $progressPercent = $null
     $estimatedRemainingSeconds = $null
     $worstCaseRemainingSeconds = $null
+    $coverageRemaining = $null
 
     $coverageTested = if ($InitialSnapshot) {
         0L
@@ -617,6 +742,10 @@ function Publish-Progress {
         $script:ProgressInvariantViolation = $false
     }
 
+    if (-not $script:ProgressInvariantViolation -and $hasKnownTotal) {
+        $coverageRemaining = if ($coverageTested -lt $knownTotal) { [long]($knownTotal - $coverageTested) } else { 0L }
+    }
+
     if ($script:ProgressInvariantViolation) {
         $ActivityMessage = 'Synchronizing current search progress.'
     }
@@ -643,7 +772,15 @@ function Publish-Progress {
     $recordPreparationUnit = if ($InitialSnapshot) { '' } else { $script:PreparationUnit }
     $recordPreparationSpeed = if ($InitialSnapshot -or $script:PreparationSpeed -le 0) { $null } else { [math]::Round($script:PreparationSpeed, 2) }
     $recordPreparationEta = if ($InitialSnapshot) { $null } else { $script:PreparationEtaSeconds }
-    $overallFlow = Get-WorkerOverallFlowSnapshot
+    $overallFlow = Get-WorkerOverallFlowSnapshot -CandidatesTested $recordCandidatesTested -SpeedPerSecond $speed -ProgressInvariantViolation ([bool]$script:ProgressInvariantViolation)
+    $recordOverallCoverageTotals = @(
+        foreach ($coverageId in @($script:OverallCoverageTotals.Keys)) {
+            [pscustomobject]@{
+                CoverageId = [string]$coverageId
+                CandidateCount = [long]$script:OverallCoverageTotals[$coverageId]
+            }
+        }
+    )
 
     $record = [ordered]@{
         SchemaVersion     = 4
@@ -690,8 +827,28 @@ function Publish-Progress {
         CurrentCoverageOrdinal = $overallFlow.CurrentCoverageOrdinal
         OverallFlowProgress = $overallFlow.OverallFlowProgress
         OverallFlowPercent = $overallFlow.OverallFlowPercent
+        OverallProgressPercent = $overallFlow.OverallProgressPercent
+        OverallCandidatesTested = $overallFlow.OverallCandidatesTested
+        OverallCandidatesTotal = $overallFlow.OverallCandidatesTotal
+        OverallCandidatesKnownTotal = $overallFlow.OverallCandidatesKnownTotal
+        OverallCandidatesTotalIsPartial = [bool]$overallFlow.OverallCandidatesTotalIsPartial
+        OverallCandidatesUnknownCoverageCount = $overallFlow.OverallCandidatesUnknownCoverageCount
+        OverallCandidatesRemaining = $overallFlow.OverallCandidatesRemaining
+        OverallSpeed = $overallFlow.OverallSpeed
+        OverallEtaSeconds = $overallFlow.OverallEtaSeconds
+        OverallCoverageCompleted = $overallFlow.OverallCoverageCompleted
+        OverallCoverageTotal = $overallFlow.OverallCoverageTotal
+        OverallStageDisplayName = [string]$overallFlow.OverallStageDisplayName
+        OverallStageNumber = [int]$overallFlow.OverallStageNumber
+        OverallStageCount = [int]$overallFlow.OverallStageCount
+        OverallCoverageDisplayName = [string]$overallFlow.OverallCoverageDisplayName
+        OverallStatusMessage = [string]$overallFlow.OverallStatusMessage
+        OverallCoverageTotals = $recordOverallCoverageTotals
         CoverageTested    = $recordCoverageTested
         CoverageTotal     = $recordCoverageTotal
+        CoverageRemaining = $coverageRemaining
+        CoverageSpeed     = if ($speed -gt 0) { $speed } else { $null }
+        CoverageEtaSeconds = $estimatedRemainingSeconds
         ProgressInvariantViolation = [bool]$script:ProgressInvariantViolation
         ProgressPercent   = $progressPercent
         SpeedPerSecond    = if ($script:EffectiveSpeed -gt 0) { $speed } else { $null }
@@ -1082,6 +1239,9 @@ function Update-HashcatStatusFromLine {
             }
             if ($null -ne $script:ActivePlanItem -and $null -eq $script:CoverageCandidateTotal -and $reportedTotal -gt 0) {
                 $script:CoverageCandidateTotal = $reportedTotal
+            }
+            if ($null -ne $script:ActivePlanItem -and $reportedTotal -gt 0) {
+                Set-WorkerOverallCoverageTotal -CoverageId ([string]$script:ActivePlanItem.CoverageId) -CandidateCount $reportedTotal
             }
             if ($null -eq $script:ActivePlanItem -and $null -eq $script:TotalCandidates -and $reportedTotal -gt 0) {
                 $script:TotalCandidates = $reportedTotal
@@ -1813,6 +1973,7 @@ function Set-CumulativeCoverage {
     $script:LastBackendSpeed = 0.0
     $script:CurrentCoverageName = [string]$Item.DisplayName
     $script:CoverageCandidateTotal = $Item.CandidateCount
+    Set-WorkerOverallCoverageTotal -CoverageId ([string]$Item.CoverageId) -CandidateCount $Item.CandidateCount
     $script:ResumeCoverageBase = if ($ResumeCoverage) { [long]$script:CoveragePosition } else { 0L }
     if (-not $ResumeCoverage) { $script:CoveragePosition = 0L }
     if ($script:CoveragePosition -lt 0) { $script:CoveragePosition = 0L }
@@ -2196,9 +2357,13 @@ function Invoke-CumulativeRecovery {
     }
 
     $requested = New-Object 'System.Collections.Generic.List[string]'
+    $script:OverallPlanItems.Clear()
     for ($stageNumber = 1; $stageNumber -le $script:RecoveryLevel; $stageNumber++) {
-        foreach ($item in @(Get-RecoveryPlanItems -Job $job -StageNumber $stageNumber)) {
+        $stageItems = @(Get-RecoveryPlanItems -Job $job -StageNumber $stageNumber)
+        foreach ($item in $stageItems) {
             if (-not $requested.Contains([string]$item.CoverageId)) { [void]$requested.Add([string]$item.CoverageId) }
+            [void]$script:OverallPlanItems.Add($item)
+            Set-WorkerOverallCoverageTotal -CoverageId ([string]$item.CoverageId) -CandidateCount (Get-ObjectPropertyValue -Object $item -Name 'CandidateCount' -Default $null)
         }
     }
     $script:RequestedCoverageIds = $requested.ToArray()

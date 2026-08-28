@@ -1,4 +1,4 @@
-#requires -Version 5.1
+﻿#requires -Version 5.1
 [CmdletBinding()]
 param()
 
@@ -21,7 +21,7 @@ if (-not $match.Success) {
 $reader = New-Object System.Xml.XmlNodeReader $xaml
 $window = [Windows.Markup.XamlReader]::Load($reader)
 try {
-    foreach ($name in @('ArchivePathBox', 'StrategyBox', 'DeviceBox', 'OverallProgressBar', 'OverallProgressPercent', 'OverallProgressSummary', 'OverallProgressCurrent', 'StartButton', 'PauseButton', 'ResumeButton', 'StopButton', 'ResultValue')) {
+    foreach ($name in @('ArchivePathBox', 'StrategyBox', 'DeviceBox', 'OverallProgressBar', 'OverallProgressPercent', 'OverallProgressStatsGrid', 'OverallCandidatesTestedValue', 'OverallCandidatesRemainingValue', 'OverallSpeedValue', 'OverallEtaValue', 'OverallProgressSummary', 'OverallProgressContextGrid', 'OverallStageValue', 'OverallCoverageValue', 'OverallProgressCurrent', 'StartButton', 'PauseButton', 'ResumeButton', 'StopButton', 'CoverageValue', 'ResultValue')) {
         if ($null -eq $window.FindName($name)) {
             throw "Required WPF control missing: $name"
         }
@@ -31,6 +31,11 @@ try {
     if ([string]$overallBar.Foreground -notmatch '2F75C9') { throw 'Overall progress bar is not using the primary blue foreground.' }
     $xamlText = $match.Groups[1].Value
     if ($xamlText.IndexOf('OverallProgressBar') -lt $xamlText.IndexOf('StrategyHelpText')) { throw 'Overall progress bar is not placed below the recovery-level explanation.' }
+    foreach ($label in @('已累计测试', '剩余待尝试', '整体速度', '预计完成', '当前阶段', '当前范围')) {
+        if ($xamlText.IndexOf($label) -lt 0) { throw "Overall progress label missing: $label" }
+    }
+    if ($xamlText.IndexOf('OverallProgressStatsGrid') -lt $xamlText.IndexOf('OverallProgressBar')) { throw 'Overall candidate summary is not placed below the overall progress bar.' }
+    if ($xamlText.IndexOf('当前范围详情') -lt 0) { throw 'Bottom progress panel is not labeled as current coverage detail.' }
 
     'UI_XAML: PASS'
 }
