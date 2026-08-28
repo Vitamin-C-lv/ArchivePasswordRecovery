@@ -600,6 +600,105 @@ function Merge-RecoveryJobForLevelUpgrade {
     return [pscustomobject]$merged
 }
 
+function Get-RecoveryLevelUpgradeIntent {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]$ExistingJob,
+        [Parameter(Mandatory = $true)]$NewControlJob,
+        [AllowNull()]$ExistingProgress = $null,
+        [string]$JobDirectory = '',
+        [string[]]$AvailableCoverageIds = @()
+    )
+
+    if ($ExistingJob.PSObject.Properties.Name -notcontains 'ArchiveIdentity' -or
+        $NewControlJob.PSObject.Properties.Name -notcontains 'ArchiveIdentity' -or
+        -not (Test-ArchiveIdentityMatch -Expected $ExistingJob.ArchiveIdentity -Actual $NewControlJob.ArchiveIdentity)) {
+        throw 'ARCHIVE_CHANGED: The selected archive does not match the existing local job.'
+    }
+
+    [int]$existingLevel = Get-RecoveryLevel -Job $ExistingJob
+    [int]$newLevel = Get-RecoveryLevel -Job $NewControlJob
+    if ($newLevel -le $existingLevel) {
+        return [pscustomobject]@{
+            Intent              = 'NewJob'
+            CanReuseExistingJob = $false
+            ResumeCurrentCoverage = $false
+            Message             = 'The requested recovery level does not extend the existing job.'
+        }
+    }
+
+    $state = ''
+    if ($null -ne $ExistingProgress -and $ExistingProgress.PSObject.Properties.Name -contains 'State') {
+        $state = [string]$ExistingProgress.State
+    }
+    if ($state -eq 'Recovered') {
+        return [pscustomobject]@{
+            Intent = 'BlockedRecovered'; CanReuseExistingJob = $false; ResumeCurrentCoverage = $false
+            Message = '该压缩包已经恢复成功，无需继续提高恢复级别。'
+        }
+    }
+    if ($state -eq 'NotEncrypted') {
+        return [pscustomobject]@{
+            Intent = 'BlockedNotEncrypted'; CanReuseExistingJob = $false; ResumeCurrentCoverage = $false
+            Message = '该压缩包未检测到密码保护，无需执行密码恢复。'
+        }
+    }
+
+    if ($state -eq 'Exhausted') {
+        return [pscustomobject]@{
+            Intent = 'UpgradeAfterTerminal'; CanReuseExistingJob = $true; ResumeCurrentCoverage = $false
+            Message = 'The previous level was exhausted; the upgrade will start at the first new coverage.'
+        }
+    }
+
+    if ($state -in @('Paused', 'Stopped')) {
+        $currentCoverageId = ''
+        if ($null -ne $ExistingProgress -and $ExistingProgress.PSObject.Properties.Name -contains 'CurrentCoverageId') {
+            $currentCoverageId = [string]$ExistingProgress.CurrentCoverageId
+        }
+        $hasCheckpoint = $false
+        if ($null -ne $ExistingProgress -and $ExistingProgress.PSObject.Properties.Name -contains 'CurrentCheckpoint' -and
+            $null -ne $ExistingProgress.CurrentCheckpoint -and
+            $ExistingProgress.CurrentCheckpoint.PSObject.Properties.Name -contains 'Position') {
+            try {
+                [long]$checkpointPosition = $ExistingProgress.CurrentCheckpoint.Position
+                $hasCheckpoint = $checkpointPosition -ge 0
+            }
+            catch { $hasCheckpoint = $false }
+        }
+        if (-not $hasCheckpoint -and $null -ne $ExistingProgress -and $ExistingProgress.PSObject.Properties.Name -contains 'CoveragePosition' -and
+            $null -ne $ExistingProgress.CoveragePosition -and -not [string]::IsNullOrWhiteSpace($currentCoverageId)) {
+            try {
+                [long]$coveragePosition = $ExistingProgress.CoveragePosition
+                $hasCheckpoint = $coveragePosition -ge 0
+            }
+            catch { $hasCheckpoint = $false }
+        }
+        if (-not $hasCheckpoint -and -not [string]::IsNullOrWhiteSpace($JobDirectory) -and
+            (Test-Path -LiteralPath $JobDirectory -PathType Container)) {
+            $hasCheckpoint = @(Get-ChildItem -LiteralPath $JobDirectory -Filter 'hashcat*.restore' -File -ErrorAction SilentlyContinue).Count -gt 0
+        }
+
+        $coverageKnown = $AvailableCoverageIds.Count -eq 0 -or $AvailableCoverageIds -contains $currentCoverageId
+        if (-not [string]::IsNullOrWhiteSpace($currentCoverageId) -and $hasCheckpoint -and $coverageKnown) {
+            return [pscustomobject]@{
+                Intent = 'UpgradeAndResume'; CanReuseExistingJob = $true; ResumeCurrentCoverage = $true
+                Message = 'The paused or stopped coverage has a local checkpoint and will resume after the level upgrade.'
+            }
+        }
+
+        return [pscustomobject]@{
+            Intent = 'UpgradeAfterTerminal'; CanReuseExistingJob = $true; ResumeCurrentCoverage = $false
+            Message = 'The paused or stopped job has no reusable current-coverage checkpoint; the upgrade will continue from the next unfinished coverage.'
+        }
+    }
+
+    return [pscustomobject]@{
+        Intent = 'NewJob'; CanReuseExistingJob = $false; ResumeCurrentCoverage = $false
+        Message = 'The existing job is not in a resumable paused or stopped state.'
+    }
+}
+
 function Get-LocalComputeDevices {
     [CmdletBinding()]
     param()
@@ -1069,6 +1168,91 @@ function New-ArchiveHashcatArtifact {
                 Message   = ('GPU recovery is not implemented for {0}. The task will use the CPU path.' -f $ArchiveFormat)
             }
         }
+    }
+}
+
+function Test-LocalProcessIdActive {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][int]$ProcessId
+    )
+
+    try {
+        [void](Get-Process -Id $ProcessId -ErrorAction Stop)
+        return $true
+    }
+    catch {
+        if ([string]$_.FullyQualifiedErrorId -match 'NoProcessFoundForGivenId|NoProcessFound') {
+            return $false
+        }
+        # An unknown process-query failure is not safe grounds for deleting a
+        # file that may belong to a live Hashcat process.
+        return $true
+    }
+}
+
+function Clear-AppOwnedHashcatResidue {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][string]$HashcatDirectory
+    )
+
+    $removed = New-Object 'System.Collections.Generic.List[string]'
+    $remaining = New-Object 'System.Collections.Generic.List[string]'
+    $activePidFiles = New-Object 'System.Collections.Generic.List[string]'
+    if (-not (Test-Path -LiteralPath $HashcatDirectory -PathType Container)) {
+        return [pscustomobject]@{
+            HashcatDirectory = $HashcatDirectory
+            RemovedPaths = @()
+            RemainingPaths = @()
+            ActivePidFiles = @()
+            RemovedCount = 0
+            RemainingCount = 0
+        }
+    }
+
+    $files = New-Object 'System.Collections.Generic.List[object]'
+    foreach ($pattern in @('ArchivePasswordRecovery-*.log', 'ArchivePasswordRecovery-*.pid')) {
+        foreach ($file in @(Get-ChildItem -LiteralPath $HashcatDirectory -Filter $pattern -File -ErrorAction Stop)) {
+            [void]$files.Add($file)
+        }
+    }
+    $protected = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
+    foreach ($pidFile in @($files | Where-Object { [string]$_.Extension -ieq '.pid' })) {
+        $pidText = ''
+        try { $pidText = [System.IO.File]::ReadAllText($pidFile.FullName).Trim() } catch { $pidText = '' }
+        [int]$processId = 0
+        $parsed = [int]::TryParse($pidText, [ref]$processId)
+        $active = $parsed -and $processId -gt 0 -and (Test-LocalProcessIdActive -ProcessId $processId)
+        if ($active) {
+            [void]$activePidFiles.Add([string]$pidFile.FullName)
+            [void]$protected.Add([string]$pidFile.FullName)
+            $logPath = Join-Path $HashcatDirectory ($pidFile.BaseName + '.log')
+            [void]$protected.Add($logPath)
+        }
+    }
+
+    foreach ($file in @($files | Sort-Object FullName -Unique)) {
+        if ($protected.Contains([string]$file.FullName)) {
+            [void]$remaining.Add([string]$file.FullName)
+            continue
+        }
+        try {
+            Remove-Item -LiteralPath $file.FullName -Force -ErrorAction Stop
+            [void]$removed.Add([string]$file.FullName)
+        }
+        catch {
+            [void]$remaining.Add([string]$file.FullName)
+        }
+    }
+
+    return [pscustomobject]@{
+        HashcatDirectory = $HashcatDirectory
+        RemovedPaths = $removed.ToArray()
+        RemainingPaths = $remaining.ToArray()
+        ActivePidFiles = $activePidFiles.ToArray()
+        RemovedCount = $removed.Count
+        RemainingCount = $remaining.Count
     }
 }
 
@@ -1614,6 +1798,105 @@ function New-GeneratedDictionaryFile {
     return [pscustomobject]@{ Path = $OutputPath; OutputCount = $processed }
 }
 
+function Get-GeneratedCoverageSourceLines {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]$Source
+    )
+
+    if ([string]$Source.SourceType -eq 'Builtin') {
+        $inputStream = [System.IO.File]::Open([string]$Source.Path, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::Read)
+        try {
+            $gzip = New-Object System.IO.Compression.GZipStream($inputStream, [System.IO.Compression.CompressionMode]::Decompress)
+            try {
+                $reader = New-Object System.IO.StreamReader($gzip, $true)
+                try {
+                    while ($null -ne ($line = $reader.ReadLine())) {
+                        Write-Output $line
+                    }
+                }
+                finally { $reader.Dispose() }
+            }
+            finally { $gzip.Dispose() }
+        }
+        finally { $inputStream.Dispose() }
+        return
+    }
+
+    if (-not (Test-Path -LiteralPath ([string]$Source.Path) -PathType Leaf)) {
+        throw 'The local generated coverage dictionary source is missing.'
+    }
+    $reader = New-Object System.IO.StreamReader(([string]$Source.Path), $true)
+    try {
+        while ($null -ne ($line = $reader.ReadLine())) {
+            Write-Output $line
+        }
+    }
+    finally { $reader.Dispose() }
+}
+
+function Get-GeneratedCoverageCandidates {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]$PlanItem,
+        $Job
+    )
+
+    $generatorKind = [string](Get-ObjectPropertyValue -Object $PlanItem -Name 'GeneratorKind' -Default ([string](Get-ObjectPropertyValue -Object $PlanItem -Name 'Kind' -Default '')))
+    switch ($generatorKind) {
+        'DateRange' {
+            foreach ($candidate in Get-DateRangeCandidates -StartYear ([int]$PlanItem.StartYear) -EndYear ([int]$PlanItem.EndYear)) {
+                Write-Output ([string]$candidate)
+            }
+            return
+        }
+        'CommonSymbols' {
+            $sources = @(Get-PlanItemDictionarySources -PlanItem $PlanItem -Job $Job)
+            if ($sources.Count -ne 1) {
+                throw 'PLAN_DICTIONARY_SOURCE_INVALID: 计划项的字典来源定义不完整。'
+            }
+            $symbols = @($PlanItem.Symbols)
+            if ($symbols.Count -eq 0) {
+                throw 'PLAN_GENERATOR_INVALID: CommonSymbols coverage has no symbols.'
+            }
+            foreach ($word in Get-GeneratedCoverageSourceLines -Source $sources[0]) {
+                if ([string]$word.Length -eq 0) { continue }
+                foreach ($symbol in $symbols) {
+                    Write-Output ([string]$word + [string]$symbol)
+                }
+            }
+            return
+        }
+        default {
+            throw ('PLAN_GENERATOR_INVALID: Unsupported finite generated coverage kind: {0}.' -f $generatorKind)
+        }
+    }
+}
+
+function Write-GeneratedCoverageDictionary {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]$PlanItem,
+        $Job,
+        [Parameter(Mandatory = $true)][string]$OutputPath,
+        [scriptblock]$ProgressCallback
+    )
+
+    $candidateGenerator = {
+        Get-GeneratedCoverageCandidates -PlanItem $PlanItem -Job $Job
+    }.GetNewClosure()
+    $progressTotal = -1L
+    if ($PlanItem.PSObject.Properties.Name -contains 'CandidateCount' -and $null -ne $PlanItem.CandidateCount) {
+        $progressTotal = [long]$PlanItem.CandidateCount
+    }
+    $result = New-GeneratedDictionaryFile -OutputPath $OutputPath -CandidateGenerator $candidateGenerator -ProgressTotal $progressTotal -ProgressCallback $ProgressCallback -ProgressUnit 'Entries'
+    return [pscustomobject]@{
+        Path = [string]$result.Path
+        GeneratedCount = [long]$result.OutputCount
+        OutputCount = [long]$result.OutputCount
+    }
+}
+
 function Get-TextDictionaryEntryCount {
     [CmdletBinding()]
     param(
@@ -2119,6 +2402,15 @@ function Get-PlanItemDictionarySources {
                 }
             }
         }
+        'CommonSymbols' {
+            $path = Get-ObjectPropertyValue -Object $PlanItem -Name 'DictionaryPath' -Default ''
+            if (-not [string]::IsNullOrWhiteSpace([string]$path)) {
+                & $addCustom $path
+            }
+            else {
+                & $addBuiltin (Get-ObjectPropertyValue -Object $PlanItem -Name 'Language' -Default '') (Get-ObjectPropertyValue -Object $PlanItem -Name 'DictionaryLevel' -Default $null)
+            }
+        }
         'CustomMask' {
             $mask = [string](Get-ObjectPropertyValue -Object $PlanItem -Name 'Mask' -Default '')
             if (-not [string]::IsNullOrWhiteSpace($mask)) {
@@ -2164,7 +2456,7 @@ function Get-RecoveryLevel4PlanItems {
     }
     $items.Add([pscustomobject]@{
             CoverageId = ('mask:L4-dates-{0}-{1}:v2' -f $startYear, $planYear); Kind = 'DateRange'; DisplayName = ('日期 {0}–{1}' -f $startYear, $planYear);
-            StartYear = $startYear; EndYear = $planYear; CandidateCount = [long]$dateCount; EngineStrategy = 'GeneratedDictionary'; GpuSupported = $true
+            StartYear = $startYear; EndYear = $planYear; CandidateCount = [long]$dateCount; GeneratorKind = 'DateRange'; EngineStrategy = 'GeneratedDictionary'; GpuSupported = $true
         })
     $items.Add([pscustomobject]@{
             CoverageId = ('mask:L4-year-combinations-{0}:v2' -f $planYear); Kind = 'YearCombination'; DisplayName = '常见年份组合';
@@ -2185,8 +2477,8 @@ function Get-RecoveryLevel4PlanItems {
         # suffix coverage above. Keep only the independent symbol and case
         # transformations, each as a single-language GPU-capable coverage.
         $items.Add([pscustomobject]@{
-                CoverageId = ('hybrid:L4-word-symbol-{0}:v2' -f $language); Kind = 'HybridDictionary'; DisplayName = ('字典词 + 常见符号（{0}）' -f $language); Language = $language; Languages = @($language); DictionaryLevels = @(1);
-                SuffixKind = 'Symbols'; Symbols = @('!', '@', '#', '$', '_', '-'); CandidateCount = ($l1Count * 6); GpuSupported = $false
+                CoverageId = ('hybrid:L4-word-symbol-{0}:v3' -f $language); Kind = 'CommonSymbols'; DisplayName = ('字典词 + 常见符号（{0}）' -f $language); Language = $language; Languages = @($language); DictionaryLevels = @(1); DictionaryLevel = 1;
+                GeneratorKind = 'CommonSymbols'; SuffixKind = 'Symbols'; Symbols = @('@', '#', '$', '_', '-'); CandidateCount = ($l1Count * 5); EngineStrategy = 'GeneratedDictionary'; GpuSupported = $true
             })
         [long]$capitalVariantCount = Get-CapitalInitialVariantCount -Language $language -Level 1
         if ($capitalVariantCount -gt 0) {
@@ -3018,6 +3310,7 @@ Export-ModuleMember -Function @(
     'Get-CustomMaskCoverageIdentity',
     'Test-CustomMaskCoverageIdentityMatch',
     'Merge-RecoveryJobForLevelUpgrade',
+    'Get-RecoveryLevelUpgradeIntent',
     'Get-LocalComputeDevices',
     'Resolve-LocalHashcat',
     'Resolve-LocalZip2John',
@@ -3029,6 +3322,7 @@ Export-ModuleMember -Function @(
     'New-ZipHashcatArtifact',
     'New-SevenZipHashcatArtifact',
     'New-ArchiveHashcatArtifact',
+    'Clear-AppOwnedHashcatResidue',
     'Get-RecoveryLevel',
     'Get-RecoveryStages',
     'Get-BuiltinQuickCandidates',
@@ -3055,6 +3349,8 @@ Export-ModuleMember -Function @(
     'Expand-CaseVariantDictionaryFile',
     'Expand-CapitalInitialDictionaryFile',
     'New-GeneratedDictionaryFile',
+    'Get-GeneratedCoverageCandidates',
+    'Write-GeneratedCoverageDictionary',
     'Get-OverallFlowProgress',
     'Get-PlanYear',
     'Get-CustomMaskPlanItem',

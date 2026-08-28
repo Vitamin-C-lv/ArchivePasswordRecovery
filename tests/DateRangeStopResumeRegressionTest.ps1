@@ -92,7 +92,7 @@ try {
     $nvidia = @(Get-HashcatOpenClDevices -ProjectRoot $projectRoot -Refresh).Devices | Where-Object { $_.Vendor -eq 'NVIDIA' } | Select-Object -First 1
     Assert-True ($null -ne $nvidia) 'The local Hashcat OpenCL probe did not initialize an NVIDIA GPU.'
     $sevenZip = Resolve-SevenZip
-    $password = '90000101'
+    $password = @((Get-DateRangeCandidates -StartYear 1900 -EndYear 9998 | Select-Object -Index 1000000))[0]
     $archivePath = New-EncryptedZipFixture -Root $testRoot -SevenZip $sevenZip -Password $password
     $workerPath = New-DateRangeStopResumeWorker -OutputPath $workerPath
     $jobDirectory = Join-Path $testRoot 'job'
@@ -213,6 +213,7 @@ try {
         LocallyVerified = [bool]$resumed.Result.LocallyVerified
     } | Format-List
     'DATE_RANGE_STOP_RESUME: PASS'
+    'GENERATED_FINITE_STOP_RESUME: PASS'
 }
 finally {
     if ($null -ne $worker -and -not $worker.HasExited) {

@@ -16,6 +16,7 @@
   - `BruteForce`：按用户选择的字符集和最小/最大长度逐步枚举；L5 对标准字符集使用互不重复的 mask 分区，不生成巨型候选数据库或密码文件。
 - 内置字符集由应用统一定义：小写 26、大写 26、数字 10、符号 24、总计 86 个字符；GPU mask 会显式传递 Hashcat custom charset，字面量 `?` 会按 Hashcat 规则转义。
 - L4 的第一个覆盖项是用户自定义 Mask/Hybrid（若填写）；不含 `?w` 时精确计算候选数，含 `?w` 时必须填写本地字典，`?w` 位于首尾可走 GPU，位于中间保持 CPU。其后才是 global/zh 字典覆盖项和首字母大写加 1–4 位数字覆盖项；后者只保留首字母确实发生变化的唯一词，再乘以 1–4 位数字空间。L4/L5 的 ID、数量和累计进度按实际规划计算，重复的年份/混合范围不会重复计数。
+- L4 的日期范围与“字典词 + 常见符号”都使用统一的有限生成集适配器：CPU 流式验证与 GPU 临时字典来自同一个候选顺序。常见符号固定为 `@`、`#`、`$`、`_`、`-`，不再生成 `!`；每个语言的候选总量是 L1 字典条目数的 5 倍。旧版已经完成的 `hybrid:L4-word-symbol-*:v2` 是包含新版 v3 的严格超集，只作显式兼容记账，不会反向把 v3 当成 v2。
 - Stage 3 的 Rules 明确拆成大小写族和追加族，CPU 与 GPU 使用同一组变形语义；Quick 和自定义 Mask 的覆盖修订号会随配置变化递增，避免复用旧断点。
 - CPU 路径始终可用：由本机 NanaZip 对每个候选进行最终验证，适用于全部已识别格式和全部五层策略。
 - 已接入两条真实的本地 GPU 执行链：**ZIP WinZip AES → `zip2john` 本地提取 → Hashcat 7.1.2 OpenCL → 单块本机 GPU → NanaZip 最终验证**，以及 **7z AES → `7z2hashcat` 本地提取 → Hashcat mode 11600 → 单块本机 GPU → NanaZip 最终验证**。
@@ -23,7 +24,7 @@
 - `Auto` 对 `Quick` 保持 CPU；对适合的 ZIP AES 或 7z AES 字典、规则、部分 Mask/Hybrid 和 BruteForce，优先选择实际初始化的 NVIDIA GPU，其次 AMD GPU；格式/加密方式/Backend/策略不支持时会诚实回退 CPU。
 - 界面以拖入压缩包、选择 1–5 级、保持 Auto、开始恢复为首屏主线；高级候选参数和设备技术细节默认折叠。运行中显示当前阶段（X/N）、Backend、实际计算设备、已测试/总候选、平滑速度、运行时间、预计剩余、当前范围最坏时间、真实进度条和本地验证结果。
 - WPF 主窗口使用 `assets\ArchivePasswordRecovery_Primary.ico` 作为应用图标。
-- Worker 的 `pause.flag` / `stop.flag` 控制保留。CPU 在进程内暂停；GPU 暂停会让 Hashcat 正常写入本地 session/restore 文件并结束该 Backend 进程，点击继续后从该本地 session 恢复。停止同样保留可用的本地 Hashcat restore 数据。通过“Open saved job...”可以重新打开保存的任务目录；继续前会校验归档路径、大小和 UTC 修改时间。升级恢复等级时保留 JobId、归档身份、创建时间、任务年份和 UI 文化，其他字段从当前控件合并。
+- Worker 的 `pause.flag` / `stop.flag` 控制保留。CPU 在进程内暂停；GPU 使用重定向 stdin 向 Hashcat 发送 `q`，等待它退出并在本地 restore 文件实际存在时保存断点；如果本次退出没有产生 restore，继续操作会重新开始当前 GPU 覆盖项，而不会宣称已保存最新断点。停止同样只在可用时保留本地 Hashcat restore 数据。通过“Open saved job...”可以重新打开保存的任务目录；继续前会校验归档路径、大小和 UTC 修改时间。升级恢复等级时保留 JobId、归档身份、创建时间、任务年份和 UI 文化，暂停/停止且有当前覆盖断点时续跑该覆盖项，Exhausted 时从新增覆盖项开始；Recovered 和 NotEncrypted 会阻止升级。
 - 成功候选直接用本机 `7z t` 验证。只有本地验证返回成功时，Worker 才写入 `Recovered` 状态。
 - 当前实机已验证到 NVIDIA GeForce RTX 4070 与 AMD Radeon 780M Graphics；两者均由 Hashcat OpenCL 实际执行 ZIP AES 与小型 7z AES 候选计算，之后由 NanaZip 本地复验。
 
@@ -42,7 +43,7 @@
 ## 隐私与本地数据边界
 
 - 归档本体、文件名、路径、提取到的元数据、字典、候选密码和找到的密码都不会上传；程序没有任何 HTTP、云、遥测或在线查询代码。
-- Worker 只在当前用户的 `%LOCALAPPDATA%\ArchivePasswordRecovery\Jobs\<任务 ID>` 保存 `job.json`、`progress.json` 和可恢复的 Hashcat restore 数据，以支持暂停/继续。`job.json` 可能包含恢复等级、固定 `RecoveryPlanYear` 与 Quick 候选，`progress.json` 会记录当前阶段、覆盖项断点、累计候选数和被跳过覆盖项的真实原因，并在恢复成功后包含找到的密码。GPU 的归档派生 hash、规则文件、状态流和临时结果放在 `%LOCALAPPDATA%\ArchivePasswordRecovery\Runtime\<任务 ID>`，启动时只清理已无活动进程的残留 Runtime；终态任务超过 7 天才会自动清理，暂停、停止和失败任务不会被自动删除。
+- Worker 只在当前用户的 `%LOCALAPPDATA%\ArchivePasswordRecovery\Jobs\<任务 ID>` 保存 `job.json`、`progress.json` 和可恢复的 Hashcat restore 数据，以支持暂停/继续。`job.json` 可能包含恢复等级、固定 `RecoveryPlanYear` 与 Quick 候选，`progress.json` 会记录当前阶段、覆盖项断点、累计候选数和被跳过覆盖项的真实原因，并在恢复成功后包含找到的密码。每个 Worker Run 的 GPU 归档派生 hash、生成字典、规则文件、状态流和临时结果都放在 `%LOCALAPPDATA%\ArchivePasswordRecovery\Runtime\<任务 ID>\<RunId>`；一个 Run 最多生成一次 ZIP/7z Hashcat 归档工件（失败也缓存），终态清理该 Run 的临时内容，Jobs 下的持久化任务与 restore 不受影响。Hashcat executable、依赖、device-specific kernel cache 和 dictionary statistics 使用 `%LOCALAPPDATA%\ArchivePasswordRecovery\Cache\Hashcat` 作为工作目录持久保留，以复用编译结果且不写入正式 `tools\hashcat`；`--logfile-disable` 关闭日志，当前 Hashcat 7.1.2 不提供 `--dictstat-disable`，所以 dictstat 只会落在 app-local cache。启动时只清理已无活动进程的应用自有 Hashcat `.log`/`.pid` 残留；终态任务超过 7 天才会自动清理，暂停、停止和失败任务不会被自动删除。
 - CPU 验证时，候选密码会作为本地 `7z.exe` 的一次命令行参数传递，但不会写入应用日志或上传。具有本机管理员/进程查看权限的其他软件理论上可在进程运行期间观察命令行，因此不要在不受信任的本机环境中运行密码恢复任务。
 - 程序在完全断网时可运行；网络不是运行组件。
 
@@ -86,10 +87,11 @@
 WPF UI (ArchivePasswordRecovery.ps1)
   -> local job.json + pause/stop flags
   -> RecoveryWorker.ps1
-     -> format inspection / strategy candidate generator
+     -> format inspection / strategy candidate generator / finite generated-set adapter
      -> CPU: local NanaZip verifier
-     -> GPU ZIP AES: local zip2john -> local Hashcat OpenCL -> local NanaZip verifier
-     -> GPU 7z AES: local 7z2hashcat -> local Hashcat OpenCL -> local NanaZip verifier
+     -> GPU ZIP AES: one cached local zip2john artifact -> local Hashcat OpenCL -> local NanaZip verifier
+     -> GPU 7z AES: one cached local 7z2hashcat artifact -> local Hashcat OpenCL -> local NanaZip verifier
+     -> per-Run Runtime directory cleanup
      -> progress.json / local verification result
 ```
 
@@ -113,6 +115,10 @@ WPF UI (ArchivePasswordRecovery.ps1)
 & "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe" -NoProfile -STA -ExecutionPolicy Bypass -File .\tests\ValidateUi.ps1
 & "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe" -NoProfile -ExecutionPolicy Bypass -File .\tests\CorrectnessRegressionTest.ps1
 & "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe" -NoProfile -ExecutionPolicy Bypass -File .\tests\CumulativeRecoveryRegressionTest.ps1
+& "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe" -NoProfile -ExecutionPolicy Bypass -File .\tests\CommonSymbolsGeneratedEquivalenceTest.ps1
+& "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe" -NoProfile -ExecutionPolicy Bypass -File .\tests\CommonSymbolsBackendIntegrationTest.ps1
+& "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe" -NoProfile -ExecutionPolicy Bypass -File .\tests\LevelUpgradeResumeRegressionTest.ps1
+& "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe" -NoProfile -ExecutionPolicy Bypass -File .\tests\RuntimeCacheGitCleanRegressionTest.ps1
 ```
 
-`SmokeTest.ps1` 会在系统临时目录生成一个小型加密 ZIP，验证格式识别、错误密码拒绝、正确密码确认和 Worker 本地验证链路，随后删除测试目录。`StrategySmokeTest.ps1` 覆盖 Quick、Dictionary、Rules、Mask 和 BruteForce 五种策略；`ControlSmokeTest.ps1` 覆盖 CPU 暂停、停止和从 checkpoint 恢复。`CorrectnessRegressionTest.ps1` 覆盖归档身份、固定年份、canonical charset、L4/L5 去重计数、增量状态解析和 7 天终态任务清理。`TargetedCorrectnessRegressionTest.ps1` 覆盖自定义 Mask/Hybrid、首字母大写数字、Rules 分族、Job 升级冻结字段以及修订号。`CumulativeRecoveryRegressionTest.ps1` 覆盖跨 L1/L2/L3 连续推进、Coverage A→B→C，以及前一/前两项已完成时保留后续二/三项断点的暂停续跑。`GpuZipBackendSmokeTest.ps1` 在临时目录生成 AES ZIP，以 NVIDIA 和 AMD 各执行一次真实 Hashcat OpenCL Dictionary 恢复，并验证最终 NanaZip 结果。`GpuSevenZipBackendSmokeTest.ps1` 在临时目录创建 LZMA2 + 7zAES（加密文件头）归档，先验证 CPU Quick，再以 NVIDIA、AMD 和 Auto 各执行一次真实 Hashcat mode 11600 Dictionary 恢复并完成 NanaZip 复验。`GpuControlProgressSmokeTest.ps1 -ArchiveFormat ZIP/7z` 以一个临时、不匹配的受限任务验证 NVIDIA GPU 的实际进度采样、停止后旧 Worker 退出、restore resume 启动新 Worker 与 stop；它会短暂占用 GPU，但不会读取用户归档。`ValidateUi.ps1` 只装载 WPF XAML 与必需控件，不会显示界面或读取任何用户归档。
+`SmokeTest.ps1` 会在系统临时目录生成一个小型加密 ZIP，验证格式识别、错误密码拒绝、正确密码确认和 Worker 本地验证链路，随后删除测试目录。`StrategySmokeTest.ps1` 覆盖 Quick、Dictionary、Rules、Mask 和 BruteForce 五种策略；`ControlSmokeTest.ps1` 覆盖 CPU 暂停、停止和从 checkpoint 恢复。`CorrectnessRegressionTest.ps1` 覆盖归档身份、固定年份、canonical charset、CommonSymbols v3、L4/L5 去重计数、增量状态解析和 7 天终态任务清理。`TargetedCorrectnessRegressionTest.ps1` 覆盖自定义 Mask/Hybrid、首字母大写数字、Rules 分族、Job 升级冻结字段以及修订号。`CumulativeRecoveryRegressionTest.ps1` 覆盖跨 L1/L2/L3 连续推进、Coverage A→B→C，以及前一/前两项已完成时保留后续二/三项断点的暂停续跑。`CommonSymbolsGeneratedEquivalenceTest.ps1` 验证 CPU 生成顺序与 GPU 临时字典逐项一致，并确认不生成 `!`；`CommonSymbolsBackendIntegrationTest.ps1` 以正式 L4 计划分别验证 CPU 与真实 GPU。`DateRangeGeneratedDictionaryEquivalenceTest.ps1` 和 `DateRangeStopResumeRegressionTest.ps1` 覆盖日期有限生成集、真实 Hashcat 停止、restore 与新 Run 续跑。`LevelUpgradeResumeRegressionTest.ps1` 覆盖 Paused/Stopped 的当前覆盖续跑、Exhausted 的首个新增覆盖、Recovered/NotEncrypted 升级硬阻断。`RuntimeCacheGitCleanRegressionTest.ps1` 验证应用自有 log/pid 清理、运行时 Hashcat 依赖隔离、单次归档工件缓存，以及 GPU Run 前后 Git 状态与项目 kernel 文件保持不变。`GpuZipBackendSmokeTest.ps1` 在临时目录生成 AES ZIP，以 NVIDIA 和 AMD 各执行一次真实 Hashcat OpenCL Dictionary 恢复，并验证最终 NanaZip 结果。`GpuSevenZipBackendSmokeTest.ps1` 在临时目录创建 LZMA2 + 7zAES（加密文件头）归档，先验证 CPU Quick，再以 NVIDIA、AMD 和 Auto 各执行一次真实 Hashcat mode 11600 Dictionary 恢复并完成 NanaZip 复验。`GpuControlProgressSmokeTest.ps1 -ArchiveFormat ZIP/7z` 以一个临时、不匹配的受限任务验证 NVIDIA GPU 的实际进度采样、停止后旧 Worker 退出、restore resume 启动新 Worker 与 stop；它会短暂占用 GPU，但不会读取用户归档。`ValidateUi.ps1` 只装载 WPF XAML 与必需控件，不会显示界面或读取任何用户归档。

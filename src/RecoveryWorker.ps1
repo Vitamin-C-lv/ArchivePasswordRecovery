@@ -27,6 +27,29 @@ $script:RuntimeJobId = if ([string]::IsNullOrWhiteSpace($jobId)) { [System.IO.Pa
 $script:RunId = [guid]::NewGuid().ToString('N')
 $script:RunStartedUtc = [datetime]::UtcNow
 $script:RuntimeDirectory = Get-RecoveryRuntimeDirectory -JobDirectory $JobDirectory -JobId $jobId -RunId $script:RunId
+$projectRoot = Split-Path $PSScriptRoot -Parent
+$script:ArchiveArtifactState = 'NotAttempted'
+$script:ArchiveHashcatArtifact = $null
+$script:ArchiveArtifactExtractionCalls = 0
+$script:ArchiveArtifactMessage = ''
+$script:HashcatRuntimeExecutable = $null
+$script:HashcatRuntimePrepared = $false
+$script:HashcatLogfileDisabled = $true
+$script:HashcatDictstatDisabled = $false
+$script:HashcatStopControl = 'Q'
+$script:HashcatResidueCleanup = $null
+try {
+    $script:HashcatResidueCleanup = Clear-AppOwnedHashcatResidue -HashcatDirectory (Join-Path $projectRoot 'tools\hashcat')
+}
+catch {
+    $script:HashcatResidueCleanup = [pscustomobject]@{
+        RemovedCount = 0
+        RemainingCount = $null
+        ActivePidFiles = @()
+        RemovedPaths = @()
+        RemainingPaths = @()
+    }
+}
 $coveragePath = Join-Path $JobDirectory 'coverage.json'
 $coverageState = $null
 if (Test-Path -LiteralPath $coveragePath -PathType Leaf) {
@@ -472,6 +495,29 @@ function Complete-CoverageItem {
     Save-CoverageState
 }
 
+function Test-CumulativeCoverageCompleted {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]$Item
+    )
+
+    $coverageId = [string]$Item.CoverageId
+    if ($script:CompletedCoverageIds.Contains($coverageId)) { return $true }
+
+    # The v2 CommonSymbols coverage was a strict superset of v3 because it
+    # included the removed exclamation-mark suffix. A completed v2 item is
+    # therefore an explicit, one-way compatibility proof for v3.
+    if ([string]$Item.Kind -eq 'CommonSymbols' -and $Item.PSObject.Properties.Name -contains 'Language') {
+        $legacyId = 'hybrid:L4-word-symbol-{0}:v2' -f ([string]$Item.Language)
+        if ($script:CompletedCoverageIds.Contains($legacyId)) {
+            [void]$script:CompletedCoverageIds.Add($coverageId)
+            Save-CoverageState
+            return $true
+        }
+    }
+    return $false
+}
+
 function Set-CoverageAttemptProgress {
     [CmdletBinding()]
     param()
@@ -610,6 +656,12 @@ function Publish-Progress {
         ActivityMessage   = $ActivityMessage
         HashcatProgressMode = $script:HashcatProgressMode
         HashcatResumeBase = $script:ResumeCoverageBase
+        HashcatLogfileDisabled = [bool]$script:HashcatLogfileDisabled
+        HashcatDictstatDisabled = [bool]$script:HashcatDictstatDisabled
+        HashcatStopControl = [string]$script:HashcatStopControl
+        ArchiveArtifactState = [string]$script:ArchiveArtifactState
+        ArchiveArtifactExtractionCalls = [int]$script:ArchiveArtifactExtractionCalls
+        ArchiveArtifactMessage = [string]$script:ArchiveArtifactMessage
         ErrorCode         = $script:ErrorCode
         ErrorFunction     = $script:ErrorFunction
         ErrorArtifactType = $script:ErrorArtifactType
@@ -1216,6 +1268,77 @@ function Copy-HashcatRestoreCheckpoint {
     }
 }
 
+function Get-RunArchiveHashcatArtifact {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][string]$ArchivePath,
+        [Parameter(Mandatory = $true)][string]$ArchiveFormat
+    )
+
+    if ($script:ArchiveArtifactState -in @('Ready', 'Unavailable')) {
+        return $script:ArchiveHashcatArtifact
+    }
+
+    $script:ArchiveArtifactExtractionCalls++
+    try {
+        $artifact = New-ArchiveHashcatArtifact -ArchivePath $ArchivePath -ArchiveFormat $ArchiveFormat -JobDirectory $script:RuntimeDirectory -ProjectRoot $projectRoot
+        $script:ArchiveHashcatArtifact = $artifact
+        $script:ArchiveArtifactMessage = [string]$artifact.Message
+        $script:ArchiveArtifactState = if ($artifact.Supported) { 'Ready' } else { 'Unavailable' }
+        return $artifact
+    }
+    catch {
+        $script:ArchiveArtifactState = 'Unavailable'
+        $script:ArchiveArtifactMessage = $_.Exception.Message
+        $script:ArchiveHashcatArtifact = [pscustomobject]@{
+            Supported = $false
+            Message = ('Local archive artifact extraction failed; CPU fallback was selected. ' + $_.Exception.Message)
+        }
+        return $script:ArchiveHashcatArtifact
+    }
+}
+
+function Prepare-HashcatRuntimeExecutable {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][string]$HashcatPath
+    )
+
+    if ($script:HashcatRuntimePrepared -and -not [string]::IsNullOrWhiteSpace([string]$script:HashcatRuntimeExecutable)) {
+        return [string]$script:HashcatRuntimeExecutable
+    }
+
+    $sourceDirectory = Split-Path $HashcatPath -Parent
+    if (-not (Test-Path -LiteralPath $HashcatPath -PathType Leaf) -or
+        -not (Test-Path -LiteralPath $sourceDirectory -PathType Container)) {
+        throw 'The local Hashcat runtime executable is missing.'
+    }
+
+    # Hashcat resolves its generated kernel and dictionary-stat caches relative
+    # to its working directory. Keep that working tree app-local and persistent
+    # so a successful GPU run does not dirty the project or throw away compile
+    # time on the next run. Per-run inputs and outputs remain under Runtime.
+    $workingDirectory = Join-Path (Get-RecoveryDataRoot) 'Cache\Hashcat'
+    New-Item -ItemType Directory -Path $workingDirectory -Force -ErrorAction Stop | Out-Null
+    Copy-Item -LiteralPath $HashcatPath -Destination (Join-Path $workingDirectory 'hashcat.exe') -Force -ErrorAction Stop
+    foreach ($dependencyName in @('OpenCL', 'modules', 'tunings')) {
+        $dependencyPath = Join-Path $sourceDirectory $dependencyName
+        if (-not (Test-Path -LiteralPath $dependencyPath -PathType Container)) {
+            throw ('The local Hashcat runtime dependency is missing: ' + $dependencyName)
+        }
+        Copy-Item -LiteralPath $dependencyPath -Destination $workingDirectory -Recurse -Force -ErrorAction Stop
+    }
+    $hcstatPath = Join-Path $sourceDirectory 'hashcat.hcstat2'
+    if (Test-Path -LiteralPath $hcstatPath -PathType Leaf) {
+        Copy-Item -LiteralPath $hcstatPath -Destination $workingDirectory -Force -ErrorAction Stop
+    }
+    New-Item -ItemType Directory -Path (Join-Path $workingDirectory 'kernels') -Force -ErrorAction Stop | Out-Null
+
+    $script:HashcatRuntimeExecutable = Join-Path $workingDirectory 'hashcat.exe'
+    $script:HashcatRuntimePrepared = $true
+    return [string]$script:HashcatRuntimeExecutable
+}
+
 function Invoke-HashcatRecovery {
     [CmdletBinding()]
     param(
@@ -1261,6 +1384,7 @@ function Invoke-HashcatRecovery {
     $commonArguments = @(
         '--backend-ignore-cuda',
         '--backend-ignore-hip',
+        '--logfile-disable',
         '--potfile-disable',
         '--session', $session,
         '--restore-file-path', $runtimeRestorePath,
@@ -1293,7 +1417,10 @@ function Invoke-HashcatRecovery {
     $startInfo.Arguments = (@($arguments | ForEach-Object {
                 ConvertTo-WindowsCommandLineArgument -Value ([string]$_)
             }) -join ' ')
-    $startInfo.WorkingDirectory = Split-Path ([string]$Engine.HashcatPath) -Parent
+    $runtimeHashcatPath = Prepare-HashcatRuntimeExecutable -HashcatPath ([string]$Engine.HashcatPath)
+    $hashcatWorkingDirectory = Split-Path $runtimeHashcatPath -Parent
+    $startInfo.FileName = $runtimeHashcatPath
+    $startInfo.WorkingDirectory = $hashcatWorkingDirectory
     $startInfo.UseShellExecute = $false
     $startInfo.CreateNoWindow = $true
     $startInfo.RedirectStandardInput = $true
@@ -1539,25 +1666,6 @@ function Expand-CaseVariantDictionary {
     return (Expand-CaseVariantDictionaryFile -SourcePath $sourcePath -OutputPath $outputPath -RecoveryPlanYear $script:RecoveryPlanYear -ProgressCallback $ProgressCallback -ProgressTotal $progressTotal -ProgressUnit $unit -DeduplicateVariants:$isBuiltin)
 }
 
-function Expand-DateRangeGeneratedDictionary {
-    [CmdletBinding()]
-    param(
-        [Parameter(Mandatory = $true)]$Item,
-        [scriptblock]$ProgressCallback
-    )
-
-    $dictionaryDirectory = Join-Path $script:RuntimeDirectory 'dictionaries'
-    New-Item -ItemType Directory -Path $dictionaryDirectory -Force | Out-Null
-    $outputPath = Join-Path $dictionaryDirectory 'generated-date-range.txt'
-    $startYear = [int]$Item.StartYear
-    $endYear = [int]$Item.EndYear
-    $candidateGenerator = {
-        Get-DateRangeCandidates -StartYear $startYear -EndYear $endYear
-    }.GetNewClosure()
-    $progressTotal = if ($null -ne $Item.CandidateCount) { [long]$Item.CandidateCount } else { -1L }
-    return (New-GeneratedDictionaryFile -OutputPath $outputPath -CandidateGenerator $candidateGenerator -ProgressTotal $progressTotal -ProgressCallback $ProgressCallback -ProgressUnit 'Entries')
-}
-
 function Get-PlanDictionaryPaths {
     [CmdletBinding()]
     param(
@@ -1565,11 +1673,16 @@ function Get-PlanDictionaryPaths {
     )
 
     $paths = New-Object 'System.Collections.Generic.List[string]'
-    if ([string]$Item.Kind -eq 'DateRange') {
+    if ([string]$Item.Kind -in @('DateRange', 'CommonSymbols')) {
         $callback = New-PreparationProgressCallback -CoverageName ([string]$Item.DisplayName) -Unit 'Entries'
-        $result = Expand-DateRangeGeneratedDictionary -Item $Item -ProgressCallback $callback
+        $dictionaryDirectory = Join-Path $script:RuntimeDirectory 'dictionaries'
+        New-Item -ItemType Directory -Path $dictionaryDirectory -Force | Out-Null
+        $safeId = ([string]$Item.CoverageId -replace '[^A-Za-z0-9_-]', '_')
+        $fileName = if ([string]$Item.Kind -eq 'DateRange') { 'generated-date-range.txt' } else { 'generated-common-symbols-{0}.txt' -f $safeId }
+        $outputPath = Join-Path $dictionaryDirectory $fileName
+        $result = Write-GeneratedCoverageDictionary -PlanItem $Item -Job $job -OutputPath $outputPath -ProgressCallback $callback
         [void]$paths.Add([string]$result.Path)
-        $Item.CandidateCount = [long]$result.OutputCount
+        $Item.CandidateCount = [long]$result.GeneratedCount
         return $paths.ToArray()
     }
     $sources = @(Get-PlanItemDictionarySources -PlanItem $Item -Job $job)
@@ -1612,7 +1725,7 @@ function Test-PlanReadiness {
     )
 
     try {
-        $dictionaryKinds = @('BuiltinDictionary', 'Dictionary', 'CustomDictionary', 'RulesDictionary', 'CustomRules', 'RuleCaseVariants', 'RuleAppendVariants', 'CapitalInitialDigits', 'HybridDictionary', 'CustomMask')
+        $dictionaryKinds = @('BuiltinDictionary', 'Dictionary', 'CustomDictionary', 'RulesDictionary', 'CustomRules', 'RuleCaseVariants', 'RuleAppendVariants', 'CapitalInitialDigits', 'HybridDictionary', 'CommonSymbols', 'CustomMask')
         if ($dictionaryKinds -contains [string]$Item.Kind) {
             foreach ($source in @(Get-PlanItemDictionarySources -PlanItem $Item -Job $job)) {
                 if ([string]$source.SourceType -eq 'Custom') {
@@ -1835,6 +1948,22 @@ function Invoke-CumulativeDictionaryPlan {
     return $true
 }
 
+function Invoke-CumulativeGeneratedFiniteSetPlan {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]$Item,
+        [Parameter(Mandatory = $true)][string]$SevenZip
+    )
+
+    [long]$position = 0
+    foreach ($candidate in Get-GeneratedCoverageCandidates -PlanItem $Item -Job $job) {
+        if (-not (Test-CumulativeCandidateAtPosition -Candidate ([string]$candidate) -Position ([ref]$position) -SevenZip $SevenZip)) {
+            return $false
+        }
+    }
+    return $true
+}
+
 function Invoke-CumulativeCapitalInitialDigitsPlan {
     [CmdletBinding()]
     param(
@@ -2011,11 +2140,8 @@ function Invoke-CumulativeMaskPlan {
                 if (-not (Test-CumulativeCandidateAtPosition -Candidate ('{0:D4}' -f $year) -Position ([ref]$position) -SevenZip $SevenZip)) { return $false }
             }
         }
-        'DateRange' {
-            foreach ($candidate in Get-DateRangeCandidates -StartYear ([int]$Item.StartYear) -EndYear ([int]$Item.EndYear)) {
-                if (-not (Test-CumulativeCandidateAtPosition -Candidate ([string]$candidate) -Position ([ref]$position) -SevenZip $SevenZip)) { return $false }
-            }
-        }
+        'DateRange' { return (Invoke-CumulativeGeneratedFiniteSetPlan -Item $Item -SevenZip $SevenZip) }
+        'CommonSymbols' { return (Invoke-CumulativeGeneratedFiniteSetPlan -Item $Item -SevenZip $SevenZip) }
         'YearCombination' {
             for ($year = [int]$Item.StartYear; $year -le [int]$Item.EndYear; $year++) {
                 if (-not (Test-CumulativeCandidateAtPosition -Candidate (('{0:D4}{0:D4}' -f $year)) -Position ([ref]$position) -SevenZip $SevenZip)) { return $false }
@@ -2048,9 +2174,10 @@ function Invoke-CumulativePlanCpu {
         'RuleCaseVariants' { return (Invoke-CumulativeDictionaryPlan -Item $Item -SevenZip $SevenZip) }
         'RuleAppendVariants' { return (Invoke-CumulativeDictionaryPlan -Item $Item -SevenZip $SevenZip) }
         'HybridDictionary' { return (Invoke-CumulativeHybridPlan -Item $Item -SevenZip $SevenZip) }
+        'CommonSymbols' { return (Invoke-CumulativeGeneratedFiniteSetPlan -Item $Item -SevenZip $SevenZip) }
         'CapitalInitialDigits' { return (Invoke-CumulativeCapitalInitialDigitsPlan -Item $Item -SevenZip $SevenZip) }
         'CustomMask' { return (Invoke-CumulativeMaskPlan -Item $Item -SevenZip $SevenZip) }
-        'DateRange' { return (Invoke-CumulativeMaskPlan -Item $Item -SevenZip $SevenZip) }
+        'DateRange' { return (Invoke-CumulativeGeneratedFiniteSetPlan -Item $Item -SevenZip $SevenZip) }
         default { return (Invoke-CumulativeMaskPlan -Item $Item -SevenZip $SevenZip) }
     }
 }
@@ -2091,7 +2218,7 @@ function Invoke-CumulativeRecovery {
         [long]$stageCompletedKnown = 0
 
         foreach ($item in $items) {
-            if ($script:CompletedCoverageIds.Contains([string]$item.CoverageId)) {
+            if (Test-CumulativeCoverageCompleted -Item $item) {
                 $script:StageCoverageBaseCandidates = $stageCompletedKnown
                 if ($null -ne $item.CandidateCount) { $stageCompletedKnown += [long]$item.CandidateCount }
                 $script:StageCandidatesTested = $stageCompletedKnown
@@ -2136,7 +2263,7 @@ function Invoke-CumulativeRecovery {
                 if ($null -ne $preparedCandidateCount) {
                     $script:CoverageCandidateTotal = [long]$preparedCandidateCount
                 }
-                if ($item.Kind -in @('BuiltinDictionary', 'CustomDictionary', 'RulesDictionary', 'CustomRules', 'HybridDictionary') -and $dictionaryPaths.Count -ne 1) {
+                if ($item.Kind -in @('BuiltinDictionary', 'CustomDictionary', 'RulesDictionary', 'CustomRules', 'HybridDictionary', 'CommonSymbols') -and $dictionaryPaths.Count -ne 1) {
                     $engine = New-CpuEngine -Message 'This coverage has multiple local dictionary streams; CPU streaming was selected.'
                 }
                 else {
@@ -2147,7 +2274,7 @@ function Invoke-CumulativeRecovery {
                     if (-not (Test-Path -LiteralPath $script:RuntimeDirectory -PathType Container)) {
                         New-Item -ItemType Directory -Path $script:RuntimeDirectory -ErrorAction Stop | Out-Null
                     }
-                    $artifact = New-ArchiveHashcatArtifact -ArchivePath ([string]$job.ArchivePath) -ArchiveFormat ([string]$inspection.Format) -JobDirectory $script:RuntimeDirectory -ProjectRoot $projectRoot
+                    $artifact = Get-RunArchiveHashcatArtifact -ArchivePath ([string]$job.ArchivePath) -ArchiveFormat ([string]$inspection.Format)
                     if (-not $artifact.Supported) {
                         $engine = New-CpuEngine -Message ($artifact.Message + ' CPU fallback was selected.')
                     }
@@ -2360,7 +2487,7 @@ try {
             if (-not (Test-Path -LiteralPath $script:RuntimeDirectory -PathType Container)) {
                 New-Item -ItemType Directory -Path $script:RuntimeDirectory -ErrorAction Stop | Out-Null
             }
-            $artifact = New-ArchiveHashcatArtifact -ArchivePath ([string]$job.ArchivePath) -ArchiveFormat ([string]$inspection.Format) -JobDirectory $script:RuntimeDirectory -ProjectRoot $projectRoot
+            $artifact = Get-RunArchiveHashcatArtifact -ArchivePath ([string]$job.ArchivePath) -ArchiveFormat ([string]$inspection.Format)
             if (-not $artifact.Supported) {
                 $engine = New-CpuEngine -Label 'CPU / NanaZip fallback' -Message ($artifact.Message + ' CPU fallback was selected.')
                 $script:EngineLabel = $engine.Label

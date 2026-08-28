@@ -51,6 +51,21 @@ try {
     Assert-Equal -Actual ([long]$finalSample.Processed) -Expected 731 -Message 'generated DateRange final preparation progress is incorrect'
     Assert-Equal -Actual ([long]$finalSample.Total) -Expected 731 -Message 'generated DateRange preparation total is incorrect'
 
+    $adapterItem = [pscustomobject]@{
+        CoverageId = 'mask:L4-dates-test:v2'
+        Kind = 'DateRange'
+        GeneratorKind = 'DateRange'
+        StartYear = $startYear
+        EndYear = $endYear
+        CandidateCount = [long]$expectedCount
+    }
+    $adapterPath = Join-Path $testRoot 'generated-date-range-adapter.txt'
+    $adapterResult = Write-GeneratedCoverageDictionary -PlanItem $adapterItem -OutputPath $adapterPath
+    $adapterCandidates = [System.IO.File]::ReadAllLines($adapterPath)
+    Assert-Equal -Actual ([long]$adapterResult.GeneratedCount) -Expected 731 -Message 'DateRange finite-set adapter count is incorrect'
+    Assert-Equal -Actual $adapterCandidates[0] -Expected $cpuCandidates[0] -Message 'DateRange finite-set adapter first candidate changed'
+    Assert-Equal -Actual $adapterCandidates[$adapterCandidates.Count - 1] -Expected $cpuCandidates[$cpuCandidates.Count - 1] -Message 'DateRange finite-set adapter last candidate changed'
+
     [pscustomobject]@{
         StartYear = $startYear
         EndYear = $endYear
@@ -60,9 +75,11 @@ try {
         First = $generatedCandidates[0]
         Last = $generatedCandidates[$generatedCandidates.Count - 1]
         OrderAndContent = 'PASS'
+        FiniteSetAdapter = 'PASS'
     } | Format-List
     'DateRangeGeneratedDictionaryEquivalence=PASS'
     'DATE_RANGE_CPU_GENERATOR_REGRESSION: PASS'
+    'GENERATED_FINITE_SET_DATE_ADAPTER: PASS'
 }
 finally {
     if (Test-Path -LiteralPath $testRoot) { [System.IO.Directory]::Delete($testRoot, $true) }

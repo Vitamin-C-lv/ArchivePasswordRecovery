@@ -1043,6 +1043,8 @@ function Start-NewJob {
 
         $requestedLevel = [int]$controlJob.RecoveryLevel
         $reuseExistingJob = $false
+        $resumeUpgrade = $false
+        $upgradeDecision = $null
         if (-not [string]::IsNullOrWhiteSpace($script:CurrentJobDirectory) -and
             (Test-Path -LiteralPath (Join-Path $script:CurrentJobDirectory 'job.json') -PathType Leaf) -and
             -not (Get-WorkerIsRunning)) {
@@ -1051,9 +1053,34 @@ function Start-NewJob {
                 $existingLevel = Get-RecoveryLevel -Job $existingJob
                 $sameArchive = ($existingJob.PSObject.Properties.Name -contains 'ArchiveIdentity' -and
                     (Test-ArchiveIdentityMatch -Expected $existingJob.ArchiveIdentity -Actual $controlJob.ArchiveIdentity))
-                $reuseExistingJob = $sameArchive -and $requestedLevel -gt $existingLevel
+                if ($sameArchive -and $requestedLevel -gt $existingLevel) {
+                    $existingProgress = $null
+                    $progressPath = Join-Path $script:CurrentJobDirectory 'progress.json'
+                    if (Test-Path -LiteralPath $progressPath -PathType Leaf) {
+                        try { $existingProgress = Read-LocalJson -Path $progressPath } catch { $existingProgress = $null }
+                    }
+                    $availableCoverageIds = New-Object 'System.Collections.Generic.List[string]'
+                    for ($stageNumber = 1; $stageNumber -le $requestedLevel; $stageNumber++) {
+                        foreach ($planItem in @(Get-RecoveryPlanItems -Job $controlJob -StageNumber $stageNumber)) {
+                            if (-not $availableCoverageIds.Contains([string]$planItem.CoverageId)) {
+                                [void]$availableCoverageIds.Add([string]$planItem.CoverageId)
+                            }
+                        }
+                    }
+                    $upgradeDecision = Get-RecoveryLevelUpgradeIntent -ExistingJob $existingJob -NewControlJob $controlJob -ExistingProgress $existingProgress -JobDirectory $script:CurrentJobDirectory -AvailableCoverageIds $availableCoverageIds.ToArray()
+                    if ([string]$upgradeDecision.Intent -in @('BlockedRecovered', 'BlockedNotEncrypted')) {
+                        throw ([string]$upgradeDecision.Message)
+                    }
+                    $reuseExistingJob = [bool]$upgradeDecision.CanReuseExistingJob
+                    $resumeUpgrade = [bool]$upgradeDecision.ResumeCurrentCoverage
+                }
             }
-            catch { $reuseExistingJob = $false }
+            catch {
+                if ($null -ne $upgradeDecision -and [string]$upgradeDecision.Intent -in @('BlockedRecovered', 'BlockedNotEncrypted')) {
+                    throw
+                }
+                $reuseExistingJob = $false
+            }
         }
         if (-not $reuseExistingJob) {
             $script:CurrentJobDirectory = Join-Path $jobsRoot ([guid]::NewGuid().ToString('N'))
@@ -1076,10 +1103,11 @@ function Start-NewJob {
             }
         }
         Write-LocalJsonAtomic -Path (Join-Path $script:CurrentJobDirectory 'job.json') -Value $job
-        # A level upgrade is a new execution of the same persistent JobId. It
-        # reuses coverage.json but must not restore the old live Worker cursor.
+        # A level upgrade keeps the persistent JobId. Paused/stopped work with a
+        # valid current checkpoint resumes it; terminal upgrades start only the
+        # newly requested coverage items.
         Reset-LiveTaskDisplay
-        Start-WorkerProcess -ResumeJob:$false
+        Start-WorkerProcess -ResumeJob:$resumeUpgrade
         Update-TaskControls -State 'Starting'
         Write-UiLog '已启动新的本地恢复任务。'
     }
