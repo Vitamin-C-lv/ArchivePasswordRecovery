@@ -23,6 +23,7 @@ $job = Read-LocalJson -Path $jobPath
 $script:IsCumulativeJob = $job.PSObject.Properties.Name -contains 'RecoveryLevel'
 $jobId = ''
 if ($job.PSObject.Properties.Name -contains 'JobId') { $jobId = [string]$job.JobId }
+$script:RuntimeJobId = if ([string]::IsNullOrWhiteSpace($jobId)) { [System.IO.Path]::GetFileName(([System.IO.Path]::GetFullPath($JobDirectory).TrimEnd('\'))) } else { $jobId }
 $script:RunId = [guid]::NewGuid().ToString('N')
 $script:RunStartedUtc = [datetime]::UtcNow
 $script:RuntimeDirectory = Get-RecoveryRuntimeDirectory -JobDirectory $JobDirectory -JobId $jobId -RunId $script:RunId
@@ -139,7 +140,20 @@ $script:CoverageCandidatesTested = 0L
 $script:StageCoverageBaseCandidates = 0L
 $script:CurrentCoverageName = ''
 $script:ActivePlanItem = $null
-$script:RequestedCoverageIds = @()
+$script:RequestedCoverageIds = if ($Resume -and $null -ne $previous -and $previous.PSObject.Properties.Name -contains 'RequestedCoverage') {
+    @($previous.RequestedCoverage | ForEach-Object { [string]$_ })
+}
+else {
+    @()
+}
+$script:OverallProgressPlanKey = ''
+$script:LastOverallFlowProgress = 0.0
+if ($null -ne $previous -and $previous.PSObject.Properties.Name -contains 'RequestedCoverage') {
+    $script:OverallProgressPlanKey = @($previous.RequestedCoverage | ForEach-Object { [string]$_ }) -join "`n"
+}
+if ($null -ne $previous -and $previous.PSObject.Properties.Name -contains 'OverallFlowProgress' -and $null -ne $previous.OverallFlowProgress) {
+    try { $script:LastOverallFlowProgress = [double]$previous.OverallFlowProgress } catch { $script:LastOverallFlowProgress = 0.0 }
+}
 $cursorSources = if ($Resume) { @($previous, $job) } else { @() }
 foreach ($cursorSource in $cursorSources) {
     if ($null -ne $cursorSource -and $cursorSource.PSObject.Properties.Name -contains 'CurrentCoverageId' -and
@@ -313,6 +327,41 @@ function Update-ProgressTimestamp {
     $script:LastProgressPreparationCurrent = $currentPreparation
     $script:LastProgressCoverageTested = $currentCoverageTested
     $script:LastProgressCoveragePosition = $currentCoveragePosition
+}
+
+function Get-WorkerOverallFlowSnapshot {
+    [CmdletBinding()]
+    param()
+
+    $skippedCoverageIds = New-Object 'System.Collections.Generic.List[string]'
+    foreach ($skipped in @($script:SkippedStages.ToArray())) {
+        if ($null -ne $skipped -and $skipped.PSObject.Properties.Name -contains 'CoverageId' -and
+            -not [string]::IsNullOrWhiteSpace([string]$skipped.CoverageId)) {
+            [void]$skippedCoverageIds.Add([string]$skipped.CoverageId)
+        }
+    }
+    $currentTotal = if ($script:IsCumulativeJob -and $null -ne $script:ActivePlanItem) { $script:CoverageCandidateTotal } else { $null }
+    $overallParameters = @{
+        PlanCoverageIds = @($script:RequestedCoverageIds)
+        CompletedCoverageIds = @($script:CompletedCoverageIds | ForEach-Object { [string]$_ })
+        SkippedCoverageIds = $skippedCoverageIds.ToArray()
+        CurrentCoverageId = [string]$script:CurrentCoverageId
+        CurrentTested = [long]$script:CoverageCandidatesTested
+        CurrentTotal = $currentTotal
+        Activity = [string]$script:Activity
+        PreviousFlowProgress = $script:LastOverallFlowProgress
+        PreviousPlanKey = $script:OverallProgressPlanKey
+    }
+    $snapshot = Get-OverallFlowProgress @overallParameters
+
+    # The initial progress snapshot is written before a cumulative plan has
+    # been enumerated. Keep the resumable plan key/cursor until that plan is
+    # available so a Resume does not briefly erase its overall flow.
+    if ($snapshot.PlanCoverageCount -gt 0 -or [string]::IsNullOrWhiteSpace($script:OverallProgressPlanKey)) {
+        $script:OverallProgressPlanKey = [string]$snapshot.PlanKey
+        $script:LastOverallFlowProgress = [double]$snapshot.OverallFlowProgress
+    }
+    return $snapshot
 }
 
 function Set-WorkerErrorContext {
@@ -548,6 +597,7 @@ function Publish-Progress {
     $recordPreparationUnit = if ($InitialSnapshot) { '' } else { $script:PreparationUnit }
     $recordPreparationSpeed = if ($InitialSnapshot -or $script:PreparationSpeed -le 0) { $null } else { [math]::Round($script:PreparationSpeed, 2) }
     $recordPreparationEta = if ($InitialSnapshot) { $null } else { $script:PreparationEtaSeconds }
+    $overallFlow = Get-WorkerOverallFlowSnapshot
 
     $record = [ordered]@{
         SchemaVersion     = 4
@@ -583,6 +633,11 @@ function Publish-Progress {
         PreparationUnit    = $recordPreparationUnit
         PreparationSpeed   = $recordPreparationSpeed
         PreparationEtaSeconds = $recordPreparationEta
+        PlanCoverageCount = $overallFlow.PlanCoverageCount
+        ProcessedCoverageCount = $overallFlow.ProcessedCoverageCount
+        CurrentCoverageOrdinal = $overallFlow.CurrentCoverageOrdinal
+        OverallFlowProgress = $overallFlow.OverallFlowProgress
+        OverallFlowPercent = $overallFlow.OverallFlowPercent
         CoverageTested    = $recordCoverageTested
         CoverageTotal     = $recordCoverageTotal
         ProgressInvariantViolation = [bool]$script:ProgressInvariantViolation
@@ -1195,7 +1250,7 @@ function Invoke-HashcatRecovery {
     $script:HashcatProgressMode = 'Absolute'
     $hasSavedRestore = $ResumeStage -and (Test-Path -LiteralPath $persistentRestorePath -PathType Leaf)
     if ($hasSavedRestore) {
-        [void](Copy-HashcatRestoreCheckpoint -SourcePath $persistentRestorePath -DestinationPath $runtimeRestorePath -RuntimeDirectory $temporaryDirectory -JobId ([System.IO.Path]::GetFileName($JobDirectory)))
+        [void](Copy-HashcatRestoreCheckpoint -SourcePath $persistentRestorePath -DestinationPath $runtimeRestorePath -RuntimeDirectory $temporaryDirectory -JobId $script:RuntimeJobId)
     }
     if ($null -ne $script:ActivePlanItem) {
         Ensure-CoverageCheckpointDictionary
@@ -1484,6 +1539,25 @@ function Expand-CaseVariantDictionary {
     return (Expand-CaseVariantDictionaryFile -SourcePath $sourcePath -OutputPath $outputPath -RecoveryPlanYear $script:RecoveryPlanYear -ProgressCallback $ProgressCallback -ProgressTotal $progressTotal -ProgressUnit $unit -DeduplicateVariants:$isBuiltin)
 }
 
+function Expand-DateRangeGeneratedDictionary {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]$Item,
+        [scriptblock]$ProgressCallback
+    )
+
+    $dictionaryDirectory = Join-Path $script:RuntimeDirectory 'dictionaries'
+    New-Item -ItemType Directory -Path $dictionaryDirectory -Force | Out-Null
+    $outputPath = Join-Path $dictionaryDirectory 'generated-date-range.txt'
+    $startYear = [int]$Item.StartYear
+    $endYear = [int]$Item.EndYear
+    $candidateGenerator = {
+        Get-DateRangeCandidates -StartYear $startYear -EndYear $endYear
+    }.GetNewClosure()
+    $progressTotal = if ($null -ne $Item.CandidateCount) { [long]$Item.CandidateCount } else { -1L }
+    return (New-GeneratedDictionaryFile -OutputPath $outputPath -CandidateGenerator $candidateGenerator -ProgressTotal $progressTotal -ProgressCallback $ProgressCallback -ProgressUnit 'Entries')
+}
+
 function Get-PlanDictionaryPaths {
     [CmdletBinding()]
     param(
@@ -1491,6 +1565,13 @@ function Get-PlanDictionaryPaths {
     )
 
     $paths = New-Object 'System.Collections.Generic.List[string]'
+    if ([string]$Item.Kind -eq 'DateRange') {
+        $callback = New-PreparationProgressCallback -CoverageName ([string]$Item.DisplayName) -Unit 'Entries'
+        $result = Expand-DateRangeGeneratedDictionary -Item $Item -ProgressCallback $callback
+        [void]$paths.Add([string]$result.Path)
+        $Item.CandidateCount = [long]$result.OutputCount
+        return $paths.ToArray()
+    }
     $sources = @(Get-PlanItemDictionarySources -PlanItem $Item -Job $job)
     foreach ($source in $sources) {
         $sourceType = [string]$source.SourceType
@@ -1554,6 +1635,13 @@ function Test-PlanReadiness {
                     return [pscustomobject]@{ Ready = $false; Message = 'the generated mask range is invalid' }
                 }
                 [void](Get-CharsetCharacters -Kind ([string](Get-ObjectPropertyValue -Object $Item -Name 'CharacterSet' -Default '')) -CustomCharacters '')
+            }
+            'DateRange' {
+                [int]$startYear = Get-ObjectPropertyValue -Object $Item -Name 'StartYear' -Default 0
+                [int]$endYear = Get-ObjectPropertyValue -Object $Item -Name 'EndYear' -Default 0
+                if ($startYear -lt 1 -or $endYear -lt $startYear -or $endYear -gt 9999) {
+                    return [pscustomobject]@{ Ready = $false; Message = 'the generated date range is invalid' }
+                }
             }
             'ConfiguredBruteForce' {
                 if ([int](Get-ObjectPropertyValue -Object $Item -Name 'MinimumLength' -Default 0) -lt 1 -or
@@ -1924,13 +2012,8 @@ function Invoke-CumulativeMaskPlan {
             }
         }
         'DateRange' {
-            for ($year = [int]$Item.StartYear; $year -le [int]$Item.EndYear; $year++) {
-                $date = [datetime]::ParseExact(('{0:D4}0101' -f $year), 'yyyyMMdd', [System.Globalization.CultureInfo]::InvariantCulture)
-                $end = $date.AddYears(1)
-                while ($date -lt $end) {
-                    if (-not (Test-CumulativeCandidateAtPosition -Candidate $date.ToString('yyyyMMdd', [System.Globalization.CultureInfo]::InvariantCulture) -Position ([ref]$position) -SevenZip $SevenZip)) { return $false }
-                    $date = $date.AddDays(1)
-                }
+            foreach ($candidate in Get-DateRangeCandidates -StartYear ([int]$Item.StartYear) -EndYear ([int]$Item.EndYear)) {
+                if (-not (Test-CumulativeCandidateAtPosition -Candidate ([string]$candidate) -Position ([ref]$position) -SevenZip $SevenZip)) { return $false }
             }
         }
         'YearCombination' {
@@ -1967,6 +2050,7 @@ function Invoke-CumulativePlanCpu {
         'HybridDictionary' { return (Invoke-CumulativeHybridPlan -Item $Item -SevenZip $SevenZip) }
         'CapitalInitialDigits' { return (Invoke-CumulativeCapitalInitialDigitsPlan -Item $Item -SevenZip $SevenZip) }
         'CustomMask' { return (Invoke-CumulativeMaskPlan -Item $Item -SevenZip $SevenZip) }
+        'DateRange' { return (Invoke-CumulativeMaskPlan -Item $Item -SevenZip $SevenZip) }
         default { return (Invoke-CumulativeMaskPlan -Item $Item -SevenZip $SevenZip) }
     }
 }

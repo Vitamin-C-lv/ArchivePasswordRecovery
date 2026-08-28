@@ -174,6 +174,15 @@ try { $startupJobCleanup = @(Cleanup-TerminalRecoveryJobs -JobsRoot $jobsRoot) }
                         </ListBoxItem>
                     </ListBox>
                     <TextBlock x:Name="StrategyHelpText" Margin="0,12,0,0" TextWrapping="Wrap" Foreground="#586473" />
+                    <StackPanel x:Name="OverallProgressPanel" Margin="0,14,0,0">
+                        <TextBlock x:Name="OverallProgressTitle" FontWeight="SemiBold" Foreground="#243447" Text="整体流程进度（按搜索范围）" />
+                        <Grid Margin="0,7,0,0">
+                            <ProgressBar x:Name="OverallProgressBar" Height="9" Minimum="0" Maximum="100" Value="0" IsIndeterminate="False" Background="#E5E9EF" Foreground="#2F75C9" />
+                            <TextBlock x:Name="OverallProgressPercent" HorizontalAlignment="Right" Margin="0,0,6,0" VerticalAlignment="Center" FontSize="11" Foreground="#2F75C9" Text="—" />
+                        </Grid>
+                        <TextBlock x:Name="OverallProgressSummary" Margin="0,6,0,0" Foreground="#687789" Text="开始恢复后显示整体流程进度" />
+                        <TextBlock x:Name="OverallProgressCurrent" Margin="0,3,0,0" TextWrapping="Wrap" Foreground="#687789" Text="当前：等待开始" />
+                    </StackPanel>
                 </StackPanel>
             </Border>
 
@@ -319,7 +328,7 @@ $window = [Windows.Markup.XamlReader]::Load($reader)
 $controls = @{}
 foreach ($name in @(
         'AppIconImage', 'ArchiveDropZone', 'EmptyArchiveDropContent', 'SelectedArchiveCard', 'ArchivePathBox', 'BrowseArchiveButton', 'ReplaceArchiveButton', 'InspectButton', 'ArchiveFileNameText', 'ArchiveInfoText',
-        'StrategyBox', 'DeviceBox', 'StrategyHelpText', 'DeviceInfoText',
+        'StrategyBox', 'DeviceBox', 'StrategyHelpText', 'OverallProgressPanel', 'OverallProgressTitle', 'OverallProgressBar', 'OverallProgressPercent', 'OverallProgressSummary', 'OverallProgressCurrent', 'DeviceInfoText',
         'QuickCandidatesBox', 'DictionaryPathBox', 'BrowseDictionaryButton', 'TryEmptyPasswordBox',
         'MaskBox', 'CharacterSetBox', 'CustomCharacterSetBox', 'MinLengthBox', 'MaxLengthBox',
         'StartButton', 'PauseButton', 'ResumeButton', 'StopButton', 'OpenJobButton', 'AdvancedSettingsExpander',
@@ -1009,6 +1018,12 @@ function Reset-LiveTaskDisplay {
     $controls.SearchProgressBar.Value = 0
     $controls.ProgressPercentValue.Text = '等待本地准备进度采样…'
     $controls.ProgressMessageText.Text = '正在准备本地恢复任务。压缩包数据不会离开此电脑。'
+    $controls.OverallProgressBar.IsIndeterminate = $false
+    $controls.OverallProgressBar.Value = 0
+    $controls.OverallProgressBar.Foreground = New-Object System.Windows.Media.SolidColorBrush([System.Windows.Media.Color]::FromRgb(170, 178, 188))
+    $controls.OverallProgressPercent.Text = '—'
+    $controls.OverallProgressSummary.Text = '开始恢复后显示整体流程进度'
+    $controls.OverallProgressCurrent.Text = '当前：等待开始'
     $controls.ResultValue.Text = ''
     $controls.ResultCard.Visibility = [System.Windows.Visibility]::Collapsed
 }
@@ -1230,6 +1245,55 @@ function Update-ProgressFromDisk {
         $activity = if ($progress.PSObject.Properties.Name -contains 'Activity' -and -not [string]::IsNullOrWhiteSpace([string]$progress.Activity)) { [string]$progress.Activity } else { $displayState }
         $activityMessage = if ($progress.PSObject.Properties.Name -contains 'ActivityMessage' -and -not [string]::IsNullOrWhiteSpace([string]$progress.ActivityMessage)) { [string]$progress.ActivityMessage } else { [string]$progress.Message }
         $currentCoverageName = if ($progress.PSObject.Properties.Name -contains 'CurrentCoverageName' -and -not [string]::IsNullOrWhiteSpace([string]$progress.CurrentCoverageName)) { [string]$progress.CurrentCoverageName } else { '' }
+        [long]$overallPlanCount = 0
+        [long]$overallProcessedCount = 0
+        [double]$overallPercent = 0
+        $overallOrdinal = $null
+        try { if ($progress.PSObject.Properties.Name -contains 'PlanCoverageCount' -and $null -ne $progress.PlanCoverageCount) { $overallPlanCount = [long]$progress.PlanCoverageCount } } catch { $overallPlanCount = 0 }
+        try { if ($progress.PSObject.Properties.Name -contains 'ProcessedCoverageCount' -and $null -ne $progress.ProcessedCoverageCount) { $overallProcessedCount = [long]$progress.ProcessedCoverageCount } } catch { $overallProcessedCount = 0 }
+        try { if ($progress.PSObject.Properties.Name -contains 'OverallFlowPercent' -and $null -ne $progress.OverallFlowPercent) { $overallPercent = [double]$progress.OverallFlowPercent } } catch { $overallPercent = 0 }
+        try { if ($progress.PSObject.Properties.Name -contains 'CurrentCoverageOrdinal' -and $null -ne $progress.CurrentCoverageOrdinal) { $overallOrdinal = [int]$progress.CurrentCoverageOrdinal } } catch { $overallOrdinal = $null }
+        if ($overallPlanCount -gt 0) {
+            if ($overallProcessedCount -lt 0) { $overallProcessedCount = 0 }
+            if ($overallProcessedCount -gt $overallPlanCount) { $overallProcessedCount = $overallPlanCount }
+            if ($overallPercent -lt 0) { $overallPercent = 0 }
+            if ($overallPercent -gt 100) { $overallPercent = 100 }
+            $controls.OverallProgressBar.IsIndeterminate = $false
+            $controls.OverallProgressBar.Foreground = New-Object System.Windows.Media.SolidColorBrush([System.Windows.Media.Color]::FromRgb(47, 117, 201))
+            $controls.OverallProgressBar.Value = $overallPercent
+            $controls.OverallProgressPercent.Text = '{0:N2}%' -f $overallPercent
+            $controls.OverallProgressSummary.Text = '已处理 {0} / {1} 个搜索范围' -f (Format-LocalCount -Value $overallProcessedCount), (Format-LocalCount -Value $overallPlanCount)
+            $overallCurrentLabel = $currentCoverageName
+            if ([string]::IsNullOrWhiteSpace($overallCurrentLabel) -and $null -ne $overallOrdinal -and $overallOrdinal -gt 0) {
+                $overallCurrentLabel = '第 {0} 个搜索范围' -f $overallOrdinal
+            }
+            if ($displayState -eq 'Recovered') {
+                $controls.OverallProgressCurrent.Text = if ([string]::IsNullOrWhiteSpace($overallCurrentLabel)) { '当前：已找到密码，后续搜索已停止' } else { '当前：{0}；已找到密码，后续搜索已停止' -f $overallCurrentLabel }
+            }
+            elseif ($displayState -eq 'Failed') {
+                $controls.OverallProgressCurrent.Text = if ([string]::IsNullOrWhiteSpace($overallCurrentLabel)) { '当前：任务失败，失败范围未计入已处理' } else { '当前：{0}；失败范围未计入已处理' -f $overallCurrentLabel }
+            }
+            elseif ($displayState -eq 'Exhausted' -and $overallProcessedCount -ge $overallPlanCount) {
+                $controls.OverallProgressCurrent.Text = '当前：所有搜索范围已完成'
+            }
+            elseif ([string]::IsNullOrWhiteSpace($overallCurrentLabel)) {
+                $controls.OverallProgressCurrent.Text = '当前：正在切换到下一搜索范围'
+            }
+            elseif ($activity -like 'Preparing*') {
+                $controls.OverallProgressCurrent.Text = '当前：正在准备 {0}（准备阶段不计入当前范围进度）' -f $overallCurrentLabel
+            }
+            else {
+                $controls.OverallProgressCurrent.Text = '当前：' + $overallCurrentLabel
+            }
+        }
+        else {
+            $controls.OverallProgressBar.IsIndeterminate = $false
+            $controls.OverallProgressBar.Value = 0
+            $controls.OverallProgressBar.Foreground = New-Object System.Windows.Media.SolidColorBrush([System.Windows.Media.Color]::FromRgb(170, 178, 188))
+            $controls.OverallProgressPercent.Text = '—'
+            $controls.OverallProgressSummary.Text = '开始恢复后显示整体流程进度'
+            $controls.OverallProgressCurrent.Text = '当前：等待开始'
+        }
         if (-not [string]::IsNullOrWhiteSpace($currentCoverageName)) {
             $coverageContext = if ($activity -eq 'AdvancingCoverage') { '当前范围已完成：' } else { '当前范围：' }
             $stageText += [Environment]::NewLine + $coverageContext + $currentCoverageName
@@ -1446,6 +1510,12 @@ $controls.SearchProgressBar.IsIndeterminate = $false
 $controls.SearchProgressBar.Value = 0
 $controls.ProgressPercentValue.Text = '当前没有本地任务正在运行。'
 $controls.ProgressMessageText.Text = '当前没有本地任务正在运行。'
+$controls.OverallProgressBar.IsIndeterminate = $false
+$controls.OverallProgressBar.Value = 0
+$controls.OverallProgressBar.Foreground = New-Object System.Windows.Media.SolidColorBrush([System.Windows.Media.Color]::FromRgb(170, 178, 188))
+$controls.OverallProgressPercent.Text = '—'
+$controls.OverallProgressSummary.Text = '开始恢复后显示整体流程进度'
+$controls.OverallProgressCurrent.Text = '当前：等待开始'
 $controls.ResultCard.Visibility = [System.Windows.Visibility]::Collapsed
 Set-ArchiveDisplayState -HasValidArchive:$false
 Update-TaskControls
