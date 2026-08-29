@@ -129,7 +129,7 @@ try {
     $sevenZip = Resolve-SevenZip
     $workerPath = Join-Path $srcRoot 'RecoveryWorker.ps1'
     $cpu = Invoke-CommonSymbolsRun -TestRoot $testRoot -WorkerPath $workerPath -SevenZip $sevenZip -DevicePreference 'CPU'
-    Assert-True ([string]$cpu.Backend -match 'NanaZip') 'CommonSymbols CPU run did not use the local verifier'
+    Assert-True ([string]$cpu.Backend -eq 'John Jumbo CPU') 'CommonSymbols CPU run did not use the John Jumbo CPU backend'
     Assert-True ([string]$cpu.ComputeDevice -eq 'CPU') 'CommonSymbols CPU run did not report CPU'
     Assert-True ([int]$cpu.ArtifactExtractionCalls -eq 0) 'CommonSymbols CPU run unexpectedly extracted a GPU archive artifact'
 

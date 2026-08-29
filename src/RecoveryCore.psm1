@@ -599,7 +599,7 @@ function Merge-RecoveryJobForLevelUpgrade {
     }
     else { $null }
 
-    $merged['SchemaVersion'] = 4
+    $merged['SchemaVersion'] = 5
     return [pscustomobject]$merged
 }
 
@@ -834,6 +834,45 @@ function Resolve-Local7z2Hashcat {
         } | Select-Object -First 1)[0]
 }
 
+function Resolve-LocalJohn {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][string]$ProjectRoot
+    )
+
+    $candidates = New-Object 'System.Collections.Generic.List[string]'
+    # john.exe is the bundled launcher. Keep the existing architecture
+    # variants as fallbacks; the launcher normally selects the best one.
+    foreach ($relativePath in @(
+            'tools\extractors\john.exe',
+            'tools\extractors\john-avx512bw.exe',
+            'tools\extractors\john-avx2.exe',
+            'tools\extractors\john-avx.exe',
+            'tools\extractors\john-avx512bw-omp.exe',
+            'tools\extractors\john-avx2-omp.exe',
+            'tools\extractors\john-avx-omp.exe'
+        )) {
+        $candidates.Add((Join-Path $ProjectRoot $relativePath))
+    }
+
+    $johnRoot = Join-Path $ProjectRoot 'tools\vendor\JtR'
+    if (Test-Path -LiteralPath $johnRoot -PathType Container) {
+        foreach ($name in @('john.exe', 'john-avx512bw.exe', 'john-avx2.exe', 'john-avx.exe', 'john-avx512bw-omp.exe', 'john-avx2-omp.exe', 'john-avx-omp.exe')) {
+            $found = Get-ChildItem -LiteralPath $johnRoot -Filter $name -File -Recurse -ErrorAction SilentlyContinue |
+                Select-Object -First 1
+            if ($null -ne $found) { $candidates.Add([string]$found.FullName) }
+        }
+    }
+
+    $pathCommand = Get-Command john.exe -ErrorAction SilentlyContinue
+    if ($null -ne $pathCommand) { $candidates.Add([string]$pathCommand.Source) }
+
+    return @($candidates | Where-Object {
+            -not [string]::IsNullOrWhiteSpace($_) -and
+            (Test-Path -LiteralPath $_ -PathType Leaf)
+        } | Select-Object -First 1)[0]
+}
+
 function ConvertTo-WindowsCommandLineArgument {
     [CmdletBinding()]
     param(
@@ -994,6 +1033,116 @@ function Get-HashcatOpenClDevices {
     return $script:HashcatDeviceCache
 }
 
+function Resolve-HashcatGpuSelection {
+    [CmdletBinding()]
+    param(
+        [AllowEmptyCollection()][object[]]$Devices = @(),
+        [string]$DevicePreference = 'Auto',
+        $SelectedGpu = $null
+    )
+
+    $gpuDevices = @($Devices | Where-Object {
+            [string]$_.Type -eq 'GPU' -and
+            -not [string]::IsNullOrWhiteSpace([string]$_.Name) -and
+            -not [string]::IsNullOrWhiteSpace([string]$_.Vendor)
+        })
+    if ($gpuDevices.Count -eq 0) {
+        return [pscustomobject]@{
+            UseGpu = $false
+            Device = $null
+            PreferenceKind = 'Unavailable'
+            Message = 'No initialized local Hashcat OpenCL GPU device was found. CPU fallback was selected.'
+        }
+    }
+
+    $preference = if ([string]::IsNullOrWhiteSpace($DevicePreference)) { 'Auto' } else { [string]$DevicePreference }
+    $selected = $null
+    $preferenceKind = 'Auto'
+    $messagePrefix = 'Auto'
+
+    if ($preference -eq 'GPU') {
+        $preferenceKind = 'Exact'
+        $messagePrefix = 'Requested'
+        $savedVendor = if ($null -ne $SelectedGpu -and $SelectedGpu.PSObject.Properties.Name -contains 'Vendor') { [string]$SelectedGpu.Vendor } else { '' }
+        $savedName = if ($null -ne $SelectedGpu -and $SelectedGpu.PSObject.Properties.Name -contains 'Name') { [string]$SelectedGpu.Name } else { '' }
+        if ([string]::IsNullOrWhiteSpace($savedVendor) -or [string]::IsNullOrWhiteSpace($savedName)) {
+            return [pscustomobject]@{
+                UseGpu = $false
+                Device = $null
+                PreferenceKind = $preferenceKind
+                Message = 'The saved GPU identity is incomplete or unavailable. CPU fallback was selected.'
+            }
+        }
+
+        # Vendor + Name is the durable identity. DeviceId is consulted only
+        # after that identity has produced a group, so a reordered OpenCL
+        # enumeration does not silently select another model.
+        $identityMatches = @($gpuDevices | Where-Object {
+                [string]::Equals([string]$_.Vendor, $savedVendor, [System.StringComparison]::Ordinal) -and
+                [string]::Equals([string]$_.Name, $savedName, [System.StringComparison]::Ordinal)
+            })
+        if ($identityMatches.Count -eq 1) {
+            $selected = $identityMatches[0]
+        }
+        elseif ($identityMatches.Count -gt 1 -and $null -ne $SelectedGpu -and
+            $SelectedGpu.PSObject.Properties.Name -contains 'LastDeviceId' -and $null -ne $SelectedGpu.LastDeviceId) {
+            [int]$lastDeviceId = -1
+            try { $lastDeviceId = [int]$SelectedGpu.LastDeviceId } catch { $lastDeviceId = -1 }
+            $idMatches = @($identityMatches | Where-Object { [int]$_.DeviceId -eq $lastDeviceId })
+            if ($idMatches.Count -eq 1) { $selected = $idMatches[0] }
+        }
+        if ($null -eq $selected) {
+            return [pscustomobject]@{
+                UseGpu = $false
+                Device = $null
+                PreferenceKind = $preferenceKind
+                Message = ('The saved GPU is unavailable or ambiguous: {0} ({1}). CPU fallback was selected.' -f $savedName, $savedVendor)
+            }
+        }
+    }
+    elseif ($preference -eq 'Auto') {
+        $selected = @($gpuDevices | Sort-Object @{ Expression = {
+                        if ([string]$_.Vendor -eq 'NVIDIA') { 0 }
+                        elseif ([string]$_.Vendor -eq 'AMD') { 1 }
+                        else { 2 }
+                    }
+                }, @{ Expression = { [int]$_.DeviceId } }, Name | Select-Object -First 1)[0]
+    }
+    elseif ($preference -eq 'CPU') {
+        return [pscustomobject]@{
+            UseGpu = $false
+            Device = $null
+            PreferenceKind = 'CPU'
+            Message = 'CPU was selected.'
+        }
+    }
+    else {
+        # Compatibility for jobs written by the previous vendor-only UI.
+        $preferenceKind = 'LegacyVendor'
+        $messagePrefix = 'Legacy request'
+        $vendor = $preference -replace '\s+GPU$', ''
+        $vendorMatches = @($gpuDevices | Where-Object {
+                [string]::Equals([string]$_.Vendor, $vendor, [System.StringComparison]::OrdinalIgnoreCase)
+            } | Sort-Object @{ Expression = { [int]$_.DeviceId } }, Name)
+        if ($vendorMatches.Count -gt 0) { $selected = $vendorMatches[0] }
+        if ($null -eq $selected) {
+            return [pscustomobject]@{
+                UseGpu = $false
+                Device = $null
+                PreferenceKind = $preferenceKind
+                Message = ("The legacy GPU preference '{0}' is unavailable. CPU fallback was selected." -f $preference)
+            }
+        }
+    }
+
+    return [pscustomobject]@{
+        UseGpu = $true
+        Device = $selected
+        PreferenceKind = $preferenceKind
+        Message = ('{0} selected local Hashcat OpenCL device: {1} (#{2}).' -f $messagePrefix, $selected.Name, $selected.DeviceId)
+    }
+}
+
 function Get-LocalGpuBackendStatus {
     [CmdletBinding()]
     param(
@@ -1004,8 +1153,9 @@ function Get-LocalGpuBackendStatus {
     $openCl = Get-HashcatOpenClDevices -ProjectRoot $ProjectRoot
     $zip2JohnPath = Resolve-LocalZip2John -ProjectRoot $ProjectRoot
     $sevenZipExtractorPath = Resolve-Local7z2Hashcat -ProjectRoot $ProjectRoot
-    $isZip = ([string]$Format -eq 'ZIP')
-    $isSevenZip = ([string]$Format -eq '7z')
+    $formatKey = ([string]$Format).ToUpperInvariant()
+    $isZip = ($formatKey -eq 'ZIP')
+    $isSevenZip = ($formatKey -eq '7Z')
     $zipReady = ($isZip -and $openCl.Ready -and -not [string]::IsNullOrWhiteSpace($zip2JohnPath))
     $sevenZipReady = ($isSevenZip -and $openCl.Ready -and -not [string]::IsNullOrWhiteSpace($sevenZipExtractorPath))
 
@@ -1158,17 +1308,141 @@ function New-ArchiveHashcatArtifact {
         [Parameter(Mandatory = $true)][string]$ProjectRoot
     )
 
-    switch ([string]$ArchiveFormat) {
+    switch (([string]$ArchiveFormat).ToUpperInvariant()) {
         'ZIP' {
             return New-ZipHashcatArtifact -ArchivePath $ArchivePath -JobDirectory $JobDirectory -ProjectRoot $ProjectRoot
         }
-        '7z' {
+        '7Z' {
             return New-SevenZipHashcatArtifact -ArchivePath $ArchivePath -JobDirectory $JobDirectory -ProjectRoot $ProjectRoot
         }
         default {
             return [pscustomobject]@{
                 Supported = $false
                 Message   = ('GPU recovery is not implemented for {0}. The task will use the CPU path.' -f $ArchiveFormat)
+            }
+        }
+    }
+}
+
+function New-LocalJohnRuntimeConfig {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][string]$RuntimeDirectory
+    )
+
+    if (-not (Test-Path -LiteralPath $RuntimeDirectory -PathType Container)) {
+        New-Item -ItemType Directory -Path $RuntimeDirectory -Force -ErrorAction Stop | Out-Null
+    }
+    $configPath = Join-Path $RuntimeDirectory 'john.conf'
+    if (-not (Test-Path -LiteralPath $configPath -PathType Leaf)) {
+        $configText = @(
+            '# ArchivePasswordRecovery app-owned John configuration'
+            '# The Worker supplies an explicit config, pot, session, and no-log path.'
+        ) -join [Environment]::NewLine
+        [System.IO.File]::WriteAllText($configPath, $configText + [Environment]::NewLine, (New-Object System.Text.UTF8Encoding($false)))
+    }
+    return $configPath
+}
+
+function New-ZipJohnArtifact {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][string]$ArchivePath,
+        [Parameter(Mandatory = $true)][string]$JobDirectory,
+        [Parameter(Mandatory = $true)][string]$ProjectRoot
+    )
+
+    $zip2JohnPath = Resolve-LocalZip2John -ProjectRoot $ProjectRoot
+    if ([string]::IsNullOrWhiteSpace($zip2JohnPath)) {
+        return [pscustomobject]@{
+            Supported = $false
+            Message = 'CPU bulk recovery is unavailable because the local zip2john executable was not found.'
+        }
+    }
+
+    $extracted = Invoke-LocalNativeProcess -FilePath $zip2JohnPath -WorkingDirectory (Split-Path $zip2JohnPath -Parent) -Arguments @($ArchivePath)
+    $records = New-Object 'System.Collections.Generic.List[string]'
+    foreach ($line in @($extracted.StdOut -split '\r?\n')) {
+        $trimmed = [string]$line.Trim()
+        if ($trimmed -match '\$(zip2|pkzip)\$' -and -not [string]::IsNullOrWhiteSpace($trimmed)) {
+            [void]$records.Add($trimmed)
+        }
+    }
+    if ($extracted.ExitCode -ne 0 -or $records.Count -eq 0) {
+        return [pscustomobject]@{
+            Supported = $false
+            Message = 'The local zip2john extractor did not produce a John-supported ZIP recovery record. NanaZip CPU verification remains the fallback.'
+        }
+    }
+
+    $isZipCrypto = @($records | Where-Object { $_ -match '\$pkzip\$' }).Count -gt 0
+    $format = if ($isZipCrypto) { 'PKZIP' } else { 'zip' }
+    $hashPath = Join-Path $JobDirectory 'john-input.hash'
+    [System.IO.File]::WriteAllLines($hashPath, $records.ToArray(), (New-Object System.Text.UTF8Encoding($false)))
+    return [pscustomobject]@{
+        Supported = $true
+        Message = if ($isZipCrypto) { 'Legacy ZipCrypto recovery data was extracted locally for John Jumbo.' } else { 'WinZip AES recovery data was extracted locally for John Jumbo.' }
+        HashPath = $hashPath
+        HashRecords = @($records.ToArray())
+        Format = $format
+        EncryptionType = if ($isZipCrypto) { 'ZipCrypto' } else { 'WinZip AES' }
+    }
+}
+
+function New-SevenZipJohnArtifact {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][string]$ArchivePath,
+        [Parameter(Mandatory = $true)][string]$JobDirectory,
+        [Parameter(Mandatory = $true)][string]$ProjectRoot
+    )
+
+    $extractorPath = Resolve-Local7z2Hashcat -ProjectRoot $ProjectRoot
+    if ([string]::IsNullOrWhiteSpace($extractorPath)) {
+        return [pscustomobject]@{
+            Supported = $false
+            Message = 'CPU bulk recovery is unavailable because the local 7z2hashcat executable was not found.'
+        }
+    }
+
+    $extracted = Invoke-LocalNativeProcess -FilePath $extractorPath -WorkingDirectory (Split-Path $extractorPath -Parent) -Arguments @($ArchivePath)
+    $match = [regex]::Match($extracted.StdOut, '(?m)(\$7z\$[^\r\n]+)')
+    if ($extracted.ExitCode -ne 0 -or -not $match.Success) {
+        return [pscustomobject]@{
+            Supported = $false
+            Message = 'The local 7z2hashcat extractor did not produce a John-supported 7-Zip AES recovery record. NanaZip CPU verification remains the fallback.'
+        }
+    }
+
+    $hashPath = Join-Path $JobDirectory 'john-input.hash'
+    $hashLine = $match.Groups[1].Value.Trim()
+    [System.IO.File]::WriteAllText($hashPath, $hashLine + [Environment]::NewLine, (New-Object System.Text.UTF8Encoding($false)))
+    return [pscustomobject]@{
+        Supported = $true
+        Message = '7-Zip AES recovery data was extracted locally for John Jumbo.'
+        HashPath = $hashPath
+        HashRecords = @($hashLine)
+        Format = '7z'
+        EncryptionType = '7-Zip AES'
+    }
+}
+
+function New-ArchiveJohnArtifact {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][string]$ArchivePath,
+        [Parameter(Mandatory = $true)][string]$ArchiveFormat,
+        [Parameter(Mandatory = $true)][string]$JobDirectory,
+        [Parameter(Mandatory = $true)][string]$ProjectRoot
+    )
+
+    switch (([string]$ArchiveFormat).ToUpperInvariant()) {
+        'ZIP' { return New-ZipJohnArtifact -ArchivePath $ArchivePath -JobDirectory $JobDirectory -ProjectRoot $ProjectRoot }
+        '7Z' { return New-SevenZipJohnArtifact -ArchivePath $ArchivePath -JobDirectory $JobDirectory -ProjectRoot $ProjectRoot }
+        default {
+            return [pscustomobject]@{
+                Supported = $false
+                Message = ('John Jumbo CPU bulk recovery is not implemented for {0}. NanaZip CPU verification remains the fallback.' -f $ArchiveFormat)
             }
         }
     }
@@ -4457,13 +4731,19 @@ Export-ModuleMember -Function @(
     'Resolve-LocalHashcat',
     'Resolve-LocalZip2John',
     'Resolve-Local7z2Hashcat',
+    'Resolve-LocalJohn',
     'ConvertTo-WindowsCommandLineArgument',
     'Invoke-LocalNativeProcess',
     'Get-HashcatOpenClDevices',
+    'Resolve-HashcatGpuSelection',
     'Get-LocalGpuBackendStatus',
     'New-ZipHashcatArtifact',
     'New-SevenZipHashcatArtifact',
     'New-ArchiveHashcatArtifact',
+    'New-LocalJohnRuntimeConfig',
+    'New-ZipJohnArtifact',
+    'New-SevenZipJohnArtifact',
+    'New-ArchiveJohnArtifact',
     'Clear-AppOwnedHashcatResidue',
     'Get-RecoveryLevel',
     'Get-RecoveryStages',

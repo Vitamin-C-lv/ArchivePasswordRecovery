@@ -451,6 +451,7 @@ $script:CurrentWorker = $null
 $script:CurrentInspection = $null
 $script:LastProgressUpdated = $null
 $script:LastProgressSnapshot = $null
+$script:DeviceSelectionWarning = ''
 $script:UiElapsedRunId = ''
 $script:UiElapsedRunStartedUtc = $null
 $script:UiElapsedFrozenSeconds = $null
@@ -498,12 +499,14 @@ function Add-LocalizedComboChoice {
     param(
         [Parameter(Mandatory = $true)]$Control,
         [Parameter(Mandatory = $true)][string]$DisplayText,
-        [Parameter(Mandatory = $true)][string]$Value
+        [Parameter(Mandatory = $true)][string]$Value,
+        $Metadata = $null
     )
 
     $item = New-Object System.Windows.Controls.ComboBoxItem
     $item.Content = $DisplayText
     $item.Tag = $Value
+    if ($null -ne $Metadata) { $item.DataContext = $Metadata }
     [void]$Control.Items.Add($item)
     return $item
 }
@@ -537,6 +540,44 @@ function Set-SelectedValue {
         }
     }
     return $false
+}
+
+function Get-UiObjectPropertyValue {
+    param(
+        $Object,
+        [Parameter(Mandatory = $true)][string]$Name,
+        $Default = $null
+    )
+
+    if ($null -eq $Object) { return $Default }
+    $property = $Object.PSObject.Properties[$Name]
+    if ($null -ne $property) { return $property.Value }
+    return $Default
+}
+
+function Get-SelectedDeviceJobSelection {
+    $selectedItem = $controls.DeviceBox.SelectedItem
+    $metadata = if ($selectedItem -is [System.Windows.Controls.ComboBoxItem]) { $selectedItem.DataContext } else { $null }
+    $metadataVendor = [string](Get-UiObjectPropertyValue -Object $metadata -Name 'Vendor' -Default '')
+    $metadataName = [string](Get-UiObjectPropertyValue -Object $metadata -Name 'Name' -Default '')
+    if (-not [string]::IsNullOrWhiteSpace($metadataVendor) -and -not [string]::IsNullOrWhiteSpace($metadataName)) {
+        [int]$lastDeviceId = -1
+        try { $lastDeviceId = [int](Get-UiObjectPropertyValue -Object $metadata -Name 'LastDeviceId' -Default -1) } catch { $lastDeviceId = -1 }
+        return [pscustomobject]@{
+            Preference = 'GPU'
+            SelectedGpu = [ordered]@{
+                Backend = 'HashcatOpenCL'
+                Vendor = $metadataVendor
+                Name = $metadataName
+                LastDeviceId = $lastDeviceId
+            }
+        }
+    }
+
+    return [pscustomobject]@{
+        Preference = Get-SelectedValue -Control $controls.DeviceBox
+        SelectedGpu = $null
+    }
 }
 
 function Convert-StrategyName {
@@ -622,6 +663,11 @@ function Convert-UiMessage {
         'The local recovery runtime artifact could not be created. The task was not marked as recovered.' = '无法创建本地恢复运行文件；任务不会标记为已恢复。'
         'Password recovered and verified locally.' = '密码已恢复，并已在本机验证。'
         'CPU was selected.' = '已选择 CPU。'
+        'Starting the local John Jumbo bulk CPU search.' = '正在启动本地 John Jumbo 批量 CPU 搜索。'
+        'John Jumbo is running a local bulk candidate search.' = 'John Jumbo 正在执行本地批量候选搜索。'
+        'John Jumbo reported a password and NanaZip verified it locally.' = 'John Jumbo 报告了密码，且 NanaZip 已在本机验证成功。'
+        'John Jumbo completed the local bulk candidate search without a verified password.' = 'John Jumbo 已完成本地批量候选搜索，未找到通过验证的密码。'
+        'John Jumbo had no remaining candidates in the current local coverage.' = '当前本地覆盖范围没有剩余候选，John Jumbo 未启动搜索。'
         'Starting local Hashcat GPU recovery.' = '正在启动本地 Hashcat GPU 恢复。'
         'No saved Hashcat restore file was found; restarting the current GPU stage locally.' = '未找到已保存的 Hashcat 恢复文件；将从当前 GPU 阶段重新开始。'
         'Pausing locally by saving the Hashcat session checkpoint.' = '正在保存本地 Hashcat 会话断点并暂停。'
@@ -716,6 +762,18 @@ function Convert-UiMessage {
     }
     if ($Message -match '^Requested selected local Hashcat OpenCL device: (.+)\.$') {
         return ('已选择本地 Hashcat OpenCL 设备：{0}。' -f $Matches[1])
+    }
+    if ($Message -match '^John Jumbo is searching the app-owned candidate wordlist\.$') {
+        return 'John Jumbo 正在搜索应用自有候选字典；已测试数量将在批量搜索完成后报告。'
+    }
+    if ($Message -match '^John Jumbo could not be started;') {
+        return 'John Jumbo 未能启动；已回退到 NanaZip CPU 验证路径。'
+    }
+    if ($Message -match '^The bundled John Jumbo build did not accept') {
+        return '捆绑的 John Jumbo 无法接受当前归档记录；已回退到 NanaZip CPU 验证路径。'
+    }
+    if ($Message -match '^The bundled John Jumbo launcher was not found') {
+        return '未找到捆绑的 John Jumbo 启动器；已回退到 NanaZip CPU 验证路径。'
     }
     if ($Message -match '^Local Hashcat ended with exit code (\d+) before a verified result was produced\.$') {
         return ('本地 Hashcat 在得到已验证结果前以退出代码 {0} 结束。' -f $Matches[1])
@@ -976,15 +1034,20 @@ function Update-DeviceInfo {
         })
     $backendText = if ($backendDescriptions.Count -gt 0) { $backendDescriptions -join '；' } else { '当前本地后端未初始化可用 GPU' }
     $windowsText = if ($gpuDescriptions.Count -gt 0) { $gpuDescriptions -join '；' } else { 'Windows 未报告 GPU' }
-    $availableVendors = New-Object 'System.Collections.Generic.List[string]'
-    [void]$availableVendors.Add('CPU')
-    foreach ($vendor in @(
-            @($devices | Where-Object { $_.Kind -eq 'GPU' } | Select-Object -ExpandProperty Vendor) +
-            @($backend.Devices | Select-Object -ExpandProperty Vendor)
-        ) | Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_) } | Select-Object -Unique) {
-        [void]$availableVendors.Add(([string]$vendor + ' GPU'))
+    $availableDevices = New-Object 'System.Collections.Generic.List[string]'
+    [void]$availableDevices.Add('CPU')
+    foreach ($device in @($backend.Devices | Sort-Object @{ Expression = {
+                    if ([string]$_.Vendor -eq 'NVIDIA') { 0 }
+                    elseif ([string]$_.Vendor -eq 'AMD') { 1 }
+                    else { 2 }
+                }
+            }, @{ Expression = { [int]$_.DeviceId } }, Name)) {
+        [void]$availableDevices.Add(('{0} (#{1})' -f $device.Name, $device.DeviceId))
     }
-    $controls.DeviceInfoText.Text = '可用：' + ($availableVendors.ToArray() -join ' · ')
+    $controls.DeviceInfoText.Text = '可用：' + ($availableDevices.ToArray() -join ' · ')
+    if (-not [string]::IsNullOrWhiteSpace([string]$script:DeviceSelectionWarning)) {
+        $controls.DeviceInfoText.Text += ' · ' + [string]$script:DeviceSelectionWarning
+    }
     $controls.AdvancedDeviceInfoText.Text = ('详细设备信息：Windows 设备：{0}。Hashcat 设备：{1}。NanaZip CPU 验证器已就绪。GPU 后端：{2}。' -f $windowsText, $backendText, (Convert-UiMessage -Message $backend.Message))
 }
 
@@ -993,15 +1056,79 @@ function Populate-DeviceChoices {
     [void](Add-LocalizedComboChoice -Control $controls.DeviceBox -DisplayText 'Auto（推荐）' -Value 'Auto')
     [void](Add-LocalizedComboChoice -Control $controls.DeviceBox -DisplayText '仅使用 CPU' -Value 'CPU')
     $backend = Get-LocalGpuBackendStatus -Format 'Unknown' -ProjectRoot $projectRoot
-    $vendors = @(
-        @((Get-LocalComputeDevices) | Where-Object { $_.Kind -eq 'GPU' } | Select-Object -ExpandProperty Vendor) +
-        @($backend.Devices | Select-Object -ExpandProperty Vendor)
-    ) | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | Select-Object -Unique
-    foreach ($vendor in $vendors) {
-        [void](Add-LocalizedComboChoice -Control $controls.DeviceBox -DisplayText ($vendor + ' 显卡') -Value ($vendor + ' GPU'))
+    $devices = @($backend.Devices | Where-Object { [string]$_.Type -eq 'GPU' } | Sort-Object @{ Expression = {
+                    if ([string]$_.Vendor -eq 'NVIDIA') { 0 }
+                    elseif ([string]$_.Vendor -eq 'AMD') { 1 }
+                    else { 2 }
+                }
+            }, @{ Expression = { [int]$_.DeviceId } }, Name)
+    foreach ($device in $devices) {
+        $metadata = [pscustomobject]@{
+            Backend = 'HashcatOpenCL'
+            Vendor = [string]$device.Vendor
+            Name = [string]$device.Name
+            LastDeviceId = [int]$device.DeviceId
+        }
+        [void](Add-LocalizedComboChoice -Control $controls.DeviceBox -DisplayText ('{0} (#{1})' -f $device.Name, $device.DeviceId) -Value ('GPU:{0}' -f $device.DeviceId) -Metadata $metadata)
     }
     [void](Set-SelectedValue -Control $controls.DeviceBox -Value 'Auto')
     Update-DeviceInfo
+}
+
+function Restore-SavedDeviceChoice {
+    param([Parameter(Mandatory = $true)]$Job)
+
+    $script:DeviceSelectionWarning = ''
+    $preference = if ($Job.PSObject.Properties.Name -contains 'DevicePreference') { [string]$Job.DevicePreference } else { 'Auto' }
+    if ([string]::IsNullOrWhiteSpace($preference)) { $preference = 'Auto' }
+
+    if ($preference -eq 'GPU') {
+        $savedGpu = if ($Job.PSObject.Properties.Name -contains 'SelectedGpu') { $Job.SelectedGpu } else { $null }
+        $savedVendor = [string](Get-UiObjectPropertyValue -Object $savedGpu -Name 'Vendor' -Default '')
+        $savedName = [string](Get-UiObjectPropertyValue -Object $savedGpu -Name 'Name' -Default '')
+        $matches = @($controls.DeviceBox.Items | Where-Object {
+                $metadata = if ($_ -is [System.Windows.Controls.ComboBoxItem]) { $_.DataContext } else { $null }
+                $metadataVendor = [string](Get-UiObjectPropertyValue -Object $metadata -Name 'Vendor' -Default '')
+                $metadataName = [string](Get-UiObjectPropertyValue -Object $metadata -Name 'Name' -Default '')
+                -not [string]::IsNullOrWhiteSpace($savedVendor) -and -not [string]::IsNullOrWhiteSpace($savedName) -and
+                [string]::Equals($metadataVendor, $savedVendor, [System.StringComparison]::Ordinal) -and
+                [string]::Equals($metadataName, $savedName, [System.StringComparison]::Ordinal)
+            })
+        if ($matches.Count -eq 1) {
+            $controls.DeviceBox.SelectedItem = $matches[0]
+            return
+        }
+        $savedLastDeviceId = Get-UiObjectPropertyValue -Object $savedGpu -Name 'LastDeviceId' -Default $null
+        if ($matches.Count -gt 1 -and $null -ne $savedLastDeviceId) {
+            [int]$lastDeviceId = -1
+            try { $lastDeviceId = [int]$savedLastDeviceId } catch { $lastDeviceId = -1 }
+            $idMatches = @($matches | Where-Object { [int](Get-UiObjectPropertyValue -Object $_.DataContext -Name 'LastDeviceId' -Default -1) -eq $lastDeviceId })
+            if ($idMatches.Count -eq 1) {
+                $controls.DeviceBox.SelectedItem = $idMatches[0]
+                return
+            }
+        }
+        [void](Set-SelectedValue -Control $controls.DeviceBox -Value 'CPU')
+        if ([string]::IsNullOrWhiteSpace($savedName)) { $savedName = '未记录设备' }
+        $script:DeviceSelectionWarning = ('保存的 GPU 不可用，已回退 CPU：' + $savedName)
+        Write-UiLog $script:DeviceSelectionWarning
+        return
+    }
+
+    if (Set-SelectedValue -Control $controls.DeviceBox -Value $preference) { return }
+
+    # Keep vendor-only preferences readable for old job files. This item is
+    # added only while opening an old task; newly created jobs always use an
+    # exact GPU identity or Auto/CPU.
+    if ($preference -match '(?i)\sGPU$') {
+        [void](Add-LocalizedComboChoice -Control $controls.DeviceBox -DisplayText ($preference + '（旧任务兼容）') -Value $preference)
+        [void](Set-SelectedValue -Control $controls.DeviceBox -Value $preference)
+        return
+    }
+
+    [void](Set-SelectedValue -Control $controls.DeviceBox -Value 'CPU')
+    $script:DeviceSelectionWarning = ('保存的设备选择无法识别，已回退 CPU：' + $preference)
+    Write-UiLog $script:DeviceSelectionWarning
 }
 
 function Get-QuickCandidateList {
@@ -1032,11 +1159,13 @@ function Get-JobFromControls {
         }
     }
     else { $null }
+    $deviceSelection = Get-SelectedDeviceJobSelection
     return [ordered]@{
-        SchemaVersion     = 4
+        SchemaVersion     = 5
         ArchivePath       = $controls.ArchivePathBox.Text.Trim()
         RecoveryLevel     = $recoveryLevel
-        DevicePreference  = Get-SelectedValue -Control $controls.DeviceBox
+        DevicePreference  = [string]$deviceSelection.Preference
+        SelectedGpu       = $deviceSelection.SelectedGpu
         QuickCandidates   = @(Get-QuickCandidateList)
         QuickCoverageRevision = 1
         QuickCoverageLegacy = $false
@@ -1700,7 +1829,7 @@ function Open-SavedJob {
         if (-not (Set-SelectedValue -Control $controls.StrategyBox -Value $savedLevel)) {
             throw '保存的任务没有有效的恢复级别。'
         }
-        [void](Set-SelectedValue -Control $controls.DeviceBox -Value ([string]$job.DevicePreference))
+        Restore-SavedDeviceChoice -Job $job
         $controls.QuickCandidatesBox.Text = (@($job.QuickCandidates) -join [Environment]::NewLine)
         $controls.TryEmptyPasswordBox.IsChecked = [bool]$job.TryEmptyPassword
         $controls.DictionaryPathBox.Text = [string]$job.DictionaryPath
@@ -1772,6 +1901,7 @@ function Update-ProgressFromDisk {
         $preparationCurrent = if ($progress.PSObject.Properties.Name -contains 'PreparationCurrent') { $progress.PreparationCurrent } else { $null }
         $preparationTotal = if ($progress.PSObject.Properties.Name -contains 'PreparationTotal') { $progress.PreparationTotal } else { $null }
         $preparationUnit = if ($progress.PSObject.Properties.Name -contains 'PreparationUnit') { [string]$progress.PreparationUnit } else { '' }
+        $johnCursorReliable = if ($progress.PSObject.Properties.Name -contains 'JohnCandidateProgressReliable') { [bool]$progress.JohnCandidateProgressReliable } else { $true }
         $overallStageName = if ($progress.PSObject.Properties.Name -contains 'OverallStageDisplayName' -and -not [string]::IsNullOrWhiteSpace([string]$progress.OverallStageDisplayName)) { [string]$progress.OverallStageDisplayName } elseif ($progress.PSObject.Properties.Name -contains 'StageName') { [string]$progress.StageName } else { '' }
         if ([string]::IsNullOrWhiteSpace($overallStageName) -and $progress.PSObject.Properties.Name -contains 'Strategy') { $overallStageName = [string]$progress.Strategy }
         [int]$overallStageNumber = 0
@@ -1880,6 +2010,20 @@ function Update-ProgressFromDisk {
         }
         else {
             '正在准备搜索范围'
+        }
+
+        if (-not $johnCursorReliable) {
+            # The overall plan can still know its shape, but it cannot turn a
+            # John bulk speed sample into a truthful current-plan cursor.
+            $overallPlanCount = 0
+            $overallProcessedCount = 0
+            $overallPercent = 0
+            $overallCandidatesTested = $null
+            $overallCandidatesRemaining = $null
+            $overallEta = $null
+            $overallEtaLow = $null
+            $overallEtaHigh = $null
+            $overallEtaReadiness = 'Unavailable'
         }
 
         if ($overallPlanCount -gt 0) {
@@ -2041,7 +2185,10 @@ function Update-ProgressFromDisk {
                 $progress.CandidatesTested
             }
             else { 0L }
-            if ($null -eq $totalValue) {
+            if (-not $johnCursorReliable) {
+                $controls.CandidatesValue.Text = 'John 批量搜索中；已测试数量将在完成后报告'
+            }
+            elseif ($null -eq $totalValue) {
                 $controls.CandidatesValue.Text = '已测试 {0} 个候选' -f (Format-LocalCount -Value $testedValue)
             }
             else {
@@ -2069,7 +2216,7 @@ function Update-ProgressFromDisk {
         }
         else { 0L }
         $total = Format-LocalCount -Value $totalValue
-        $hasKnownTotal = ($null -ne $totalValue -and [long]$totalValue -gt 0)
+        $hasKnownTotal = ($johnCursorReliable -and $null -ne $totalValue -and [long]$totalValue -gt 0)
         $invariantViolation = ($progress.PSObject.Properties.Name -contains 'ProgressInvariantViolation' -and [bool]$progress.ProgressInvariantViolation)
         $hasProgress = (-not $invariantViolation -and $progress.PSObject.Properties.Name -contains 'ProgressPercent' -and $null -ne $progress.ProgressPercent)
         $preparationHasTotal = $null -ne $preparationTotal -and [long]$preparationTotal -gt 0
@@ -2094,13 +2241,13 @@ function Update-ProgressFromDisk {
         else {
             $controls.SearchProgressBar.IsIndeterminate = $true
             $controls.SearchProgressBar.Value = 0
-            $controls.ProgressPercentValue.Text = if ($invariantViolation) { '正在同步当前搜索进度…' } elseif ($activity -ne 'RunningCoverage') { Convert-UiMessage -Message $activityMessage } elseif ($hasKnownTotal) { '正在根据当前本地速度估算进度…' } else { '当前搜索空间无法预先计算总量；总量将在执行过程中估算。' }
+            $controls.ProgressPercentValue.Text = if ($invariantViolation) { '正在同步当前搜索进度…' } elseif (-not $johnCursorReliable) { 'John 批量搜索中；已测试数量和百分比将在完成后报告。' } elseif ($activity -ne 'RunningCoverage') { Convert-UiMessage -Message $activityMessage } elseif ($hasKnownTotal) { '正在根据当前本地速度估算进度…' } else { '当前搜索空间无法预先计算总量；总量将在执行过程中估算。' }
         }
 
         $estimated = if ($progress.PSObject.Properties.Name -contains 'EstimatedRemainingSeconds') { $progress.EstimatedRemainingSeconds } else { $null }
         $worstCase = if ($progress.PSObject.Properties.Name -contains 'WorstCaseRemainingSeconds') { $progress.WorstCaseRemainingSeconds } else { $null }
         $preparationEta = if ($progress.PSObject.Properties.Name -contains 'PreparationEtaSeconds') { $progress.PreparationEtaSeconds } else { $null }
-        $etaAllowed = -not $isPreparation -and $activity -eq 'RunningCoverage' -and $hasKnownTotal -and -not $invariantViolation -and [long]$testedValue -lt [long]$totalValue -and $speed -gt 0
+        $etaAllowed = $johnCursorReliable -and -not $isPreparation -and $activity -eq 'RunningCoverage' -and $hasKnownTotal -and -not $invariantViolation -and [long]$testedValue -lt [long]$totalValue -and $speed -gt 0
         if ($isPreparation) {
             if ($null -ne $preparationEta -and [double]$preparationEta -gt 0) {
                 $controls.EstimatedRemainingValue.Text = '准备' + (Format-LocalEta -Seconds $preparationEta)
@@ -2116,6 +2263,10 @@ function Update-ProgressFromDisk {
         elseif ($etaAllowed) {
             $controls.EstimatedRemainingValue.Text = Format-LocalEta -Seconds $estimated
             $controls.WorstCaseValue.Text = Format-LocalEta -Seconds $worstCase
+        }
+        elseif (-not $johnCursorReliable) {
+            $controls.EstimatedRemainingValue.Text = 'John 批量搜索完成后更新'
+            $controls.WorstCaseValue.Text = 'John 批量搜索完成后更新'
         }
         elseif ($invariantViolation) {
             $controls.EstimatedRemainingValue.Text = '正在同步当前搜索进度…'

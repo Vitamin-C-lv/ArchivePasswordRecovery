@@ -83,7 +83,8 @@ try {
     if ($LASTEXITCODE -ne 0) { throw ('DateRange CPU Worker exited with code ' + $LASTEXITCODE) }
     $progress = Read-LocalJson -Path (Join-Path $jobDirectory 'progress.json')
     Assert-True ([string]$progress.State -eq 'Recovered') ('DateRange CPU did not recover; state=' + $progress.State + '; message=' + $progress.Message)
-    Assert-True ([string]$progress.Backend -match 'NanaZip') ('DateRange CPU selected an unexpected backend: ' + $progress.Backend)
+    Assert-True ([string]$progress.Backend -eq 'John Jumbo CPU') ('DateRange CPU selected an unexpected backend: ' + $progress.Backend)
+    Assert-True ([int]$progress.JohnProcessLaunchCount -eq 1 -and [int]$progress.NanaZipVerifierProcessLaunchCount -eq 1) 'DateRange CPU did not use one John process plus one final NanaZip verification'
     Assert-True ([string]$progress.ComputeDevice -eq 'CPU') ('DateRange CPU selected an unexpected device: ' + $progress.ComputeDevice)
     Assert-True ([string]$progress.Result.Password -ceq '19900101' -and [bool]$progress.Result.LocallyVerified) 'DateRange CPU did not return the NanaZip-verified password'
     Assert-True ([long]$progress.CoverageCandidateTotal -eq 13514) 'DateRange CPU did not preserve the formal coverage total'
