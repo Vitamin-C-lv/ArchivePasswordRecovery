@@ -78,6 +78,7 @@ $script:JohnActiveSearchMs = 0L
 $script:JohnLastOutputPath = $null
 $script:JohnLastErrorPath = $null
 $script:JohnLastSpeed = 0.0
+$script:JohnWordlistSourceMode = 'NOT_USED'
 $script:JohnPauseResume = 'NOT_VERIFIED'
 $script:JohnCandidateProgressReliable = $true
 $script:NanaZipVerifierProcessLaunchCount = 0
@@ -274,8 +275,12 @@ if ($null -ne $previous) {
 }
 $script:ActiveHashcatProcess = $null
 $script:ActiveJohnProcess = $null
-$script:JohnOutputLineOffset = 0L
-$script:JohnErrorLineOffset = 0L
+$script:JohnOutputByteOffset = 0L
+$script:JohnOutputRemainder = ''
+$script:JohnOutputDecoder = $null
+$script:JohnErrorByteOffset = 0L
+$script:JohnErrorRemainder = ''
+$script:JohnErrorDecoder = $null
 $script:ActiveGpuBatch = $null
 $script:StatusFileOffset = 0L
 $script:StatusFileRemainder = ''
@@ -1688,6 +1693,7 @@ function Publish-Progress {
         JohnArtifactMessage = [string]$script:JohnArtifactMessage
         JohnLastMessage = [string]$script:JohnLastMessage
         JohnBinaryUsed = [string]$script:JohnBinaryUsed
+        JohnWordlistSourceMode = [string]$script:JohnWordlistSourceMode
         JohnProcessLaunchCount = [int]$script:JohnProcessLaunchCount
         JohnActiveSearchMs = [long]$script:JohnActiveSearchMs
         JohnLastSpeed = if ($script:JohnLastSpeed -gt 0) { [math]::Round($script:JohnLastSpeed, 2) } else { $null }
@@ -2190,16 +2196,8 @@ function New-JohnCandidateWordlist {
         }
     }
 
-    $wordlistDirectory = Join-Path $script:RuntimeDirectory 'john'
-    New-Item -ItemType Directory -Path $wordlistDirectory -Force -ErrorAction Stop | Out-Null
-    $identity = if ($isCumulativeItem) { [string](Get-ObjectPropertyValue -Object $Item -Name 'CoverageId' -Default 'coverage') } else { 'legacy-' + [string]$Strategy }
-    $safeIdentity = [regex]::Replace($identity, '[^A-Za-z0-9_.-]', '_')
-    if ([string]::IsNullOrWhiteSpace($safeIdentity)) { $safeIdentity = 'coverage' }
-    if ($safeIdentity.Length -gt 80) { $safeIdentity = $safeIdentity.Substring(0, 80) }
-    $wordlistPath = Join-Path $wordlistDirectory ('candidates-{0}.txt' -f $safeIdentity)
-    $writer = New-Object System.IO.StreamWriter($wordlistPath, $false, (New-Object System.Text.UTF8Encoding($false)))
-    [long]$position = 0L
-
+    $paths = @()
+    $writer = $null
     try {
         $paths = @(
             if ($isCumulativeItem) { Get-PlanDictionaryPaths -Item $Item } else { [string]$job.DictionaryPath }
@@ -2207,6 +2205,44 @@ function New-JohnCandidateWordlist {
         if ($paths.Count -eq 0) {
             throw 'No local dictionary path was available for the John wordlist.'
         }
+
+        # These paths are already application-owned plaintext candidate
+        # streams. Reusing one of them is safe only from the beginning of a
+        # coverage with a single source; every other case keeps the existing
+        # materialization so filtering, encoding normalization, and ordering
+        # remain unchanged.
+        $directKinds = @('BuiltinDictionary', 'DateRange', 'CommonSymbols', 'RuleCaseVariants')
+        if ($isCumulativeItem -and $SkipCount -eq 0L -and $paths.Count -eq 1 -and $directKinds -contains $kind) {
+            $directPath = [string]$paths[0]
+            if (-not (Test-Path -LiteralPath $directPath -PathType Leaf)) {
+                throw ('The local John dictionary path is missing: ' + $directPath)
+            }
+            $knownCount = Get-ObjectPropertyValue -Object $Item -Name 'CandidateCount' -Default $null
+            if ($null -eq $knownCount) {
+                throw 'The direct John candidate stream has no planner candidate count.'
+            }
+            [long]$directCount = $knownCount
+            if ($directCount -lt 0) { throw 'The direct John candidate stream has an invalid candidate count.' }
+            $script:JohnWordlistSourceMode = 'Direct'
+            return [pscustomobject]@{
+                Supported = $true
+                Path = $directPath
+                TotalCount = $directCount
+                RemainingCount = $directCount
+                StartPosition = 0L
+                SourceMode = 'Direct'
+            }
+        }
+
+        $wordlistDirectory = Join-Path $script:RuntimeDirectory 'john'
+        New-Item -ItemType Directory -Path $wordlistDirectory -Force -ErrorAction Stop | Out-Null
+        $identity = if ($isCumulativeItem) { [string](Get-ObjectPropertyValue -Object $Item -Name 'CoverageId' -Default 'coverage') } else { 'legacy-' + [string]$Strategy }
+        $safeIdentity = [regex]::Replace($identity, '[^A-Za-z0-9_.-]', '_')
+        if ([string]::IsNullOrWhiteSpace($safeIdentity)) { $safeIdentity = 'coverage' }
+        if ($safeIdentity.Length -gt 80) { $safeIdentity = $safeIdentity.Substring(0, 80) }
+        $wordlistPath = Join-Path $wordlistDirectory ('candidates-{0}.txt' -f $safeIdentity)
+        $writer = New-Object System.IO.StreamWriter($wordlistPath, $false, (New-Object System.Text.UTF8Encoding($false)))
+        [long]$position = 0L
         $useRules = if ($isCumulativeItem) {
             $kind -in @('RulesDictionary', 'CustomRules', 'RuleAppendVariants')
         }
@@ -2242,7 +2278,7 @@ function New-JohnCandidateWordlist {
         }
     }
     finally {
-        $writer.Dispose()
+        if ($null -ne $writer) { $writer.Dispose() }
     }
 
     if ($isCumulativeItem) {
@@ -2252,12 +2288,14 @@ function New-JohnCandidateWordlist {
     elseif ($null -eq $script:TotalCandidates -or [long]$script:TotalCandidates -ne $position) {
         $script:TotalCandidates = $position
     }
+    $script:JohnWordlistSourceMode = 'Materialized'
     return [pscustomobject]@{
         Supported = $true
         Path = $wordlistPath
         TotalCount = $position
         RemainingCount = [math]::Max(0L, $position - $SkipCount)
         StartPosition = [math]::Min($position, [math]::Max(0L, $SkipCount))
+        SourceMode = 'Materialized'
     }
 }
 
@@ -2648,19 +2686,19 @@ function Import-JohnOutputFile {
     )
 
     try {
-        if (Test-Path -LiteralPath $OutputPath -PathType Leaf) {
-            $lines = [System.IO.File]::ReadAllLines($OutputPath)
-            for ($index = [int]$script:JohnOutputLineOffset; $index -lt $lines.Count; $index++) {
-                Update-JohnStatusFromLine -Line ([string]$lines[$index])
-            }
-            $script:JohnOutputLineOffset = [long]$lines.Count
+        $outputIncremental = Read-LocalTextFileIncremental -Path $OutputPath -Offset $script:JohnOutputByteOffset -Remainder $script:JohnOutputRemainder -Decoder $script:JohnOutputDecoder
+        $script:JohnOutputByteOffset = [long]$outputIncremental.Offset
+        $script:JohnOutputRemainder = [string]$outputIncremental.Remainder
+        $script:JohnOutputDecoder = $outputIncremental.Decoder
+        foreach ($line in @($outputIncremental.Lines)) {
+            Update-JohnStatusFromLine -Line ([string]$line)
         }
-        if (Test-Path -LiteralPath $ErrorPath -PathType Leaf) {
-            $errorLines = [System.IO.File]::ReadAllLines($ErrorPath)
-            for ($index = [int]$script:JohnErrorLineOffset; $index -lt $errorLines.Count; $index++) {
-                Update-JohnStatusFromLine -Line ([string]$errorLines[$index])
-            }
-            $script:JohnErrorLineOffset = [long]$errorLines.Count
+        $errorIncremental = Read-LocalTextFileIncremental -Path $ErrorPath -Offset $script:JohnErrorByteOffset -Remainder $script:JohnErrorRemainder -Decoder $script:JohnErrorDecoder
+        $script:JohnErrorByteOffset = [long]$errorIncremental.Offset
+        $script:JohnErrorRemainder = [string]$errorIncremental.Remainder
+        $script:JohnErrorDecoder = $errorIncremental.Decoder
+        foreach ($line in @($errorIncremental.Lines)) {
+            Update-JohnStatusFromLine -Line ([string]$line)
         }
     }
     catch { }
@@ -2863,56 +2901,28 @@ function Invoke-JohnCpuRecovery {
         return [pscustomobject]@{ Status = 'Unsupported'; Message = 'The bundled John Jumbo launcher was not found. NanaZip CPU verification remains the fallback.' }
     }
 
+    $artifactGroups = @(
+        if ($artifact.PSObject.Properties.Name -contains 'Groups' -and $null -ne $artifact.Groups) {
+            @($artifact.Groups)
+        }
+        else {
+            [pscustomobject]@{
+                Format = [string]$artifact.Format
+                HashPath = [string]$artifact.HashPath
+                HashRecords = @($artifact.HashRecords)
+                EncryptionType = [string]$artifact.EncryptionType
+            }
+        }
+    )
+    if ($artifactGroups.Count -eq 0) {
+        $script:JohnLastMessage = 'The local John archive artifact contained no format group; NanaZip CPU verification remains the fallback.'
+        return [pscustomobject]@{ Status = 'Unsupported'; Message = [string]$script:JohnLastMessage }
+    }
+
     $configPath = New-LocalJohnRuntimeConfig -RuntimeDirectory $script:RuntimeDirectory
     $potPath = Join-Path $script:RuntimeDirectory 'john.pot'
     $runIdText = [string]$script:RunId
-    $sessionName = if ($runIdText.Length -gt 20) { 'APR-' + $runIdText.Substring(0, 20) } else { 'APR-' + $runIdText }
-    $outputPath = Join-Path $script:RuntimeDirectory 'john-output.txt'
-    $errorPath = Join-Path $script:RuntimeDirectory 'john-stderr.txt'
-    foreach ($path in @($outputPath, $errorPath)) {
-        if ([System.IO.File]::Exists($path)) { [System.IO.File]::Delete($path) }
-    }
-
-    $arguments = @(
-        ('--config={0}' -f $configPath),
-        ('--format={0}' -f [string]$artifact.Format),
-        ('--wordlist={0}' -f [string]$wordlist.Path),
-        '--no-log',
-        ('--pot={0}' -f $potPath),
-        ('--session={0}' -f $sessionName),
-        '--progress-every=1',
-        [string]$artifact.HashPath
-    )
-    $startInfo = New-Object System.Diagnostics.ProcessStartInfo
-    $startInfo.FileName = [string]$johnPath
-    $startInfo.Arguments = (@($arguments | ForEach-Object {
-                ConvertTo-WindowsCommandLineArgument -Value ([string]$_)
-            }) -join ' ')
-    $startInfo.WorkingDirectory = $script:RuntimeDirectory
-    $startInfo.UseShellExecute = $false
-    $startInfo.CreateNoWindow = $true
-    $startInfo.RedirectStandardInput = $true
-    $startInfo.RedirectStandardOutput = $true
-    $startInfo.RedirectStandardError = $true
-
-    $process = New-Object System.Diagnostics.Process
-    $process.StartInfo = $startInfo
-    try {
-        [void]$process.Start()
-    }
-    catch {
-        $process.Dispose()
-        $script:JohnLastMessage = ('John Jumbo could not be started; NanaZip CPU verification remains the fallback. ' + $_.Exception.Message)
-        return [pscustomobject]@{ Status = 'Unsupported'; Message = ('John Jumbo could not be started; NanaZip CPU verification remains the fallback. ' + $_.Exception.Message) }
-    }
-
-    $script:JohnBinaryUsed = [string]$johnPath
-    $script:JohnProcessLaunchCount++
-    $script:JohnProcessStartedUtc = [datetime]::UtcNow
-    $script:JohnLastOutputPath = $outputPath
-    $script:JohnLastErrorPath = $errorPath
-    $script:JohnOutputLineOffset = 0L
-    $script:JohnErrorLineOffset = 0L
+    $sessionNameBase = if ($runIdText.Length -gt 20) { 'APR-' + $runIdText.Substring(0, 20) } else { 'APR-' + $runIdText }
     $script:JohnCandidateProgressReliable = $false
     $script:EngineLabel = 'CPU / John Jumbo bulk'
     $script:BackendName = 'John Jumbo CPU'
@@ -2924,120 +2934,191 @@ function Invoke-JohnCpuRecovery {
     }
     Set-WorkerActivity -Activity 'StartingJohn' -Message 'Starting the local John Jumbo bulk CPU search.'
     Publish-Progress -State 'Running' -Message 'Starting the local John Jumbo bulk CPU search; exact tested count will be reported after completion.' -Result $null
-    $script:ActiveJohnProcess = $process
-    $standardOutputTask = Start-LocalStreamPump -Reader $process.StandardOutput -OutputPath $outputPath
-    $standardErrorTask = Start-LocalStreamPump -Reader $process.StandardError -OutputPath $errorPath
-    $pauseSent = $false
-    $stopSent = $false
-    $controlRequestedUtc = $null
-    $lastStatusMessage = 'John Jumbo is searching the app-owned candidate wordlist.'
 
-    while (-not $process.HasExited) {
-        Import-JohnOutputFile -OutputPath $outputPath -ErrorPath $errorPath
-        if (Test-Path -LiteralPath $stopPath -PathType Leaf) {
-            if (-not $stopSent) {
-                try {
-                    $process.StandardInput.Write('q')
-                    $process.StandardInput.Flush()
-                }
-                catch { if (-not $process.HasExited) { $process.Kill() } }
-                $stopSent = $true
-                $controlRequestedUtc = [datetime]::UtcNow
-                $lastStatusMessage = 'Stopping John Jumbo. Current CPU bulk coverage remains resumable from its saved cursor.'
-                Set-WorkerActivity -Activity 'Stopping' -Message $lastStatusMessage
-                Publish-Progress -State 'Stopping' -Message $lastStatusMessage -Result $null
-            }
+    $groupNumber = 0
+    $unsupportedGroup = $false
+    $rejectedCandidate = $false
+    foreach ($artifactGroup in $artifactGroups) {
+        $groupNumber++
+        $outputPath = Join-Path $script:RuntimeDirectory 'john-output.txt'
+        $errorPath = Join-Path $script:RuntimeDirectory 'john-stderr.txt'
+        foreach ($path in @($outputPath, $errorPath)) {
+            if ([System.IO.File]::Exists($path)) { [System.IO.File]::Delete($path) }
         }
-        elseif (Test-Path -LiteralPath $pausePath -PathType Leaf) {
-            if (-not $pauseSent) {
-                try {
-                    $process.StandardInput.Write('q')
-                    $process.StandardInput.Flush()
-                    $pauseSent = $true
+
+        $sessionName = $sessionNameBase
+        if ($artifactGroups.Count -gt 1) { $sessionName = $sessionNameBase + '-g' + [string]$groupNumber }
+        $arguments = @(
+            ('--config={0}' -f $configPath),
+            ('--format={0}' -f [string]$artifactGroup.Format),
+            ('--wordlist={0}' -f [string]$wordlist.Path),
+            '--no-log',
+            ('--pot={0}' -f $potPath),
+            ('--session={0}' -f $sessionName),
+            '--progress-every=1',
+            [string]$artifactGroup.HashPath
+        )
+        $startInfo = New-Object System.Diagnostics.ProcessStartInfo
+        $startInfo.FileName = [string]$johnPath
+        $startInfo.Arguments = (@($arguments | ForEach-Object {
+                    ConvertTo-WindowsCommandLineArgument -Value ([string]$_)
+                }) -join ' ')
+        $startInfo.WorkingDirectory = $script:RuntimeDirectory
+        $startInfo.UseShellExecute = $false
+        $startInfo.CreateNoWindow = $true
+        $startInfo.RedirectStandardInput = $true
+        $startInfo.RedirectStandardOutput = $true
+        $startInfo.RedirectStandardError = $true
+
+        $process = New-Object System.Diagnostics.Process
+        $process.StartInfo = $startInfo
+        try {
+            [void]$process.Start()
+        }
+        catch {
+            $process.Dispose()
+            $script:JohnLastMessage = ('John Jumbo could not be started; NanaZip CPU verification remains the fallback. ' + $_.Exception.Message)
+            return [pscustomobject]@{ Status = 'Unsupported'; Message = ('John Jumbo could not be started; NanaZip CPU verification remains the fallback. ' + $_.Exception.Message) }
+        }
+
+        $script:JohnBinaryUsed = [string]$johnPath
+        $script:JohnProcessLaunchCount++
+        $script:JohnProcessStartedUtc = [datetime]::UtcNow
+        $script:JohnLastOutputPath = $outputPath
+        $script:JohnLastErrorPath = $errorPath
+        $script:JohnOutputByteOffset = 0L
+        $script:JohnOutputRemainder = ''
+        $script:JohnOutputDecoder = $null
+        $script:JohnErrorByteOffset = 0L
+        $script:JohnErrorRemainder = ''
+        $script:JohnErrorDecoder = $null
+        $script:ActiveJohnProcess = $process
+        $standardOutputTask = Start-LocalStreamPump -Reader $process.StandardOutput -OutputPath $outputPath
+        $standardErrorTask = Start-LocalStreamPump -Reader $process.StandardError -OutputPath $errorPath
+        $pauseSent = $false
+        $stopSent = $false
+        $controlRequestedUtc = $null
+        $lastStatusMessage = if ($artifactGroups.Count -gt 1) {
+            'John Jumbo is searching one local archive record format at a time.'
+        }
+        else {
+            'John Jumbo is searching the app-owned candidate wordlist.'
+        }
+
+        while (-not $process.HasExited) {
+            Import-JohnOutputFile -OutputPath $outputPath -ErrorPath $errorPath
+            if (Test-Path -LiteralPath $stopPath -PathType Leaf) {
+                if (-not $stopSent) {
+                    try {
+                        $process.StandardInput.Write('q')
+                        $process.StandardInput.Flush()
+                    }
+                    catch { if (-not $process.HasExited) { $process.Kill() } }
+                    $stopSent = $true
                     $controlRequestedUtc = [datetime]::UtcNow
-                    $script:JohnPauseResume = 'UNSUPPORTED'
-                    $lastStatusMessage = 'John Jumbo 已停止当前批处理；当前版本不宣称可恢复其内部进度，继续时从本覆盖的已知游标重新开始。'
-                    Set-WorkerActivity -Activity 'Pausing' -Message $lastStatusMessage
-                    Publish-Progress -State 'Pausing' -Message $lastStatusMessage -Result $null
-                }
-                catch {
-                    if (-not $process.HasExited) { $process.Kill() }
-                    $script:TerminalState = 'Failed'
-                    Publish-Progress -State 'Failed' -Message ('John Jumbo could not stop for a local pause: ' + $_.Exception.Message) -Result $null
-                    return [pscustomobject]@{ Status = 'Failed'; Message = $_.Exception.Message }
+                    $lastStatusMessage = 'Stopping John Jumbo. Current CPU bulk coverage remains resumable from its saved cursor.'
+                    Set-WorkerActivity -Activity 'Stopping' -Message $lastStatusMessage
+                    Publish-Progress -State 'Stopping' -Message $lastStatusMessage -Result $null
                 }
             }
-        }
-
-        if (($stopSent -or $pauseSent) -and -not $process.HasExited -and
-            $null -ne $controlRequestedUtc -and ([datetime]::UtcNow - $controlRequestedUtc).TotalSeconds -ge 8) {
-            try { $process.Kill() } catch { }
-        }
-        if (-not $stopSent -and -not $pauseSent -and
-            ([datetime]::UtcNow - $script:LastPublishUtc).TotalMilliseconds -ge 500) {
-            Publish-Progress -State 'Running' -Message $lastStatusMessage -Result $null -BackendSpeed $script:JohnLastSpeed
-        }
-        Start-Sleep -Milliseconds 200
-    }
-
-    $process.WaitForExit()
-    $processExitCode = $process.ExitCode
-    $searchStartedUtc = if ($null -ne $script:JohnProcessStartedUtc) { $script:JohnProcessStartedUtc } else { [datetime]::UtcNow }
-    $script:JohnActiveSearchMs += [long](([datetime]::UtcNow - $searchStartedUtc).TotalMilliseconds)
-    try {
-        if (-not $standardOutputTask.Wait(5000)) { [void]$standardOutputTask.Wait(1000) }
-        if (-not $standardErrorTask.Wait(5000)) { [void]$standardErrorTask.Wait(1000) }
-    }
-    catch { }
-    Import-JohnOutputFile -OutputPath $outputPath -ErrorPath $errorPath
-    $script:ActiveJohnProcess = $null
-    $process.Dispose()
-
-    if ($stopSent) {
-        $script:TerminalState = 'Stopped'
-        Set-WorkerActivity -Activity 'Stopped' -Message 'Stopped by the user. John CPU coverage will restart from its last known cursor when resumed.'
-        Publish-Progress -State 'Stopped' -Message 'Stopped by the user. John CPU coverage will restart from its last known cursor when resumed.' -Result $null
-        return [pscustomobject]@{ Status = 'Stopped'; Message = 'Stopped by user.' }
-    }
-    if ($pauseSent) {
-        $script:TerminalState = 'Paused'
-        Publish-Progress -State 'Paused' -Message $lastStatusMessage -Result $null
-        return [pscustomobject]@{ Status = 'Paused'; Message = $lastStatusMessage }
-    }
-
-    $candidate = Get-JohnRecoveredPassword -PotPath $potPath -Artifact $artifact
-    if ($null -ne $candidate) {
-        $script:NanaZipVerifierProcessLaunchCount++
-        $attempt = Test-ArchivePassword -ArchivePath ([string]$job.ArchivePath) -Password $candidate -SevenZip $SevenZip
-        if ($attempt.IsValid) {
-            $script:JohnLastMessage = 'John Jumbo reported a password and NanaZip verified it locally.'
-            $script:TerminalState = 'Recovered'
-            $result = [ordered]@{
-                Password = $candidate
-                LocallyVerified = $true
-                Verification = 'NanaZip 7z t returned exit code 0 for the password reported by John Jumbo.'
-                VerifiedAtUtc = [datetime]::UtcNow.ToString('o')
+            elseif (Test-Path -LiteralPath $pausePath -PathType Leaf) {
+                if (-not $pauseSent) {
+                    try {
+                        $process.StandardInput.Write('q')
+                        $process.StandardInput.Flush()
+                        $pauseSent = $true
+                        $controlRequestedUtc = [datetime]::UtcNow
+                        $script:JohnPauseResume = 'UNSUPPORTED'
+                        $lastStatusMessage = 'John Jumbo 已停止当前批处理；当前版本不宣称可恢复其内部进度，继续时从本覆盖的已知游标重新开始。'
+                        Set-WorkerActivity -Activity 'Pausing' -Message $lastStatusMessage
+                        Publish-Progress -State 'Pausing' -Message $lastStatusMessage -Result $null
+                    }
+                    catch {
+                        if (-not $process.HasExited) { $process.Kill() }
+                        $script:TerminalState = 'Failed'
+                        Publish-Progress -State 'Failed' -Message ('John Jumbo could not stop for a local pause: ' + $_.Exception.Message) -Result $null
+                        return [pscustomobject]@{ Status = 'Failed'; Message = $_.Exception.Message }
+                    }
+                }
             }
-            Set-WorkerActivity -Activity 'Recovered' -Message 'John Jumbo reported a password and NanaZip verified it locally.'
-            Publish-Progress -State 'Recovered' -Message 'John Jumbo reported a password and NanaZip verified it locally.' -Result $result
-            return [pscustomobject]@{ Status = 'Recovered'; Message = 'Password recovered and verified.' }
+
+            if (($stopSent -or $pauseSent) -and -not $process.HasExited -and
+                $null -ne $controlRequestedUtc -and ([datetime]::UtcNow - $controlRequestedUtc).TotalSeconds -ge 8) {
+                try { $process.Kill() } catch { }
+            }
+            if (-not $stopSent -and -not $pauseSent -and
+                ([datetime]::UtcNow - $script:LastPublishUtc).TotalMilliseconds -ge 500) {
+                Publish-Progress -State 'Running' -Message $lastStatusMessage -Result $null -BackendSpeed $script:JohnLastSpeed
+            }
+            Start-Sleep -Milliseconds 200
         }
+
+        $process.WaitForExit()
+        $processExitCode = $process.ExitCode
+        $searchStartedUtc = if ($null -ne $script:JohnProcessStartedUtc) { $script:JohnProcessStartedUtc } else { [datetime]::UtcNow }
+        $script:JohnActiveSearchMs += [long](([datetime]::UtcNow - $searchStartedUtc).TotalMilliseconds)
+        try {
+            if (-not $standardOutputTask.Wait(5000)) { [void]$standardOutputTask.Wait(1000) }
+            if (-not $standardErrorTask.Wait(5000)) { [void]$standardErrorTask.Wait(1000) }
+        }
+        catch { }
+        Import-JohnOutputFile -OutputPath $outputPath -ErrorPath $errorPath
+        $script:ActiveJohnProcess = $null
+        $process.Dispose()
+
+        if ($stopSent) {
+            $script:TerminalState = 'Stopped'
+            Set-WorkerActivity -Activity 'Stopped' -Message 'Stopped by the user. John CPU coverage will restart from its last known cursor when resumed.'
+            Publish-Progress -State 'Stopped' -Message 'Stopped by the user. John CPU coverage will restart from its last known cursor when resumed.' -Result $null
+            return [pscustomobject]@{ Status = 'Stopped'; Message = 'Stopped by user.' }
+        }
+        if ($pauseSent) {
+            $script:TerminalState = 'Paused'
+            Publish-Progress -State 'Paused' -Message $lastStatusMessage -Result $null
+            return [pscustomobject]@{ Status = 'Paused'; Message = $lastStatusMessage }
+        }
+
+        $candidate = Get-JohnRecoveredPassword -PotPath $potPath -Artifact $artifactGroup
+        if ($null -ne $candidate) {
+            $script:NanaZipVerifierProcessLaunchCount++
+            $attempt = Test-ArchivePassword -ArchivePath ([string]$job.ArchivePath) -Password $candidate -SevenZip $SevenZip
+            if ($attempt.IsValid) {
+                $script:JohnLastMessage = 'John Jumbo reported a password and NanaZip verified it locally.'
+                $script:TerminalState = 'Recovered'
+                $result = [ordered]@{
+                    Password = $candidate
+                    LocallyVerified = $true
+                    Verification = 'NanaZip 7z t returned exit code 0 for the password reported by John Jumbo.'
+                    VerifiedAtUtc = [datetime]::UtcNow.ToString('o')
+                }
+                Set-WorkerActivity -Activity 'Recovered' -Message 'John Jumbo reported a password and NanaZip verified it locally.'
+                Publish-Progress -State 'Recovered' -Message 'John Jumbo reported a password and NanaZip verified it locally.' -Result $result
+                return [pscustomobject]@{ Status = 'Recovered'; Message = 'Password recovered and verified.' }
+            }
+            $rejectedCandidate = $true
+        }
+
+        $diagnostic = ''
+        foreach ($path in @($outputPath, $errorPath)) {
+            if (Test-Path -LiteralPath $path -PathType Leaf) {
+                try { $diagnostic += "`n" + ([string]::Join("`n", [System.IO.File]::ReadAllLines($path))) } catch { }
+            }
+        }
+        if ($processExitCode -ne 0 -or $diagnostic -match '(?i)no password hashes loaded|unknown ciphertext|format.*(not found|unknown)|invalid.*format|error:') {
+            $unsupportedGroup = $true
+            $script:JohnCandidateProgressReliable = $true
+            $script:JohnLastMessage = 'The bundled John Jumbo build did not accept one extracted archive record format; NanaZip CPU verification remains the fallback.'
+        }
+    }
+
+    if ($rejectedCandidate) {
         $script:TerminalState = 'Failed'
         Set-WorkerActivity -Activity 'Failed' -Message 'John Jumbo reported a candidate, but NanaZip did not verify it.'
         Publish-Progress -State 'Failed' -Message 'John Jumbo reported a candidate, but NanaZip did not verify it. The task was not marked as recovered.' -Result $null
         return [pscustomobject]@{ Status = 'Failed'; Message = 'NanaZip rejected the John candidate.' }
     }
-
-    $diagnostic = ''
-    foreach ($path in @($outputPath, $errorPath)) {
-        if (Test-Path -LiteralPath $path -PathType Leaf) {
-            try { $diagnostic += "`n" + ([string]::Join("`n", [System.IO.File]::ReadAllLines($path))) } catch { }
-        }
-    }
-    if ($processExitCode -ne 0 -or $diagnostic -match '(?i)no password hashes loaded|unknown ciphertext|format.*(not found|unknown)|invalid.*format|error:') {
-        $script:JohnCandidateProgressReliable = $true
-        $script:JohnLastMessage = 'The bundled John Jumbo build did not accept this extracted archive record; NanaZip CPU verification remains the fallback.'
-        return [pscustomobject]@{ Status = 'Unsupported'; Message = 'The bundled John Jumbo build did not accept this extracted archive record; NanaZip CPU verification remains the fallback.' }
+    if ($unsupportedGroup) {
+        return [pscustomobject]@{ Status = 'Unsupported'; Message = [string]$script:JohnLastMessage }
     }
 
     Complete-JohnCoverage -TotalCount ([long]$wordlist.TotalCount) -StartPosition ([long]$wordlist.StartPosition)

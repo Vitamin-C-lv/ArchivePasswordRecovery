@@ -288,10 +288,10 @@ function Read-LocalJson {
     return (Get-Content -LiteralPath $Path -Raw -Encoding UTF8 | ConvertFrom-Json)
 }
 
-function Read-HashcatStatusIncremental {
+function Read-LocalTextFileIncremental {
     [CmdletBinding()]
     param(
-        [Parameter(Mandatory = $true)][string]$StatusPath,
+        [Parameter(Mandatory = $true)][string]$Path,
         [long]$Offset = 0L,
         [AllowEmptyString()][string]$Remainder = '',
         $Decoder = $null
@@ -299,7 +299,7 @@ function Read-HashcatStatusIncremental {
 
     $encoding = New-Object System.Text.UTF8Encoding($false)
     if ($null -eq $Decoder) { $Decoder = $encoding.GetDecoder() }
-    if (-not (Test-Path -LiteralPath $StatusPath -PathType Leaf)) {
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) {
         return [pscustomobject]@{ Offset = $Offset; Remainder = $Remainder; Lines = @(); Decoder = $Decoder; BytesRead = 0L }
     }
 
@@ -307,7 +307,7 @@ function Read-HashcatStatusIncremental {
     $startOffset = $Offset
     $bytesRead = 0L
     try {
-        $stream = [System.IO.File]::Open($StatusPath, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::ReadWrite)
+        $stream = [System.IO.File]::Open($Path, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::ReadWrite)
         [long]$length = $stream.Length
         if ($length -lt $Offset) {
             $Offset = 0L
@@ -1143,6 +1143,18 @@ function Resolve-HashcatGpuSelection {
     }
 }
 
+function Read-HashcatStatusIncremental {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][string]$StatusPath,
+        [long]$Offset = 0L,
+        [AllowEmptyString()][string]$Remainder = '',
+        $Decoder = $null
+    )
+
+    return Read-LocalTextFileIncremental -Path $StatusPath -Offset $Offset -Remainder $Remainder -Decoder $Decoder
+}
+
 function Get-LocalGpuBackendStatus {
     [CmdletBinding()]
     param(
@@ -1344,6 +1356,37 @@ function New-LocalJohnRuntimeConfig {
     return $configPath
 }
 
+function Get-ZipJohnRecordGroups {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][string[]]$Records
+    )
+
+    $formatOrder = New-Object 'System.Collections.Generic.List[string]'
+    $recordsByFormat = @{}
+    foreach ($record in @($Records)) {
+        $trimmed = [string]$record.Trim()
+        $format = if ($trimmed -match '\$pkzip\$') { 'PKZIP' } elseif ($trimmed -match '\$zip2\$') { 'zip' } else { '' }
+        if ([string]::IsNullOrWhiteSpace($format)) { continue }
+        if (-not $recordsByFormat.ContainsKey($format)) {
+            $recordsByFormat[$format] = New-Object 'System.Collections.Generic.List[string]'
+            [void]$formatOrder.Add($format)
+        }
+        [void]$recordsByFormat[$format].Add($trimmed)
+    }
+
+    $groups = New-Object 'System.Collections.Generic.List[object]'
+    foreach ($format in $formatOrder) {
+        $encryptionType = if ($format -eq 'PKZIP') { 'ZipCrypto' } else { 'WinZip AES' }
+        [void]$groups.Add([pscustomobject]@{
+                Format = $format
+                HashRecords = $recordsByFormat[$format].ToArray()
+                EncryptionType = $encryptionType
+            })
+    }
+    return $groups.ToArray()
+}
+
 function New-ZipJohnArtifact {
     [CmdletBinding()]
     param(
@@ -1375,17 +1418,42 @@ function New-ZipJohnArtifact {
         }
     }
 
-    $isZipCrypto = @($records | Where-Object { $_ -match '\$pkzip\$' }).Count -gt 0
-    $format = if ($isZipCrypto) { 'PKZIP' } else { 'zip' }
     $hashPath = Join-Path $JobDirectory 'john-input.hash'
-    [System.IO.File]::WriteAllLines($hashPath, $records.ToArray(), (New-Object System.Text.UTF8Encoding($false)))
+    $groups = @(Get-ZipJohnRecordGroups -Records $records.ToArray())
+    $groupArtifacts = New-Object 'System.Collections.Generic.List[object]'
+    foreach ($group in $groups) {
+        $groupHashPath = if ($groups.Count -eq 1) {
+            $hashPath
+        }
+        else {
+            Join-Path $JobDirectory ('john-input-{0}.hash' -f [string]$group.Format)
+        }
+        [System.IO.File]::WriteAllLines($groupHashPath, [string[]]$group.HashRecords, (New-Object System.Text.UTF8Encoding($false)))
+        [void]$groupArtifacts.Add([pscustomobject]@{
+                Format = [string]$group.Format
+                HashPath = $groupHashPath
+                HashRecords = @($group.HashRecords)
+                EncryptionType = [string]$group.EncryptionType
+            })
+    }
+    $primary = $null
+    for ($candidateIndex = 0; $candidateIndex -lt $groupArtifacts.Count; $candidateIndex++) {
+        $candidate = $groupArtifacts[$candidateIndex]
+        if ([string]$candidate.Format -eq 'PKZIP') {
+            $primary = $candidate
+            break
+        }
+    }
+    if ($null -eq $primary) { $primary = $groupArtifacts[0] }
+    $isMixed = $groupArtifacts.Count -gt 1
     return [pscustomobject]@{
         Supported = $true
-        Message = if ($isZipCrypto) { 'Legacy ZipCrypto recovery data was extracted locally for John Jumbo.' } else { 'WinZip AES recovery data was extracted locally for John Jumbo.' }
-        HashPath = $hashPath
+        Message = if ($isMixed) { 'ZIP recovery data was extracted locally for John Jumbo and grouped by John record format.' } else { '{0} recovery data was extracted locally for John Jumbo.' -f [string]$primary.EncryptionType }
+        HashPath = [string]$primary.HashPath
         HashRecords = @($records.ToArray())
-        Format = $format
-        EncryptionType = if ($isZipCrypto) { 'ZipCrypto' } else { 'WinZip AES' }
+        Format = [string]$primary.Format
+        EncryptionType = if ($isMixed) { 'Mixed ZIP encryption records' } else { [string]$primary.EncryptionType }
+        Groups = $groupArtifacts.ToArray()
     }
 }
 
@@ -1424,6 +1492,12 @@ function New-SevenZipJohnArtifact {
         HashRecords = @($hashLine)
         Format = '7z'
         EncryptionType = '7-Zip AES'
+        Groups = @([pscustomobject]@{
+                Format = '7z'
+                HashPath = $hashPath
+                HashRecords = @($hashLine)
+                EncryptionType = '7-Zip AES'
+            })
     }
 }
 
@@ -4719,6 +4793,7 @@ Export-ModuleMember -Function @(
     'Resolve-CoverageProgress',
     'Get-CoverageEtaSeconds',
     'Read-LocalJson',
+    'Read-LocalTextFileIncremental',
     'Read-HashcatStatusIncremental',
     'Get-ArchiveIdentity',
     'Test-ArchiveIdentityMatch',
@@ -4741,6 +4816,7 @@ Export-ModuleMember -Function @(
     'New-SevenZipHashcatArtifact',
     'New-ArchiveHashcatArtifact',
     'New-LocalJohnRuntimeConfig',
+    'Get-ZipJohnRecordGroups',
     'New-ZipJohnArtifact',
     'New-SevenZipJohnArtifact',
     'New-ArchiveJohnArtifact',
