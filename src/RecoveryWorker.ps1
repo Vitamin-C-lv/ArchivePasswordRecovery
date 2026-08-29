@@ -10,6 +10,38 @@ $ErrorActionPreference = 'Stop'
 
 Import-Module (Join-Path $PSScriptRoot 'RecoveryCore.psm1') -Force -DisableNameChecking
 
+function Enter-WorkerJobOwnership {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][string]$JobId
+    )
+
+    $safeJobId = [regex]::Replace($JobId, '[^A-Za-z0-9_.-]', '_')
+    if ([string]::IsNullOrWhiteSpace($safeJobId)) { $safeJobId = 'unknown' }
+    if ($safeJobId.Length -gt 180) { $safeJobId = $safeJobId.Substring(0, 180) }
+    $mutexName = 'Local\ArchivePasswordRecovery.Job.' + $safeJobId
+    $mutex = New-Object System.Threading.Mutex($false, $mutexName)
+    try {
+        $acquired = $false
+        try {
+            $acquired = $mutex.WaitOne(0)
+        }
+        catch [System.Threading.AbandonedMutexException] {
+            # The OS released an abandoned mutex; this Worker now owns it.
+            $acquired = $true
+        }
+        if (-not $acquired) {
+            $mutex.Dispose()
+            throw 'JOB_ALREADY_ACTIVE: another RecoveryWorker already owns this local Job.'
+        }
+        return $mutex
+    }
+    catch {
+        try { $mutex.Dispose() } catch { }
+        throw
+    }
+}
+
 $jobPath = Join-Path $JobDirectory 'job.json'
 $progressPath = Join-Path $JobDirectory 'progress.json'
 $pausePath = Join-Path $JobDirectory 'pause.flag'
@@ -24,6 +56,8 @@ $script:IsCumulativeJob = $job.PSObject.Properties.Name -contains 'RecoveryLevel
 $jobId = ''
 if ($job.PSObject.Properties.Name -contains 'JobId') { $jobId = [string]$job.JobId }
 $script:RuntimeJobId = if ([string]::IsNullOrWhiteSpace($jobId)) { [System.IO.Path]::GetFileName(([System.IO.Path]::GetFullPath($JobDirectory).TrimEnd('\'))) } else { $jobId }
+$script:JobOwnershipMutex = Enter-WorkerJobOwnership -JobId $script:RuntimeJobId
+$script:JobOwnershipAcquired = $true
 $script:RunId = [guid]::NewGuid().ToString('N')
 $script:RunStartedUtc = [datetime]::UtcNow
 $script:RuntimeDirectory = Get-RecoveryRuntimeDirectory -JobDirectory $JobDirectory -JobId $jobId -RunId $script:RunId
@@ -162,12 +196,22 @@ $script:LastConsumedBackendSpeedSampleUtc = $null
 $script:LastKnownOverallSpeed = 0.0
 $script:LastKnownOverallSpeedUtc = $null
 $script:SpeedClassProfiles = @{}
+try {
+    $loadedPerformanceProfiles = Read-PerformanceProfiles
+    foreach ($profileKey in @($loadedPerformanceProfiles.Keys)) {
+        $script:SpeedClassProfiles[[string]$profileKey] = $loadedPerformanceProfiles[$profileKey]
+    }
+}
+catch {
+    # A stale or unreadable local performance cache must never block recovery.
+}
 $script:ArchiveBackendClass = 'archive:unknown'
 $script:PreferredGpuComputeBackendClass = ''
 $script:CurrentSpeedClassKey = ''
 $script:CurrentArchiveBackendClass = ''
 $script:CurrentComputeBackendClass = ''
 $script:CurrentAttackFamily = ''
+$script:CurrentHashMode = ''
 $script:CurrentCoverageRunningStartedUtc = $null
 $script:CurrentCoverageSpeedSampleCount = 0
 $script:CurrentCoverageLastSpeedSampleUtc = $null
@@ -233,6 +277,8 @@ $script:CoveragePosition = 0L
 $script:CoverageCandidateTotal = $null
 $script:CoverageCandidatesTested = 0L
 $script:StageCoverageBaseCandidates = 0L
+$script:BatchBaseCandidates = 0L
+$script:BatchResumeBase = 0L
 $script:CurrentCoverageName = ''
 $script:ActivePlanItem = $null
 $script:RequestedCoverageIds = if ($Resume -and $null -ne $previous -and $previous.PSObject.Properties.Name -contains 'RequestedCoverage') {
@@ -581,6 +627,21 @@ function Get-WorkerPlanSpeedClassMetadata {
         }
     }
 
+    $hashcatBackend = [string](Get-ObjectPropertyValue -Object $Item -Name 'HashcatBackend' -Default '')
+    if ($null -ne $Engine) {
+        $hashcatBackend = [string](Get-ObjectPropertyValue -Object $Engine -Name 'Backend' -Default $hashcatBackend)
+    }
+    elseif ([string]::IsNullOrWhiteSpace($hashcatBackend)) {
+        $hashcatBackend = [string]$script:BackendName
+    }
+    $hashMode = [string](Get-ObjectPropertyValue -Object $Item -Name 'HashMode' -Default '')
+    if ($null -ne $Artifact) {
+        $hashMode = [string](Get-ObjectPropertyValue -Object $Artifact -Name 'HashMode' -Default $hashMode)
+    }
+    elseif ([string]::IsNullOrWhiteSpace($hashMode)) {
+        $hashMode = [string]$script:CurrentHashMode
+    }
+
     $key = if (-not [string]::IsNullOrWhiteSpace($existingKey) -and $null -eq $Engine -and $null -eq $Artifact) {
         $existingKey
     }
@@ -592,6 +653,8 @@ function Get-WorkerPlanSpeedClassMetadata {
         ArchiveBackendClass = $archiveClass
         ComputeBackendClass = $computeClass
         AttackFamily        = $attackFamily
+        HashcatBackend      = $hashcatBackend
+        HashMode            = $hashMode
     }
 }
 
@@ -613,10 +676,13 @@ function Set-WorkerCoverageSpeedClass {
     $Item | Add-Member -NotePropertyName ArchiveBackendClass -NotePropertyValue ([string]$metadata.ArchiveBackendClass) -Force
     $Item | Add-Member -NotePropertyName ComputeBackendClass -NotePropertyValue ([string]$metadata.ComputeBackendClass) -Force
     $Item | Add-Member -NotePropertyName AttackFamily -NotePropertyValue ([string]$metadata.AttackFamily) -Force
+    $Item | Add-Member -NotePropertyName HashcatBackend -NotePropertyValue ([string]$metadata.HashcatBackend) -Force
+    $Item | Add-Member -NotePropertyName HashMode -NotePropertyValue ([string]$metadata.HashMode) -Force
     $script:CurrentSpeedClassKey = [string]$metadata.SpeedClassKey
     $script:CurrentArchiveBackendClass = [string]$metadata.ArchiveBackendClass
     $script:CurrentComputeBackendClass = [string]$metadata.ComputeBackendClass
     $script:CurrentAttackFamily = [string]$metadata.AttackFamily
+    $script:CurrentHashMode = [string]$metadata.HashMode
     if ($metadata.ComputeBackendClass -like 'gpu:*') {
         $script:PreferredGpuComputeBackendClass = [string]$metadata.ComputeBackendClass
     }
@@ -639,13 +705,32 @@ function Update-WorkerSpeedClassProfile {
             ArchiveBackendClass = $script:CurrentArchiveBackendClass
             ComputeBackendClass = $script:CurrentComputeBackendClass
             AttackFamily        = $script:CurrentAttackFamily
+            HashcatBackend      = [string]$script:BackendName
+            HashMode            = [string]$script:CurrentHashMode
             SampleCount         = 0
             SmoothedSpeed       = 0.0
+            HashcatStartupMs    = $null
             LastSampleUtc       = $null
             IsCalibrated         = $false
+            IsHistorical        = $false
+            HistoricalSampleCount = 0
+            LiveSampleCount     = 0
         }
     }
     [int]$profile.SampleCount = [int]$profile.SampleCount + 1
+    if ($profile.PSObject.Properties.Name -notcontains 'LiveSampleCount') {
+        $profile | Add-Member -NotePropertyName LiveSampleCount -NotePropertyValue 0 -Force
+    }
+    [int]$profile.LiveSampleCount = [int]$profile.LiveSampleCount + 1
+    if ($profile.PSObject.Properties.Name -notcontains 'HistoricalSampleCount') {
+        $profile | Add-Member -NotePropertyName HistoricalSampleCount -NotePropertyValue 0 -Force
+    }
+    $profile.IsHistorical = $false
+    $profile.HashcatBackend = [string]$script:BackendName
+    $profile.HashMode = [string]$script:CurrentHashMode
+    if ($script:HashcatStartupSamples -gt 0) {
+        $profile.HashcatStartupMs = [math]::Round($script:HashcatStartupMsTotal / [double]$script:HashcatStartupSamples, 1)
+    }
     [double]$profile.SmoothedSpeed = if ([double]$profile.SmoothedSpeed -le 0) {
         $ObservedSpeed
     }
@@ -659,7 +744,7 @@ function Update-WorkerSpeedClassProfile {
     if ($null -ne $script:CurrentCoverageRunningStartedUtc) {
         $runningLongEnough = ($SampleUtc.ToUniversalTime() - $script:CurrentCoverageRunningStartedUtc.ToUniversalTime()).TotalSeconds -ge 1
     }
-    $profile.IsCalibrated = [int]$profile.SampleCount -ge 2 -or $runningLongEnough
+    $profile.IsCalibrated = [int]$profile.LiveSampleCount -ge 2 -or $runningLongEnough
     $script:SpeedClassProfiles[$script:CurrentSpeedClassKey] = $profile
     if ($script:CurrentComputeBackendClass -like 'gpu:*') {
         if ($script:ConservativeObservedGpuSpeed -le 0) {
@@ -703,6 +788,21 @@ function Get-WorkerOverallPlanItems {
             $candidateCount = $script:OverallCoverageTotals[$coverageId]
         }
         $speedClass = Get-WorkerPlanSpeedClassMetadata -Item $item
+        # Built-in GPU-compatible coverage is materialized into the same
+        # dictionary execution family. Reflect that stable execution class in
+        # the plan before the first live sample so a persisted profile can
+        # seed Preliminary ETA for the work that will actually run.
+        $canUseMaterializedFamily = $false
+        if ([bool](Get-ObjectPropertyValue -Object $item -Name 'GpuSupported' -Default $false) -and
+            (Test-BuiltinGpuBatchItem -Item $item) -and
+            [string](Get-ObjectPropertyValue -Object $job -Name 'DevicePreference' -Default 'Auto') -ne 'CPU' -and
+            -not ([string]$speedClass.ComputeBackendClass -eq 'cpu')) {
+            $canUseMaterializedFamily = $true
+        }
+        if ($canUseMaterializedFamily -and [string]::IsNullOrWhiteSpace([string](Get-ObjectPropertyValue -Object $item -Name 'AttackFamily' -Default ''))) {
+            $speedClass.AttackFamily = 'MaterializedDictionary'
+            $speedClass.SpeedClassKey = '{0}|{1}|{2}' -f $speedClass.ArchiveBackendClass, $speedClass.ComputeBackendClass, $speedClass.AttackFamily
+        }
         [void]$items.Add([pscustomobject]@{
                 CoverageId          = $coverageId
                 CandidateCount       = $candidateCount
@@ -710,6 +810,8 @@ function Get-WorkerOverallPlanItems {
                 ArchiveBackendClass  = [string]$speedClass.ArchiveBackendClass
                 ComputeBackendClass  = [string]$speedClass.ComputeBackendClass
                 AttackFamily         = [string]$speedClass.AttackFamily
+                HashcatBackend       = [string]$speedClass.HashcatBackend
+                HashMode             = [string]$speedClass.HashMode
             })
     }
     return $items.ToArray()
@@ -1129,6 +1231,8 @@ function Get-WorkerOverallFlowSnapshot {
             PlanEtaPlanIdentity = $planEtaReadiness.PlanEtaPlanIdentity
             StructureChanged = $planEtaReadiness.StructureChanged
             UnestimatedCoverageCount = $planEta.UnestimatedCoverageCount
+            UsedHistoricalProfile = [bool]$planEta.UsedHistoricalProfile
+            HistoricalProfileCount = [int]$planEta.HistoricalProfileCount
         }
     }
     $overallParameters = @{
@@ -1181,6 +1285,8 @@ function Get-WorkerOverallFlowSnapshot {
     $snapshot | Add-Member -NotePropertyName LastValidPlanEtaUtc -NotePropertyValue $(if ($null -ne $script:LastValidPlanEtaUtc) { $script:LastValidPlanEtaUtc.ToUniversalTime().ToString('o') } else { $null }) -Force
     $snapshot | Add-Member -NotePropertyName PlanEtaAdjustmentReason -NotePropertyValue ([string]$(if ($null -ne $planEtaDisplay) { $planEtaDisplay.PlanEtaAdjustmentReason } else { '' })) -Force
     $snapshot | Add-Member -NotePropertyName UnestimatedCoverageCount -NotePropertyValue ([int]$(if ($null -ne $planEta) { $planEta.UnestimatedCoverageCount } else { 0 })) -Force
+    $snapshot | Add-Member -NotePropertyName UsedHistoricalProfile -NotePropertyValue ([bool]$(if ($null -ne $planEta) { $planEta.UsedHistoricalProfile } else { $false })) -Force
+    $snapshot | Add-Member -NotePropertyName HistoricalProfileCount -NotePropertyValue ([int]$(if ($null -ne $planEta) { $planEta.HistoricalProfileCount } else { 0 })) -Force
     $snapshot | Add-Member -NotePropertyName LastKnownOverallSpeed -NotePropertyValue $recordLastKnownOverallSpeed -Force
     $snapshot | Add-Member -NotePropertyName LastKnownOverallSpeedUtc -NotePropertyValue $recordLastKnownOverallSpeedUtc -Force
     $snapshot | Add-Member -NotePropertyName OverallSpeedIsRecent -NotePropertyValue $overallSpeedIsRecent -Force
@@ -1260,6 +1366,21 @@ function Update-EffectiveSpeed {
     $script:LastMetricCandidates = $script:CandidatesTested
 }
 
+function Save-WorkerPerformanceProfiles {
+    [CmdletBinding()]
+    param()
+
+    try {
+        # Profiles are written once when this Worker exits, not on the
+        # progress publish cadence. The cache contains only speed-class data.
+        Save-PerformanceProfiles -Profiles $script:SpeedClassProfiles | Out-Null
+    }
+    catch {
+        # Performance history is an optional ETA seed and must never affect
+        # the recovery result or terminal state.
+    }
+}
+
 function Save-CoverageState {
     [CmdletBinding()]
     param()
@@ -1326,6 +1447,7 @@ function Complete-CoverageItem {
     $script:CurrentArchiveBackendClass = ''
     $script:CurrentComputeBackendClass = ''
     $script:CurrentAttackFamily = ''
+    $script:CurrentHashMode = ''
     $script:CurrentCoverageRunningStartedUtc = $null
     $script:CurrentCoverageSpeedSampleCount = 0
     $script:CurrentCoverageLastSpeedSampleUtc = $null
@@ -1531,8 +1653,11 @@ function Publish-Progress {
         GeneratedDictionaryPreparationMs = [long]$script:GeneratedDictionaryPreparationMs
         DerivedDictionaryPreparationMs = [long]$script:DerivedDictionaryPreparationMs
         BuiltinBatchPreparationMs = [long]$script:BuiltinBatchPreparationMs
+        PreparationMs = [long]$script:GeneratedDictionaryPreparationMs + [long]$script:DerivedDictionaryPreparationMs + [long]$script:BuiltinBatchPreparationMs
+        GpuSearchMs = [long]$script:HashcatActiveSearchMs
         CoverageTransitionCount = [int]$script:CoverageTransitionCount
         RunElapsedMs = [long](([datetime]::UtcNow - $script:RunStartedUtc).TotalMilliseconds)
+        TotalElapsedMs = [long](([datetime]::UtcNow - $script:RunStartedUtc).TotalMilliseconds)
         ErrorCode         = $script:ErrorCode
         ErrorFunction     = $script:ErrorFunction
         ErrorArtifactType = $script:ErrorArtifactType
@@ -1594,6 +1719,8 @@ function Publish-Progress {
         LastValidPlanEtaUtc = $overallFlow.LastValidPlanEtaUtc
         PlanEtaAdjustmentReason = [string]$overallFlow.PlanEtaAdjustmentReason
         UnestimatedCoverageCount = [int]$overallFlow.UnestimatedCoverageCount
+        UsedHistoricalProfile = [bool]$overallFlow.UsedHistoricalProfile
+        HistoricalProfileCount = [int]$overallFlow.HistoricalProfileCount
         LastKnownOverallSpeed = $overallFlow.LastKnownOverallSpeed
         LastKnownOverallSpeedUtc = $overallFlow.LastKnownOverallSpeedUtc
         OverallSpeedIsRecent = [bool]$overallFlow.OverallSpeedIsRecent
@@ -1701,6 +1828,136 @@ function Stop-ActiveHashcatProcess {
     finally {
         $script:ActiveHashcatProcess = $null
     }
+}
+
+function Get-WorkerKnownCandidateCount {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]$Item
+    )
+
+    $value = Get-ObjectPropertyValue -Object $Item -Name 'CandidateCount' -Default $null
+    $coverageId = [string](Get-ObjectPropertyValue -Object $Item -Name 'CoverageId' -Default '')
+    if ($null -eq $value -and -not [string]::IsNullOrWhiteSpace($coverageId) -and $script:OverallCoverageTotals.ContainsKey($coverageId)) {
+        $value = $script:OverallCoverageTotals[$coverageId]
+    }
+    if ($null -eq $value) { return $null }
+    try {
+        [long]$count = $value
+        if ($count -ge 0) { return $count }
+    }
+    catch { }
+    return $null
+}
+
+function Get-WorkerStageNumberForItem {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]$Item,
+        [int]$DefaultStageNumber = 0
+    )
+
+    $value = Get-ObjectPropertyValue -Object $Item -Name 'StageNumber' -Default $null
+    if ($null -ne $value) {
+        try { return [int]$value } catch { }
+    }
+    return [int]$DefaultStageNumber
+}
+
+function Get-WorkerCompletedCandidateCountOutsideBatch {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][AllowEmptyCollection()][object[]]$BatchItems
+    )
+
+    $batchIds = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::Ordinal)
+    foreach ($batchItem in @($BatchItems)) {
+        if ($null -ne $batchItem) { [void]$batchIds.Add([string](Get-ObjectPropertyValue -Object $batchItem -Name 'CoverageId' -Default '')) }
+    }
+    [long]$total = 0
+    foreach ($item in @($script:OverallPlanItems.ToArray())) {
+        $coverageId = [string](Get-ObjectPropertyValue -Object $item -Name 'CoverageId' -Default '')
+        if ([string]::IsNullOrWhiteSpace($coverageId) -or $batchIds.Contains($coverageId) -or
+            -not $script:CompletedCoverageIds.Contains($coverageId)) { continue }
+        $count = Get-WorkerKnownCandidateCount -Item $item
+        if ($null -ne $count) { $total += [long]$count }
+    }
+    return $total
+}
+
+function Get-WorkerCompletedCandidateCountBeforeStage {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][int]$StageNumber
+    )
+
+    [long]$total = 0
+    foreach ($item in @($script:OverallPlanItems.ToArray())) {
+        $itemStage = Get-WorkerStageNumberForItem -Item $item -DefaultStageNumber $StageNumber
+        $coverageId = [string](Get-ObjectPropertyValue -Object $item -Name 'CoverageId' -Default '')
+        if ($itemStage -ge $StageNumber -or [string]::IsNullOrWhiteSpace($coverageId) -or
+            -not $script:CompletedCoverageIds.Contains($coverageId)) { continue }
+        $count = Get-WorkerKnownCandidateCount -Item $item
+        if ($null -ne $count) { $total += [long]$count }
+    }
+    return $total
+}
+
+function Get-WorkerCompletedCandidateCountBeforeCoverage {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][int]$StageNumber,
+        [Parameter(Mandatory = $true)][string]$CoverageId
+    )
+
+    [long]$total = 0
+    if (-not $script:StagePlanItems.ContainsKey($StageNumber)) { return $total }
+    foreach ($item in @($script:StagePlanItems[$StageNumber])) {
+        $itemCoverageId = [string](Get-ObjectPropertyValue -Object $item -Name 'CoverageId' -Default '')
+        if ([string]::Equals($itemCoverageId, $CoverageId, [System.StringComparison]::Ordinal)) { break }
+        if (-not $script:CompletedCoverageIds.Contains($itemCoverageId)) { continue }
+        $count = Get-WorkerKnownCandidateCount -Item $item
+        if ($null -ne $count) { $total += [long]$count }
+    }
+    return $total
+}
+
+function Set-WorkerBatchProgressContext {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]$Segment,
+        [Parameter(Mandatory = $true)][long]$BatchPosition
+    )
+
+    $segmentStage = Get-WorkerStageNumberForItem -Item $Segment -DefaultStageNumber $script:StageNumber
+    $segmentCoverageId = [string](Get-ObjectPropertyValue -Object $Segment -Name 'CoverageId' -Default '')
+    $currentItem = @($script:ActiveGpuBatch.Items | Where-Object {
+            [string](Get-ObjectPropertyValue -Object $_ -Name 'CoverageId' -Default '') -eq $segmentCoverageId
+        } | Select-Object -First 1)[0]
+    if ($null -ne $currentItem) { $script:ActivePlanItem = $currentItem }
+    $stage = @($script:RecoveryStages | Where-Object { [int]$_.StageNumber -eq $segmentStage } | Select-Object -First 1)[0]
+    if ($null -ne $stage) {
+        $script:StageNumber = $segmentStage
+        $script:StageCount = [int]$stage.StageCount
+        $script:StageName = [string]$stage.DisplayName
+        $script:Strategy = [string]$stage.Strategy
+    }
+    $script:StageStatus = 'Running'
+    $script:StageMessage = ''
+    $script:CurrentCoverageId = $segmentCoverageId
+    $script:CurrentCoverageName = [string](Get-ObjectPropertyValue -Object $Segment -Name 'DisplayName' -Default '')
+    [long]$segmentStart = [long](Get-ObjectPropertyValue -Object $Segment -Name 'StartOffset' -Default 0)
+    [long]$segmentTotal = [long](Get-ObjectPropertyValue -Object $Segment -Name 'CandidateCount' -Default 0)
+    [long]$localPosition = [math]::Min($segmentTotal, [math]::Max(0L, $BatchPosition - $segmentStart))
+    $script:CoverageCandidateTotal = $segmentTotal
+    $script:CoveragePosition = $localPosition
+    $script:CoverageCandidatesTested = $localPosition
+    $script:StageBaseCandidates = Get-WorkerCompletedCandidateCountBeforeStage -StageNumber $segmentStage
+    $script:StageCoverageBaseCandidates = Get-WorkerCompletedCandidateCountBeforeCoverage -StageNumber $segmentStage -CoverageId $segmentCoverageId
+    $script:StageCandidatesTested = [long]$script:StageCoverageBaseCandidates + $localPosition
+    $script:CandidatesTested = [long]$script:BatchBaseCandidates + $BatchPosition
+    $script:RunCandidatesTested = [math]::Max(0L, $BatchPosition - $script:BatchResumeBase)
+    Update-CoverageCheckpoint
 }
 
 function Test-NextCandidate {
@@ -2033,18 +2290,13 @@ function Update-HashcatStatusFromLine {
                 }
                 if ($null -eq $currentSegment -and @($script:ActiveGpuBatch.Segments).Count -gt 0) { $currentSegment = @($script:ActiveGpuBatch.Segments)[@($script:ActiveGpuBatch.Segments).Count - 1] }
                 if ($null -ne $currentSegment) {
-                    $currentItem = @($script:ActiveGpuBatch.Items | Where-Object { [string]$_.CoverageId -eq [string]$currentSegment.CoverageId } | Select-Object -First 1)[0]
-                    if ($null -ne $currentItem) { $script:ActivePlanItem = $currentItem }
-                    $script:CurrentCoverageId = [string]$currentSegment.CoverageId
-                    $script:CurrentCoverageName = [string]$currentSegment.DisplayName
-                    $script:CoverageCandidateTotal = [long]$currentSegment.CandidateCount
-                    $script:CoveragePosition = [math]::Min([long]$currentSegment.CandidateCount, [math]::Max(0L, $batchPosition - [long]$currentSegment.StartOffset))
-                    $script:CoverageCandidatesTested = $script:CoveragePosition
+                    # A segment carries its logical StageNumber. Rebuild the
+                    # stage-local cursor from that map while Hashcat keeps
+                    # running, so Stage3 -> Stage4 remains visible and the
+                    # cumulative tested counts do not inherit the wrong stage
+                    # base.
+                    Set-WorkerBatchProgressContext -Segment $currentSegment -BatchPosition $batchPosition
                 }
-                $script:StageCandidatesTested = [long]$script:StageCoverageBaseCandidates + $batchPosition
-                $script:CandidatesTested = [long]$script:StageBaseCandidates + $script:StageCandidatesTested
-                $script:RunCandidatesTested = [math]::Max(0L, $batchPosition - $script:ResumeCoverageBase)
-                Update-CoverageCheckpoint
             }
             elseif ($null -ne $script:ActivePlanItem) {
                 $script:CoveragePosition = [long]$resolved.ResolvedTested
@@ -2391,7 +2643,11 @@ function Invoke-HashcatRecovery {
     $sessionPart = ([string]$script:RuntimeJobId -replace '[^A-Za-z0-9_-]', '_')
     if ([string]::IsNullOrWhiteSpace($sessionPart)) { $sessionPart = 'job' }
     if ($sessionPart.Length -gt 20) { $sessionPart = $sessionPart.Substring(0, 20) }
-    $session = ('APR-{0}-s{1}' -f $sessionPart, $StageNumber)
+    $sessionStageNumber = $StageNumber
+    if ($null -ne $script:ActiveGpuBatch -and @($script:ActiveGpuBatch.Segments).Count -gt 0) {
+        $sessionStageNumber = [int](@($script:ActiveGpuBatch.Segments)[0].StageNumber)
+    }
+    $session = ('APR-{0}-s{1}' -f $sessionPart, $sessionStageNumber)
     $script:HashcatProgressMode = 'Absolute'
     $hasSavedRestore = $ResumeStage -and (Test-Path -LiteralPath $persistentRestorePath -PathType Leaf)
     if ($hasSavedRestore) {
@@ -2853,12 +3109,60 @@ function Test-BuiltinGpuBatchItem {
     param([Parameter(Mandatory = $true)]$Item)
 
     if ([string]$Item.Kind -notin @('BuiltinDictionary', 'RuleCaseVariants', 'RuleAppendVariants', 'DateRange', 'CommonSymbols')) { return $false }
+    if ($Item.PSObject.Properties.Name -contains 'GpuSupported' -and -not [bool]$Item.GpuSupported) { return $false }
+    if ($Item.PSObject.Properties.Name -contains 'Languages' -and @($Item.Languages).Count -gt 1) { return $false }
     if ([string]$Item.Kind -eq 'BuiltinDictionary') { return $true }
     if ([string]$Item.Kind -eq 'DateRange') { return $true }
     if ([string]$Item.Kind -eq 'CommonSymbols') {
         return -not ($Item.PSObject.Properties.Name -contains 'DictionaryPath' -and -not [string]::IsNullOrWhiteSpace([string]$Item.DictionaryPath))
     }
     return $Item.PSObject.Properties.Name -contains 'DictionarySource' -and [string]$Item.DictionarySource -eq 'Builtin'
+}
+
+function Get-BuiltinBatchItemStageNumber {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]$Item,
+        [Parameter(Mandatory = $true)][int]$DefaultStageNumber
+    )
+
+    if ($Item.PSObject.Properties.Name -contains 'StageNumber' -and $null -ne $Item.StageNumber) {
+        try { return [int]$Item.StageNumber } catch { }
+    }
+    return $DefaultStageNumber
+}
+
+function Get-BuiltinBatchExecutionFamily {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]$Item
+    )
+
+    $family = [string](Get-ObjectPropertyValue -Object $Item -Name 'ExecutionAttackFamily' -Default '')
+    if ([string]::IsNullOrWhiteSpace($family)) {
+        $family = [string](Get-ObjectPropertyValue -Object $Item -Name 'AttackFamily' -Default '')
+    }
+    if ([string]::IsNullOrWhiteSpace($family)) { return 'MaterializedDictionary' }
+    return $family
+}
+
+function Test-BuiltinGpuBatchNeighbor {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]$Left,
+        [Parameter(Mandatory = $true)]$Right,
+        [Parameter(Mandatory = $true)][int]$DefaultStageNumber
+    )
+
+    if (-not (Test-BuiltinGpuBatchItem -Item $Left) -or -not (Test-BuiltinGpuBatchItem -Item $Right)) { return $false }
+    $leftCoverageId = [string](Get-ObjectPropertyValue -Object $Left -Name 'CoverageId' -Default '')
+    $rightCoverageId = [string](Get-ObjectPropertyValue -Object $Right -Name 'CoverageId' -Default '')
+    if ((-not [string]::IsNullOrWhiteSpace($leftCoverageId) -and $script:CompletedCoverageIds.Contains($leftCoverageId)) -or
+        (-not [string]::IsNullOrWhiteSpace($rightCoverageId) -and $script:CompletedCoverageIds.Contains($rightCoverageId))) { return $false }
+    if (-not [string]::Equals((Get-BuiltinBatchExecutionFamily -Item $Left), (Get-BuiltinBatchExecutionFamily -Item $Right), [System.StringComparison]::Ordinal)) { return $false }
+    $leftStage = Get-BuiltinBatchItemStageNumber -Item $Left -DefaultStageNumber $DefaultStageNumber
+    $rightStage = Get-BuiltinBatchItemStageNumber -Item $Right -DefaultStageNumber $DefaultStageNumber
+    return [math]::Abs($leftStage - $rightStage) -le 1
 }
 
 function Get-BuiltinGpuBatchItems {
@@ -2875,9 +3179,9 @@ function Get-BuiltinGpuBatchItems {
     for ($index = 0; $index -lt $Items.Count; $index++) {
         if ([string]$Items[$index].CoverageId -eq [string]$CurrentItem.CoverageId) {
             $start = $index
-            while ($start -gt 0 -and (Test-BuiltinGpuBatchItem -Item $Items[$start - 1])) { $start-- }
+            while ($start -gt 0 -and (Test-BuiltinGpuBatchNeighbor -Left $Items[$start - 1] -Right $Items[$start] -DefaultStageNumber $StageNumber)) { $start-- }
             $end = $index
-            while ($end + 1 -lt $Items.Count -and (Test-BuiltinGpuBatchItem -Item $Items[$end + 1])) { $end++ }
+            while ($end + 1 -lt $Items.Count -and (Test-BuiltinGpuBatchNeighbor -Left $Items[$end] -Right $Items[$end + 1] -DefaultStageNumber $StageNumber)) { $end++ }
             break
         }
     }
@@ -2899,6 +3203,10 @@ function New-BuiltinGpuExecutionBatch {
     # incomplete or differently composed cache without overwriting it.
     $batchSchemaVersion = 2
     $coverageIds = @($Items | ForEach-Object { [string]$_.CoverageId })
+    $stageNumbers = @($Items | ForEach-Object {
+            Get-BuiltinBatchItemStageNumber -Item $_ -DefaultStageNumber $StageNumber
+        } | Select-Object -Unique)
+    if ($stageNumbers.Count -eq 0) { $stageNumbers = @([int]$StageNumber) }
     $compositionTokens = @($Items | ForEach-Object {
             $languageKey = if ($_.PSObject.Properties.Name -contains 'Language') { ([string]$_.Language).Substring(0, 1) } else { 'x' }
             $kindKey = switch ([string]$_.Kind) {
@@ -2924,8 +3232,9 @@ function New-BuiltinGpuExecutionBatch {
     }
     if ($compositionCount -gt 0) { [void]$compositionParts.Add($compositionToken + $(if ($compositionCount -gt 1) { 'x' + $compositionCount } else { '' })) }
     $composition = $compositionParts -join '-'
-    $batchId = 'stage{0}-builtin-v{1}-{2}' -f $StageNumber, $batchSchemaVersion, $composition
-    $yearSpecific = $StageNumber -eq 3 -or @($Items | Where-Object { [string]$_.Kind -eq 'DateRange' }).Count -gt 0
+    $stageLabel = ($stageNumbers -join '-')
+    $batchId = 'stage{0}-builtin-v{1}-{2}' -f $stageLabel, $batchSchemaVersion, $composition
+    $yearSpecific = @($stageNumbers | Where-Object { [int]$_ -eq 3 }).Count -gt 0 -or @($Items | Where-Object { [string]$_.Kind -eq 'DateRange' }).Count -gt 0
     $batchPlanYear = if ($yearSpecific) { [int]$script:RecoveryPlanYear } else { $null }
     $yearPart = if ($yearSpecific) { '-planYear' + $script:RecoveryPlanYear } else { '' }
     $cacheDirectory = Join-Path (Join-Path (Join-Path (Get-RecoveryDataRoot) 'Cache\BuiltinBatches') $resourceVersion) ($batchId + $yearPart)
@@ -2938,8 +3247,27 @@ function New-BuiltinGpuExecutionBatch {
         try {
             $cache = Read-LocalJson -Path $cachePath
             $cacheYearMatches = if ($yearSpecific) { [int]$cache.RecoveryPlanYear -eq [int]$script:RecoveryPlanYear } else { $true }
+            $cachedStageNumbers = if ($cache.PSObject.Properties.Name -contains 'StageNumbers') {
+                @($cache.StageNumbers | ForEach-Object { [int]$_ })
+            }
+            else {
+                @([int]$cache.StageNumber)
+            }
+            # Keep the original single-stage marker compatible. A
+            # StageNumbers array is required only when the batch actually
+            # crosses a boundary; this avoids invalidating existing v2
+            # same-stage caches merely because the marker gained a field.
+            $stageNumbersMatch = [int]$cache.StageNumber -eq [int]$StageNumber
+            if ($stageNumbers.Count -gt 1) {
+                $stageNumbersMatch = $cachedStageNumbers.Count -eq $stageNumbers.Count
+            }
+            if ($stageNumbersMatch -and $stageNumbers.Count -gt 1) {
+                for ($stageIndex = 0; $stageIndex -lt $stageNumbers.Count; $stageIndex++) {
+                    if ([int]$cachedStageNumbers[$stageIndex] -ne [int]$stageNumbers[$stageIndex]) { $stageNumbersMatch = $false; break }
+                }
+            }
             if ([string]$cache.BatchId -eq $batchId -and [int]$cache.BatchSchemaVersion -eq $batchSchemaVersion -and [string]$cache.ResourceVersion -eq $resourceVersion -and
-                [int]$cache.StageNumber -eq $StageNumber -and $cacheYearMatches) {
+                $stageNumbersMatch -and $cacheYearMatches) {
                 $segments = @((Read-LocalJson -Path $segmentsPath).Segments)
                 $cachedCoverageIds = @($cache.CoverageIds | ForEach-Object { [string]$_ })
                 $cacheHit = $segments.Count -eq $Items.Count -and $cachedCoverageIds.Count -eq $coverageIds.Count
@@ -2954,7 +3282,10 @@ function New-BuiltinGpuExecutionBatch {
     }
     if (-not $cacheHit) {
         if (Test-Path -LiteralPath $cacheDirectory -PathType Container) {
-            throw ('BUILTIN_BATCH_CACHE_INVALID: immutable batch cache marker did not match: ' + $cacheDirectory)
+            # The final directory is app-owned and published atomically. A
+            # marker mismatch is therefore a rebuildable batch-cache fault;
+            # never widen this cleanup to another batch or to the Job folder.
+            [System.IO.Directory]::Delete($cacheDirectory, $true)
         }
         $parentDirectory = Split-Path $cacheDirectory -Parent
         New-Item -ItemType Directory -Path $parentDirectory -Force | Out-Null
@@ -2983,13 +3314,14 @@ function New-BuiltinGpuExecutionBatch {
                 }
                 $item.CandidateCount = $segmentCount
                 Set-WorkerOverallCoverageTotal -CoverageId ([string]$item.CoverageId) -CandidateCount $segmentCount
-                [void]$segmentList.Add([pscustomobject]@{ CoverageId = [string]$item.CoverageId; DisplayName = [string]$item.DisplayName; StageNumber = $StageNumber; StartOffset = $offset; CandidateCount = $segmentCount })
+                $itemStageNumber = Get-BuiltinBatchItemStageNumber -Item $item -DefaultStageNumber $StageNumber
+                [void]$segmentList.Add([pscustomobject]@{ CoverageId = [string]$item.CoverageId; DisplayName = [string]$item.DisplayName; StageNumber = $itemStageNumber; StartOffset = $offset; CandidateCount = $segmentCount })
                 $offset += $segmentCount
             }
         }
         finally { $writer.Dispose() }
         Write-LocalJsonAtomic -Path (Join-Path $temporaryDirectory 'segments.json') -Value ([ordered]@{ BatchId = $batchId; BatchSchemaVersion = $batchSchemaVersion; TotalCandidateCount = $offset; Segments = $segmentList.ToArray() })
-        Write-LocalJsonAtomic -Path (Join-Path $temporaryDirectory 'cache.json') -Value ([ordered]@{ BatchId = $batchId; ResourceVersion = $resourceVersion; BatchSchemaVersion = $batchSchemaVersion; StageNumber = $StageNumber; RecoveryPlanYear = $batchPlanYear; CoverageIds = $coverageIds; Languages = @($Items | ForEach-Object { if ($_.PSObject.Properties.Name -contains 'Language') { [string]$_.Language } } | Select-Object -Unique); OutputCount = $offset; CreatedUtc = [datetime]::UtcNow.ToString('o') })
+        Write-LocalJsonAtomic -Path (Join-Path $temporaryDirectory 'cache.json') -Value ([ordered]@{ BatchId = $batchId; ResourceVersion = $resourceVersion; BatchSchemaVersion = $batchSchemaVersion; StageNumber = $StageNumber; StageNumbers = $stageNumbers; RecoveryPlanYear = $batchPlanYear; CoverageIds = $coverageIds; Languages = @($Items | ForEach-Object { if ($_.PSObject.Properties.Name -contains 'Language') { [string]$_.Language } } | Select-Object -Unique); OutputCount = $offset; CreatedUtc = [datetime]::UtcNow.ToString('o') })
         [System.IO.Directory]::Move($temporaryDirectory, $cacheDirectory)
         if (Test-Path -LiteralPath $temporaryDirectory -PathType Container) { [System.IO.Directory]::Delete($temporaryDirectory, $true) }
         $segments = $segmentList.ToArray()
@@ -3002,7 +3334,7 @@ function New-BuiltinGpuExecutionBatch {
     $script:BuiltinBatchCacheHit = $cacheHit
     $batchStopwatch.Stop()
     $script:BuiltinBatchPreparationMs += [long]$batchStopwatch.ElapsedMilliseconds
-    return [pscustomobject]@{ BatchId = $batchId; BatchSchemaVersion = $batchSchemaVersion; CandidatePath = $candidatePath; Segments = @($segments); TotalCandidateCount = [long](@($segments | Measure-Object -Property CandidateCount -Sum).Sum); CacheHit = $cacheHit; Items = $Items }
+    return [pscustomobject]@{ BatchId = $batchId; BatchSchemaVersion = $batchSchemaVersion; StageNumbers = $stageNumbers; CandidatePath = $candidatePath; Segments = @($segments); TotalCandidateCount = [long](@($segments | Measure-Object -Property CandidateCount -Sum).Sum); CacheHit = $cacheHit; Items = $Items }
 }
 
 function Set-CumulativeStage {
@@ -3026,6 +3358,8 @@ function Set-CumulativeStage {
     if (-not $ResumeStage) { $script:StageCandidatesTested = 0L }
     $script:StageBaseCandidates = [math]::Max(0L, $script:CandidatesTested - $script:StageCandidatesTested)
     $script:StageCoverageBaseCandidates = 0L
+    $script:BatchBaseCandidates = 0L
+    $script:BatchResumeBase = 0L
     $script:TotalCandidates = Get-CachedStageCandidateCount -Items $Items
     Set-WorkerActivity -Activity 'PreparingCoverage' -Message ('Preparing local coverage for stage {0}.' -f $Stage.DisplayName)
 }
@@ -3050,9 +3384,12 @@ function Set-CumulativeCoverage {
     $script:CurrentArchiveBackendClass = ''
     $script:CurrentComputeBackendClass = ''
     $script:CurrentAttackFamily = ''
+    $script:CurrentHashMode = ''
     $script:CurrentCoverageRunningStartedUtc = $null
     $script:CurrentCoverageSpeedSampleCount = 0
     $script:CurrentCoverageLastSpeedSampleUtc = $null
+    $script:BatchBaseCandidates = 0L
+    $script:BatchResumeBase = 0L
     $script:CurrentCoverageName = [string]$Item.DisplayName
     $script:CoverageCandidateTotal = $Item.CandidateCount
     Set-WorkerOverallCoverageTotal -CoverageId ([string]$Item.CoverageId) -CandidateCount $Item.CandidateCount
@@ -3446,6 +3783,7 @@ function Invoke-CumulativeRecovery {
         $stageItems = @(Get-RecoveryPlanItems -Job $job -StageNumber $stageNumber)
         $script:StagePlanItems[$stageNumber] = $stageItems
         foreach ($item in $stageItems) {
+            $item | Add-Member -NotePropertyName StageNumber -NotePropertyValue ([int]$stageNumber) -Force
             if (-not $requested.Contains([string]$item.CoverageId)) { [void]$requested.Add([string]$item.CoverageId) }
             [void]$script:OverallPlanItems.Add($item)
             Set-WorkerOverallCoverageTotal -CoverageId ([string]$item.CoverageId) -CandidateCount (Get-ObjectPropertyValue -Object $item -Name 'CandidateCount' -Default $null)
@@ -3542,25 +3880,24 @@ function Invoke-CumulativeRecovery {
             }
 
             if ($engine.UseGpu -and $batchEligible) {
-                $batchItems = @(Get-BuiltinGpuBatchItems -Items $items -CurrentItem $item -StageNumber $stageNumber)
+                # The flattened ordered plan lets a compatible built-in GPU
+                # run continue over one stage boundary. Non-compatible items
+                # remain barriers inside Get-BuiltinGpuBatchItems.
+                $batchItems = @(Get-BuiltinGpuBatchItems -Items $script:OverallPlanItems.ToArray() -CurrentItem $item -StageNumber $stageNumber)
                 if ($batchItems.Count -gt 0) {
                     $gpuBatch = New-BuiltinGpuExecutionBatch -Items $batchItems -StageNumber $stageNumber
                     $script:ActiveGpuBatch = $gpuBatch
-                    [long]$completedInsideBatch = 0
-                    foreach ($batchItem in @($gpuBatch.Items)) {
-                        if ($script:CompletedCoverageIds.Contains([string]$batchItem.CoverageId) -and $null -ne $batchItem.CandidateCount) {
-                            $completedInsideBatch += [long]$batchItem.CandidateCount
-                        }
-                    }
-                    # A resumed batch may include logical segments already
-                    # completed before the saved cursor. The Hashcat restore
-                    # point is absolute from the batch start, so remove those
-                    # segments from the stage base exactly once.
-                    $script:StageCoverageBaseCandidates = [math]::Max(0L, [long]$stageCompletedKnown - $completedInsideBatch)
+                    # A resumed batch reports an absolute position from the
+                    # batch start. Candidates already completed outside this
+                    # batch form the stable global base; segment mapping below
+                    # rebuilds the stage-local base for every StageNumber.
+                    $script:BatchBaseCandidates = Get-WorkerCompletedCandidateCountOutsideBatch -BatchItems @($gpuBatch.Items)
                     $currentSegment = @($gpuBatch.Segments | Where-Object { [string]$_.CoverageId -eq [string]$item.CoverageId } | Select-Object -First 1)[0]
                     if ($null -ne $currentSegment) {
-                        $script:CoverageCandidateTotal = [long]$currentSegment.CandidateCount
-                        $script:CoveragePosition = if ($resumeThisCoverage) { [long]$script:CoveragePosition } else { 0L }
+                        [long]$currentPosition = if ($resumeThisCoverage) { [math]::Max(0L, [long]$script:CoveragePosition) } else { 0L }
+                        $script:BatchResumeBase = [long]$currentSegment.StartOffset + $currentPosition
+                        $script:ResumeCoverageBase = $currentPosition
+                        Set-WorkerBatchProgressContext -Segment $currentSegment -BatchPosition ([long]$currentSegment.StartOffset + $currentPosition)
                     }
                     $planJob = Get-PlanJob -Item $item -DictionaryPath ([string]$gpuBatch.CandidatePath)
                     $planJob.Strategy = 'Dictionary'
@@ -3578,6 +3915,8 @@ function Invoke-CumulativeRecovery {
                     $batchItem | Add-Member -NotePropertyName ArchiveBackendClass -NotePropertyValue ([string]$speedMetadata.ArchiveBackendClass) -Force
                     $batchItem | Add-Member -NotePropertyName ComputeBackendClass -NotePropertyValue ([string]$speedMetadata.ComputeBackendClass) -Force
                     $batchItem | Add-Member -NotePropertyName AttackFamily -NotePropertyValue ([string]$speedMetadata.AttackFamily) -Force
+                    $batchItem | Add-Member -NotePropertyName HashcatBackend -NotePropertyValue ([string]$speedMetadata.HashcatBackend) -Force
+                    $batchItem | Add-Member -NotePropertyName HashMode -NotePropertyValue ([string]$speedMetadata.HashMode) -Force
                 }
             }
             $script:EngineLabel = $engine.Label
@@ -3610,6 +3949,8 @@ function Invoke-CumulativeRecovery {
                 $script:CoverageCandidatesTested = 0L
                 $script:ActivePlanItem = $null
                 $script:ActiveGpuBatch = $null
+                $script:BatchBaseCandidates = 0L
+                $script:BatchResumeBase = 0L
                 $script:CoverageResult = ''
                 Save-CoverageState
                 $script:TerminalState = $null
@@ -3894,6 +4235,13 @@ catch {
     exit 1
 }
 finally {
+    Save-WorkerPerformanceProfiles
+    if ($script:JobOwnershipAcquired -and $null -ne $script:JobOwnershipMutex) {
+        try { [void]$script:JobOwnershipMutex.ReleaseMutex() } catch { }
+        try { $script:JobOwnershipMutex.Dispose() } catch { }
+        $script:JobOwnershipAcquired = $false
+        $script:JobOwnershipMutex = $null
+    }
     # Keep a failed RunId directory for the next startup cleanup and local
     # diagnostics; successful/stopped runs retain only their persistent state.
     if ($script:TerminalState -in @('Recovered', 'Exhausted', 'Stopped', 'NotEncrypted')) {

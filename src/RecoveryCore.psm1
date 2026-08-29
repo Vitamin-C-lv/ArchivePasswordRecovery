@@ -4,6 +4,8 @@ $script:HashcatDeviceCache = $null
 $script:HashcatDeviceCacheUtc = [datetime]::MinValue
 $script:TerminalJobRetentionDays = 7
 $script:BuiltinDictionaryManifestCache = $null
+$script:PerformanceProfileSchemaVersion = 1
+$script:PerformanceProfileRuntimeVersion = '4'
 
 function Resolve-SevenZip {
     [CmdletBinding()]
@@ -1411,6 +1413,355 @@ function Get-RecoveryDataRoot {
     return (Join-Path $env:LOCALAPPDATA 'ArchivePasswordRecovery')
 }
 
+function Get-PerformanceProfileCacheRoot {
+    [CmdletBinding()]
+    param()
+
+    return (Join-Path (Get-RecoveryDataRoot) 'Cache\PerformanceProfiles')
+}
+
+function Read-PerformanceProfiles {
+    [CmdletBinding()]
+    param()
+
+    $profiles = @{}
+    $cachePath = Join-Path (Get-PerformanceProfileCacheRoot) 'profiles.json'
+    if (-not (Test-Path -LiteralPath $cachePath -PathType Leaf)) { return $profiles }
+
+    $cacheInvalid = $false
+    try {
+        $cache = Read-LocalJson -Path $cachePath
+        if ($null -eq $cache -or
+            $cache.PSObject.Properties.Name -notcontains 'SchemaVersion' -or
+            [int]$cache.SchemaVersion -ne [int]$script:PerformanceProfileSchemaVersion -or
+            $cache.PSObject.Properties.Name -notcontains 'RuntimeVersion' -or
+            [string]$cache.RuntimeVersion -ne [string]$script:PerformanceProfileRuntimeVersion) {
+            $cacheInvalid = $true
+        }
+        if (-not $cacheInvalid) {
+            foreach ($record in @($cache.Profiles)) {
+                if ($null -eq $record -or $record.PSObject.Properties.Name -notcontains 'SpeedClassKey') { continue }
+                $key = [string]$record.SpeedClassKey
+                if ([string]::IsNullOrWhiteSpace($key) -or $key -match '[\\/\x00]') { continue }
+                $emaSpeed = 0.0
+                $sampleCount = 0
+                try { $emaSpeed = [double]$record.EmaSpeed } catch { $emaSpeed = 0.0 }
+                try { $sampleCount = [int]$record.SampleCount } catch { $sampleCount = 0 }
+                if ($emaSpeed -le 0 -or $sampleCount -le 0) { continue }
+
+                $startupMs = $null
+                if ($record.PSObject.Properties.Name -contains 'HashcatStartupMs' -and $null -ne $record.HashcatStartupMs) {
+                    try {
+                        [double]$startupValue = $record.HashcatStartupMs
+                        if ($startupValue -ge 0) { $startupMs = $startupValue }
+                    }
+                    catch { $startupMs = $null }
+                }
+                $profiles[$key] = [pscustomobject]@{
+                    SpeedClassKey       = $key
+                    ArchiveBackendClass = [string](Get-ObjectPropertyValue -Object $record -Name 'ArchiveBackendClass' -Default '')
+                    ComputeBackendClass = [string](Get-ObjectPropertyValue -Object $record -Name 'ComputeBackendClass' -Default '')
+                    AttackFamily        = [string](Get-ObjectPropertyValue -Object $record -Name 'AttackFamily' -Default '')
+                    HashcatBackend      = [string](Get-ObjectPropertyValue -Object $record -Name 'HashcatBackend' -Default '')
+                    HashMode            = [string](Get-ObjectPropertyValue -Object $record -Name 'HashMode' -Default '')
+                    SampleCount         = $sampleCount
+                    SmoothedSpeed       = $emaSpeed
+                    EmaSpeed            = $emaSpeed
+                    HashcatStartupMs    = $startupMs
+                    LastSampleUtc       = [string](Get-ObjectPropertyValue -Object $record -Name 'LastSampleUtc' -Default '')
+                    IsCalibrated        = $false
+                    IsHistorical        = $true
+                    HistoricalSampleCount = $sampleCount
+                    LiveSampleCount     = 0
+                }
+            }
+        }
+    }
+    catch {
+        $cacheInvalid = $true
+    }
+    if ($cacheInvalid) {
+        try { Clear-PerformanceProfiles | Out-Null } catch { }
+        return @{}
+    }
+    return $profiles
+}
+
+function Save-PerformanceProfiles {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][AllowEmptyCollection()][hashtable]$Profiles
+    )
+
+    $records = New-Object 'System.Collections.Generic.List[object]'
+    foreach ($profileKey in @($Profiles.Keys | Sort-Object)) {
+        $profile = $Profiles[$profileKey]
+        if ($null -eq $profile) { continue }
+        $key = [string](Get-ObjectPropertyValue -Object $profile -Name 'SpeedClassKey' -Default $profileKey)
+        if ([string]::IsNullOrWhiteSpace($key) -or $key -match '[\\/\x00]') { continue }
+        [double]$emaSpeed = 0
+        [int]$sampleCount = 0
+        try { $emaSpeed = [double](Get-ObjectPropertyValue -Object $profile -Name 'SmoothedSpeed' -Default (Get-ObjectPropertyValue -Object $profile -Name 'EmaSpeed' -Default 0)) } catch { $emaSpeed = 0 }
+        try { $sampleCount = [int](Get-ObjectPropertyValue -Object $profile -Name 'SampleCount' -Default 0) } catch { $sampleCount = 0 }
+        if ($emaSpeed -le 0 -or $sampleCount -le 0) { continue }
+        $startupMs = $null
+        try {
+            $candidateStartup = [double](Get-ObjectPropertyValue -Object $profile -Name 'HashcatStartupMs' -Default -1)
+            if ($candidateStartup -ge 0) { $startupMs = [math]::Round($candidateStartup, 1) }
+        }
+        catch { $startupMs = $null }
+        [void]$records.Add([ordered]@{
+                SpeedClassKey       = $key
+                ArchiveBackendClass = [string](Get-ObjectPropertyValue -Object $profile -Name 'ArchiveBackendClass' -Default '')
+                ComputeBackendClass = [string](Get-ObjectPropertyValue -Object $profile -Name 'ComputeBackendClass' -Default '')
+                AttackFamily        = [string](Get-ObjectPropertyValue -Object $profile -Name 'AttackFamily' -Default '')
+                HashcatBackend      = [string](Get-ObjectPropertyValue -Object $profile -Name 'HashcatBackend' -Default '')
+                HashMode            = [string](Get-ObjectPropertyValue -Object $profile -Name 'HashMode' -Default '')
+                EmaSpeed            = [math]::Round($emaSpeed, 2)
+                HashcatStartupMs    = $startupMs
+                SampleCount         = $sampleCount
+                LastSampleUtc       = [string](Get-ObjectPropertyValue -Object $profile -Name 'LastSampleUtc' -Default '')
+            })
+    }
+    if ($records.Count -eq 0) { return $false }
+    $record = [ordered]@{
+        SchemaVersion = [int]$script:PerformanceProfileSchemaVersion
+        RuntimeVersion = [string]$script:PerformanceProfileRuntimeVersion
+        Profiles = $records.ToArray()
+        UpdatedUtc = [datetime]::UtcNow.ToString('o')
+    }
+    Write-LocalJsonAtomic -Path (Join-Path (Get-PerformanceProfileCacheRoot) 'profiles.json') -Value $record
+    return $true
+}
+
+function Clear-PerformanceProfiles {
+    [CmdletBinding()]
+    param()
+
+    $rootFull = [System.IO.Path]::GetFullPath((Get-PerformanceProfileCacheRoot)).TrimEnd('\')
+    $expectedRoot = [System.IO.Path]::GetFullPath((Join-Path (Get-RecoveryDataRoot) 'Cache\PerformanceProfiles')).TrimEnd('\')
+    if (-not [string]::Equals($rootFull, $expectedRoot, [System.StringComparison]::OrdinalIgnoreCase)) {
+        throw 'Refusing to remove a performance cache outside the application cache root.'
+    }
+    if (-not (Test-Path -LiteralPath $rootFull -PathType Container)) { return 0 }
+    [int]$removedCount = 0
+    foreach ($entry in @(Get-ChildItem -LiteralPath $rootFull -Force -ErrorAction Stop)) {
+        if ($entry.PSIsContainer) {
+            [System.IO.Directory]::Delete([System.IO.Path]::GetFullPath($entry.FullName), $true)
+        }
+        else {
+            Remove-Item -LiteralPath ([System.IO.Path]::GetFullPath($entry.FullName)) -Force -ErrorAction Stop
+        }
+        $removedCount++
+    }
+    return $removedCount
+}
+
+function Get-RecoveryJobDirectoryMatch {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][string]$JobDirectory,
+        [Parameter(Mandatory = $true)]$ArchiveIdentity
+    )
+
+    if (-not (Test-Path -LiteralPath $JobDirectory -PathType Container)) { return $null }
+    $directoryFull = [System.IO.Path]::GetFullPath($JobDirectory).TrimEnd('\')
+    $jobPath = Join-Path $directoryFull 'job.json'
+    if (-not (Test-Path -LiteralPath $jobPath -PathType Leaf)) { return $null }
+    try { $job = Read-LocalJson -Path $jobPath } catch { return $null }
+    if ($job.PSObject.Properties.Name -notcontains 'ArchiveIdentity' -or $null -eq $job.ArchiveIdentity) { return $null }
+    if (-not (Test-ArchiveIdentityMatch -Expected $job.ArchiveIdentity -Actual $ArchiveIdentity)) { return $null }
+    $jobId = if ($job.PSObject.Properties.Name -contains 'JobId' -and -not [string]::IsNullOrWhiteSpace([string]$job.JobId)) {
+        [string]$job.JobId
+    }
+    else {
+        [string]([System.IO.Path]::GetFileName($directoryFull))
+    }
+    if ([string]::IsNullOrWhiteSpace($jobId) -or $jobId -match '[\\/]|\.\.') {
+        throw 'A matching local job has an invalid JobId and cannot be reset safely.'
+    }
+    return [pscustomobject]@{
+        JobId = $jobId
+        JobDirectory = $directoryFull
+        ArchivePath = [string](Get-ObjectPropertyValue -Object $job -Name 'ArchivePath' -Default '')
+        DictionaryPath = [string](Get-ObjectPropertyValue -Object $job -Name 'DictionaryPath' -Default '')
+    }
+}
+
+function Get-RecoveryJobDirectoriesForArchive {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][string]$JobsRoot,
+        [Parameter(Mandatory = $true)][string]$ArchivePath
+    )
+
+    if (-not (Test-Path -LiteralPath $ArchivePath -PathType Leaf)) {
+        throw 'The selected archive no longer exists.'
+    }
+    $actualIdentity = Get-ArchiveIdentity -Path $ArchivePath
+    if (-not (Test-Path -LiteralPath $JobsRoot -PathType Container)) { return @() }
+
+    $rootFull = [System.IO.Path]::GetFullPath($JobsRoot).TrimEnd('\')
+    $matches = New-Object 'System.Collections.Generic.List[object]'
+    foreach ($directory in @(Get-ChildItem -LiteralPath $rootFull -Directory -ErrorAction Stop)) {
+        $match = Get-RecoveryJobDirectoryMatch -JobDirectory $directory.FullName -ArchiveIdentity $actualIdentity
+        if ($null -ne $match) { [void]$matches.Add($match) }
+    }
+    return $matches.ToArray()
+}
+
+function Remove-RecoveryJobDirectoryTree {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][string]$DirectoryPath,
+        [Parameter(Mandatory = $true)]$ProtectedPaths
+    )
+
+    foreach ($entry in @(Get-ChildItem -LiteralPath $DirectoryPath -Force -ErrorAction Stop)) {
+        $entryFull = [System.IO.Path]::GetFullPath($entry.FullName).TrimEnd('\')
+        if ($ProtectedPaths.Contains($entryFull)) { continue }
+        $hasProtectedChild = $false
+        foreach ($protectedPath in $ProtectedPaths) {
+            if ($protectedPath.StartsWith($entryFull + '\', [System.StringComparison]::OrdinalIgnoreCase)) {
+                $hasProtectedChild = $true
+                break
+            }
+        }
+        if ($hasProtectedChild -and $entry.PSIsContainer) {
+            Remove-RecoveryJobDirectoryTree -DirectoryPath $entryFull -ProtectedPaths $ProtectedPaths
+            continue
+        }
+        if ($entry.PSIsContainer) {
+            [System.IO.Directory]::Delete($entryFull, $true)
+        }
+        else {
+            [System.IO.File]::Delete($entryFull)
+        }
+    }
+}
+
+function Clear-RecoveryJobDirectoryData {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][string]$JobDirectory,
+        [Parameter(Mandatory = $true)][string[]]$ProtectedPaths
+    )
+
+    $jobFull = [System.IO.Path]::GetFullPath($JobDirectory).TrimEnd('\')
+    $protected = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
+    foreach ($protectedPath in @($ProtectedPaths)) {
+        if ([string]::IsNullOrWhiteSpace([string]$protectedPath)) { continue }
+        try {
+            $protectedValue = [string]$protectedPath
+            if (-not [System.IO.Path]::IsPathRooted($protectedValue)) {
+                $protectedValue = Join-Path $jobFull $protectedValue
+            }
+            $protectedFull = [System.IO.Path]::GetFullPath($protectedValue).TrimEnd('\')
+            if ($protectedFull -ne $jobFull -and $protectedFull.StartsWith($jobFull + '\', [System.StringComparison]::OrdinalIgnoreCase)) {
+                [void]$protected.Add($protectedFull)
+            }
+        }
+        catch { }
+    }
+    Remove-RecoveryJobDirectoryTree -DirectoryPath $jobFull -ProtectedPaths $protected
+    if (@(Get-ChildItem -LiteralPath $jobFull -Force -ErrorAction Stop).Count -eq 0) {
+        [System.IO.Directory]::Delete($jobFull, $false)
+    }
+}
+
+function Reset-RecoveryJobData {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][string]$JobsRoot,
+        [Parameter(Mandatory = $true)][string]$RuntimeRoot,
+        [Parameter(Mandatory = $true)][string]$ArchivePath,
+        [string]$CurrentJobDirectory = ''
+    )
+
+    $matches = @(Get-RecoveryJobDirectoriesForArchive -JobsRoot $JobsRoot -ArchivePath $ArchivePath)
+    if (-not [string]::IsNullOrWhiteSpace($CurrentJobDirectory) -and (Test-Path -LiteralPath $CurrentJobDirectory -PathType Container)) {
+        $actualIdentity = Get-ArchiveIdentity -Path $ArchivePath
+        $currentMatch = Get-RecoveryJobDirectoryMatch -JobDirectory $CurrentJobDirectory -ArchiveIdentity $actualIdentity
+        if ($null -ne $currentMatch -and @($matches | Where-Object { [string]$_.JobDirectory -eq [string]$currentMatch.JobDirectory }).Count -eq 0) {
+            $matches = @($matches + $currentMatch)
+        }
+    }
+    $jobsRootFull = [System.IO.Path]::GetFullPath($JobsRoot).TrimEnd('\')
+    $runtimeRootFull = [System.IO.Path]::GetFullPath($RuntimeRoot).TrimEnd('\')
+    $currentJobFull = if (-not [string]::IsNullOrWhiteSpace($CurrentJobDirectory)) { [System.IO.Path]::GetFullPath($CurrentJobDirectory).TrimEnd('\') } else { '' }
+    $removed = New-Object 'System.Collections.Generic.List[string]'
+    foreach ($match in $matches) {
+        $ownershipMutex = $null
+        $ownershipAcquired = $false
+        try {
+            # Use the same lightweight per-Job mutex as RecoveryWorker. This
+            # closes the reset/start race around the activity check without
+            # introducing another persistent state machine.
+            $safeJobId = [regex]::Replace([string]$match.JobId, '[^A-Za-z0-9_.-]', '_')
+            if ([string]::IsNullOrWhiteSpace($safeJobId)) { $safeJobId = 'unknown' }
+            if ($safeJobId.Length -gt 180) { $safeJobId = $safeJobId.Substring(0, 180) }
+            $ownershipMutex = New-Object System.Threading.Mutex($false, ('Local\ArchivePasswordRecovery.Job.' + $safeJobId))
+            try { $ownershipAcquired = $ownershipMutex.WaitOne(0) }
+            catch [System.Threading.AbandonedMutexException] { $ownershipAcquired = $true }
+            if (-not $ownershipAcquired) {
+                throw ('任务 {0} 仍有 Worker 正在获取执行权，请先停止后再恢复初始化。' -f [string]$match.JobId)
+            }
+
+            $activity = Get-RecoveryRuntimeActivity -JobId ([string]$match.JobId) -JobDirectory ([string]$match.JobDirectory) -RuntimeRoot $runtimeRootFull
+            if (-not $activity.Known) {
+                throw ('无法确认任务 {0} 当前没有运行，已停止清理以保护任务数据。' -f [string]$match.JobId)
+            }
+            if ($activity.Active) {
+                throw ('任务 {0} 仍在运行，请先暂停或停止后再恢复初始化。' -f [string]$match.JobId)
+            }
+
+            $jobTarget = [System.IO.Path]::GetFullPath([string]$match.JobDirectory).TrimEnd('\')
+            $isDirectJobsRootChild = $jobTarget.StartsWith($jobsRootFull + '\', [System.StringComparison]::OrdinalIgnoreCase) -and
+                [System.IO.Path]::GetDirectoryName($jobTarget).TrimEnd('\') -eq $jobsRootFull
+            $isExplicitCurrentJob = -not [string]::IsNullOrWhiteSpace($currentJobFull) -and
+                [string]::Equals($jobTarget, $currentJobFull, [System.StringComparison]::OrdinalIgnoreCase)
+            if (-not $isDirectJobsRootChild -and -not $isExplicitCurrentJob) {
+                throw 'Refusing to remove a local job outside the selected application Jobs root.'
+            }
+            $runtimeTarget = [System.IO.Path]::GetFullPath((Join-Path $runtimeRootFull ([string]$match.JobId))).TrimEnd('\')
+            if (-not $runtimeTarget.StartsWith($runtimeRootFull + '\', [System.StringComparison]::OrdinalIgnoreCase) -or
+                [System.IO.Path]::GetDirectoryName($runtimeTarget).TrimEnd('\') -ne $runtimeRootFull) {
+                throw 'Refusing to remove a Runtime outside the selected application Runtime root.'
+            }
+            if (Test-Path -LiteralPath $runtimeTarget -PathType Container) {
+                [System.IO.Directory]::Delete($runtimeTarget, $true)
+            }
+            if (Test-Path -LiteralPath $jobTarget -PathType Container) {
+                $protectedPaths = New-Object 'System.Collections.Generic.List[string]'
+                foreach ($protectedPath in @(
+                        [string]$ArchivePath,
+                        [string]$match.ArchivePath,
+                        [string]$match.DictionaryPath
+                    )) {
+                    if (-not [string]::IsNullOrWhiteSpace($protectedPath)) {
+                        [void]$protectedPaths.Add($protectedPath)
+                    }
+                }
+                Clear-RecoveryJobDirectoryData -JobDirectory $jobTarget -ProtectedPaths $protectedPaths.ToArray()
+                [void]$removed.Add([string]$match.JobId)
+            }
+        }
+        finally {
+            if ($ownershipAcquired -and $null -ne $ownershipMutex) {
+                try { [void]$ownershipMutex.ReleaseMutex() } catch { }
+            }
+            if ($null -ne $ownershipMutex) {
+                try { $ownershipMutex.Dispose() } catch { }
+            }
+        }
+    }
+    return [pscustomobject]@{
+        MatchedJobCount = $matches.Count
+        RemovedJobCount = $removed.Count
+        RemovedJobIds = $removed.ToArray()
+    }
+}
+
 function Get-RecoveryRuntimeRoot {
     [CmdletBinding()]
     param()
@@ -1447,32 +1798,118 @@ function Get-RecoveryRuntimeDirectory {
 function Get-RecoveryRuntimeActivity {
     [CmdletBinding()]
     param(
-        [Parameter(Mandatory = $true)][string]$JobId
+        [Parameter(Mandatory = $true)][string]$JobId,
+        [AllowEmptyString()][string]$JobDirectory = '',
+        [AllowEmptyString()][string]$RuntimeRoot = ''
     )
 
+    if ([string]::IsNullOrWhiteSpace($JobId)) {
+        return [pscustomobject]@{ Known = $false; Active = $false; Reason = 'A local JobId is required.'; WorkerProcessIds = @(); HashcatProcessIds = @() }
+    }
     try {
         $processes = @(Get-CimInstance -ClassName Win32_Process -Filter "Name = 'powershell.exe' OR Name = 'pwsh.exe' OR Name = 'hashcat.exe'" -ErrorAction Stop)
     }
     catch {
         # A failed process query is not safe grounds for deleting a Runtime.
-        return [pscustomobject]@{ Known = $false; Active = $false; Reason = $_.Exception.Message }
+        return [pscustomobject]@{ Known = $false; Active = $false; Reason = $_.Exception.Message; WorkerProcessIds = @(); HashcatProcessIds = @() }
     }
 
     $jobPattern = [regex]::Escape($JobId)
+    $jobDirectoryPattern = ''
+    if (-not [string]::IsNullOrWhiteSpace($JobDirectory)) {
+        try { $jobDirectoryPattern = [regex]::Escape(([System.IO.Path]::GetFullPath($JobDirectory)).TrimEnd('\')) } catch { $jobDirectoryPattern = '' }
+    }
+    if ([string]::IsNullOrWhiteSpace($RuntimeRoot)) { $RuntimeRoot = Get-RecoveryRuntimeRoot }
+    $runtimeJobPattern = ''
+    try { $runtimeJobPattern = [regex]::Escape(([System.IO.Path]::GetFullPath((Join-Path $RuntimeRoot $JobId))).TrimEnd('\')) } catch { $runtimeJobPattern = '' }
+    $workerProcessIds = New-Object 'System.Collections.Generic.List[int]'
+    $hashcatProcessIds = New-Object 'System.Collections.Generic.List[int]'
     foreach ($process in $processes) {
         $name = [string]$process.Name
         $commandLine = [string]$process.CommandLine
-        if ($name -match '(?i)^hashcat\.exe$' -and
-            ($commandLine -match ('ArchivePasswordRecovery-' + $jobPattern) -or $commandLine -match ('Runtime[\\/]' + $jobPattern))) {
-            return [pscustomobject]@{ Known = $true; Active = $true; Reason = 'Hashcat process matches this local Runtime job.' }
+        if ($name -match '(?i)^(powershell|pwsh)\.exe$' -and $commandLine -match '(?i)RecoveryWorker\.ps1') {
+            $workerMatches = $commandLine -match $jobPattern
+            if (-not $workerMatches -and -not [string]::IsNullOrWhiteSpace($jobDirectoryPattern)) {
+                $workerMatches = $commandLine -match $jobDirectoryPattern
+            }
+            if ($workerMatches) {
+                [void]$workerProcessIds.Add([int]$process.ProcessId)
+            }
         }
-        if ($name -match '(?i)^(powershell|pwsh)\.exe$' -and
-            $commandLine -match '(?i)RecoveryWorker\.ps1' -and $commandLine -match $jobPattern) {
-            return [pscustomobject]@{ Known = $true; Active = $true; Reason = 'RecoveryWorker process matches this local Runtime job.' }
+        elseif ($name -match '(?i)^hashcat\.exe$') {
+            $hashcatMatches = $commandLine -match ('ArchivePasswordRecovery-' + $jobPattern) -or
+                $commandLine -match ('Runtime[\\/]' + $jobPattern)
+            if (-not $hashcatMatches -and -not [string]::IsNullOrWhiteSpace($runtimeJobPattern)) {
+                $hashcatMatches = $commandLine -match $runtimeJobPattern
+            }
+            if ($hashcatMatches) {
+                [void]$hashcatProcessIds.Add([int]$process.ProcessId)
+            }
         }
     }
 
-    return [pscustomobject]@{ Known = $true; Active = $false; Reason = '' }
+    $active = $workerProcessIds.Count -gt 0 -or $hashcatProcessIds.Count -gt 0
+    $reason = if ($workerProcessIds.Count -gt 0) {
+        'RecoveryWorker process matches this local Runtime job.'
+    }
+    elseif ($hashcatProcessIds.Count -gt 0) {
+        'Hashcat process matches this local Runtime job.'
+    }
+    else {
+        ''
+    }
+    return [pscustomobject]@{
+        Known = $true
+        Active = $active
+        Reason = $reason
+        WorkerProcessIds = $workerProcessIds.ToArray()
+        HashcatProcessIds = $hashcatProcessIds.ToArray()
+    }
+}
+
+function Prepare-RecoveryJobResume {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][string]$JobDirectory,
+        [string]$RuntimeRoot = ''
+    )
+
+    $jobFull = [System.IO.Path]::GetFullPath($JobDirectory).TrimEnd('\')
+    $jobPath = Join-Path $jobFull 'job.json'
+    if (-not (Test-Path -LiteralPath $jobPath -PathType Leaf)) {
+        throw 'The local Job description is missing; resume was not started.'
+    }
+    $job = Read-LocalJson -Path $jobPath
+    $jobId = if ($job.PSObject.Properties.Name -contains 'JobId') { [string]$job.JobId } else { '' }
+    if ([string]::IsNullOrWhiteSpace($jobId)) {
+        $jobId = [System.IO.Path]::GetFileName($jobFull)
+    }
+    $activity = Get-RecoveryRuntimeActivity -JobId $jobId -JobDirectory $jobFull -RuntimeRoot $RuntimeRoot
+    if (-not $activity.Known) {
+        throw ('Unable to confirm that the previous local Worker has exited: ' + [string]$activity.Reason)
+    }
+    if ($activity.Active) {
+        throw 'The previous local Worker or Hashcat process is still active; resume was not started.'
+    }
+
+    $removedFlags = New-Object 'System.Collections.Generic.List[string]'
+    foreach ($flagName in @('pause.flag', 'stop.flag')) {
+        $flagPath = Join-Path $jobFull $flagName
+        if (Test-Path -LiteralPath $flagPath -PathType Leaf) {
+            Remove-Item -LiteralPath $flagPath -Force -ErrorAction Stop
+            [void]$removedFlags.Add($flagName)
+        }
+    }
+
+    $activity = Get-RecoveryRuntimeActivity -JobId $jobId -JobDirectory $jobFull -RuntimeRoot $RuntimeRoot
+    if (-not $activity.Known -or $activity.Active) {
+        throw 'The previous local Worker became active again while resume flags were being cleared; resume was not started.'
+    }
+    return [pscustomobject]@{
+        JobId = $jobId
+        RemovedFlags = $removedFlags.ToArray()
+        Activity = $activity
+    }
 }
 
 function Clear-RecoveryRuntime {
@@ -1641,7 +2078,10 @@ function Expand-BuiltinDictionary {
     }
     if ($cacheHit) { return $outputPath }
     if (Test-Path -LiteralPath $cacheDirectory -PathType Container) {
-        throw ('BUILTIN_DERIVED_CACHE_INVALID: immutable cache marker did not match: ' + $cacheDirectory)
+        # This directory is an app-owned, versioned derived cache. A complete
+        # directory is published atomically, so a marker mismatch means the
+        # rebuildable cache is stale or damaged; remove only this exact entry.
+        [System.IO.Directory]::Delete($cacheDirectory, $true)
     }
 
     New-Item -ItemType Directory -Path $cacheRoot -Force | Out-Null
@@ -1977,6 +2417,16 @@ function Test-PlanEtaProfileCalibrated {
     try { return [int]$Profile.SampleCount -ge 2 } catch { return $false }
 }
 
+function Test-PlanEtaProfileHistorical {
+    [CmdletBinding()]
+    param(
+        $Profile
+    )
+
+    if ($null -eq $Profile -or $Profile.PSObject.Properties.Name -notcontains 'IsHistorical') { return $false }
+    return [bool]$Profile.IsHistorical
+}
+
 function Test-PlanEtaFamilyCompatible {
     [CmdletBinding()]
     param(
@@ -1989,6 +2439,23 @@ function Test-PlanEtaFamilyCompatible {
     if ($TargetFamily -in @('Mask', 'BruteForce') -and $ProfileFamily -in @('Mask', 'BruteForce')) { return $true }
     if ($TargetFamily -eq 'Hybrid' -and $ProfileFamily -in @('Dictionary', 'Generated', 'Mask', 'BruteForce')) { return $true }
     return $false
+}
+
+function Test-PlanEtaProfileRuntimeCompatible {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]$Item,
+        [Parameter(Mandatory = $true)]$Profile
+    )
+
+    foreach ($propertyName in @('HashcatBackend', 'HashMode')) {
+        $targetValue = [string](Get-ObjectPropertyValue -Object $Item -Name $propertyName -Default '')
+        $profileValue = [string](Get-ObjectPropertyValue -Object $Profile -Name $propertyName -Default '')
+        if (-not [string]::IsNullOrWhiteSpace($targetValue) -and [string]::IsNullOrWhiteSpace($profileValue)) { return $false }
+        if (-not [string]::IsNullOrWhiteSpace($targetValue) -and
+            -not [string]::Equals($targetValue, $profileValue, [System.StringComparison]::OrdinalIgnoreCase)) { return $false }
+    }
+    return $true
 }
 
 function Get-PlanEtaProfileSpeed {
@@ -2006,11 +2473,20 @@ function Get-PlanEtaProfileSpeed {
 
     if (-not [string]::IsNullOrWhiteSpace($speedClassKey) -and $SpeedProfiles.ContainsKey($speedClassKey)) {
         $exact = $SpeedProfiles[$speedClassKey]
-        if ((Test-PlanEtaProfileCalibrated -Profile $exact)) {
+        if ((Test-PlanEtaProfileRuntimeCompatible -Item $Item -Profile $exact) -and (Test-PlanEtaProfileCalibrated -Profile $exact)) {
             try {
                 [double]$exactSpeed = $exact.SmoothedSpeed
                 if ($exactSpeed -gt 0) {
                     return [pscustomobject]@{ Speed = $exactSpeed; Source = 'ExactProfile'; ProfileKey = $speedClassKey }
+                }
+            }
+            catch { }
+        }
+        if ((Test-PlanEtaProfileRuntimeCompatible -Item $Item -Profile $exact) -and (Test-PlanEtaProfileHistorical -Profile $exact)) {
+            try {
+                [double]$historicalSpeed = $exact.SmoothedSpeed
+                if ($historicalSpeed -gt 0) {
+                    return [pscustomobject]@{ Speed = $historicalSpeed; Source = 'HistoricalProfile'; ProfileKey = $speedClassKey }
                 }
             }
             catch { }
@@ -2020,7 +2496,10 @@ function Get-PlanEtaProfileSpeed {
     $compatible = New-Object 'System.Collections.Generic.List[object]'
     foreach ($profileKey in @($SpeedProfiles.Keys)) {
         $profile = $SpeedProfiles[$profileKey]
-        if (-not (Test-PlanEtaProfileCalibrated -Profile $profile)) { continue }
+        $isCalibrated = Test-PlanEtaProfileCalibrated -Profile $profile
+        $isHistorical = Test-PlanEtaProfileHistorical -Profile $profile
+        if (-not $isCalibrated -and -not $isHistorical) { continue }
+        if (-not (Test-PlanEtaProfileRuntimeCompatible -Item $Item -Profile $profile)) { continue }
         $profileArchiveClass = [string](Get-ObjectPropertyValue -Object $profile -Name 'ArchiveBackendClass' -Default '')
         $profileComputeClass = [string](Get-ObjectPropertyValue -Object $profile -Name 'ComputeBackendClass' -Default '')
         $profileFamily = [string](Get-ObjectPropertyValue -Object $profile -Name 'AttackFamily' -Default '')
@@ -2033,14 +2512,18 @@ function Get-PlanEtaProfileSpeed {
         try {
             [double]$profileSpeed = $profile.SmoothedSpeed
             if ($profileSpeed -gt 0) {
-                [void]$compatible.Add([pscustomobject]@{ Speed = $profileSpeed; ProfileKey = [string]$profileKey })
+                [void]$compatible.Add([pscustomobject]@{
+                        Speed = $profileSpeed
+                        ProfileKey = [string]$profileKey
+                        Source = if ($isHistorical) { 'HistoricalCompatibleProfile' } else { 'CompatibleProfile' }
+                    })
             }
         }
         catch { }
     }
     if ($compatible.Count -eq 0) { return $null }
     $selected = @($compatible | Sort-Object Speed | Select-Object -First 1)[0]
-    return [pscustomobject]@{ Speed = [double]$selected.Speed; Source = 'CompatibleProfile'; ProfileKey = [string]$selected.ProfileKey }
+    return [pscustomobject]@{ Speed = [double]$selected.Speed; Source = [string]$selected.Source; ProfileKey = [string]$selected.ProfileKey }
 }
 
 function Get-CoverageDurationSumEta {
@@ -2087,6 +2570,8 @@ function Get-CoverageDurationSumEta {
     [int]$remainingPlanItemCount = 0
     [bool]$usedFallbackSpeed = $false
     [bool]$usedCompatibleProfile = $false
+    [bool]$usedHistoricalProfile = $false
+    [int]$historicalProfileCount = 0
     [bool]$currentCoverageSpeedIsStable = $false
     [string]$currentCoverageSpeedSource = ''
     $structureParts = New-Object 'System.Collections.Generic.List[string]'
@@ -2205,6 +2690,10 @@ function Get-CoverageDurationSumEta {
             $source = [string]$profile.Source
             $sourceIsStable = $source -eq 'ExactProfile'
             if ($source -eq 'CompatibleProfile') { $usedCompatibleProfile = $true }
+            if ($source -in @('HistoricalProfile', 'HistoricalCompatibleProfile')) {
+                $usedHistoricalProfile = $true
+                $historicalProfileCount++
+            }
         }
         elseif (-not $isCurrent -and $FallbackGpuSpeedPerSecond -gt 0 -and $itemComputeClass -like 'gpu:*') {
             $speed = $FallbackGpuSpeedPerSecond
@@ -2297,6 +2786,12 @@ function Get-CoverageDurationSumEta {
         ($etaCalibrationCoverage -ge 0.70 -or ($canJudgeUncalibratedImpact -and $estimatedDurationShare -lt 0.05))) {
         $readiness = 'Preliminary'
     }
+    elseif ($requiredSpeedClassCount -gt 0 -and $usedHistoricalProfile -and $hasFiniteEtaBounds -and $estimatedCoverageCount -gt 0) {
+        # Persisted measurements are deliberately a Preliminary seed only.
+        # They make an early bounded estimate possible, but never contribute
+        # calibrated evidence for Stable readiness.
+        $readiness = 'Preliminary'
+    }
     elseif ($planIds.Count -gt 0) {
         $readiness = 'Calibrating'
     }
@@ -2356,6 +2851,8 @@ function Get-CoverageDurationSumEta {
         RemainingCoverageCount       = $remainingCoverageCount
         UsedFallbackSpeed            = $usedFallbackSpeed
         UsedCompatibleProfile        = $usedCompatibleProfile
+        UsedHistoricalProfile        = $usedHistoricalProfile
+        HistoricalProfileCount       = $historicalProfileCount
         CurrentCoverageSpeedSource   = $currentCoverageSpeedSource
         CurrentCoverageSpeedIsStable = $currentCoverageSpeedIsStable
         PlanEtaPlanIdentity           = ($planIdentityParts.ToArray() -join ';')
@@ -3972,9 +4469,16 @@ Export-ModuleMember -Function @(
     'Get-RecoveryStages',
     'Get-BuiltinQuickCandidates',
     'Get-RecoveryDataRoot',
+    'Get-PerformanceProfileCacheRoot',
+    'Read-PerformanceProfiles',
+    'Save-PerformanceProfiles',
+    'Clear-PerformanceProfiles',
+    'Get-RecoveryJobDirectoriesForArchive',
+    'Reset-RecoveryJobData',
     'Get-RecoveryRuntimeRoot',
     'Get-RecoveryRuntimeDirectory',
     'Get-RecoveryRuntimeActivity',
+    'Prepare-RecoveryJobResume',
     'Clear-RecoveryRuntime',
     'Cleanup-StaleRecoveryRuntime',
     'Cleanup-TerminalRecoveryJobs',

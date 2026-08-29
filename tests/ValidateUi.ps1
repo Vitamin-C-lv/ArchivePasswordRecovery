@@ -21,7 +21,7 @@ if (-not $match.Success) {
 $reader = New-Object System.Xml.XmlNodeReader $xaml
 $window = [Windows.Markup.XamlReader]::Load($reader)
 try {
-    foreach ($name in @('ArchivePathBox', 'StrategyBox', 'DeviceBox', 'OverallProgressPanel', 'OverallProgressTitle', 'OverallProgressSubtitle', 'OverallProgressBar', 'OverallProgressPercent', 'OverallProgressStatsGrid', 'OverallEtaLabel', 'OverallCandidatesTestedLabel', 'OverallCandidatesRemainingLabel', 'OverallSpeedLabel', 'OverallCandidatesTestedValue', 'OverallCandidatesRemainingValue', 'OverallSpeedValue', 'OverallEtaValue', 'OverallProgressSummary', 'OverallProgressContextGrid', 'OverallStageValue', 'OverallCoverageValue', 'OverallProgressCurrent', 'OverallProgressHelper', 'StartButton', 'PauseButton', 'ResumeButton', 'StopButton', 'CoverageValue', 'ResultValue')) {
+    foreach ($name in @('ArchivePathBox', 'StrategyBox', 'DeviceBox', 'OverallProgressPanel', 'OverallProgressTitle', 'OverallProgressSubtitle', 'OverallProgressBar', 'OverallProgressPercent', 'OverallProgressStatsGrid', 'OverallEtaLabel', 'OverallCandidatesTestedLabel', 'OverallCandidatesRemainingLabel', 'OverallSpeedLabel', 'OverallCandidatesTestedValue', 'OverallCandidatesRemainingValue', 'OverallSpeedValue', 'OverallEtaValue', 'OverallProgressSummary', 'OverallProgressContextGrid', 'OverallStageValue', 'OverallCoverageValue', 'OverallProgressCurrent', 'OverallProgressHelper', 'StartButton', 'PauseButton', 'ResumeButton', 'StopButton', 'CoverageValue', 'ResultValue', 'ResetCurrentArchiveButton', 'ClearPerformanceProfilesButton')) {
         if ($null -eq $window.FindName($name)) {
             throw "Required WPF control missing: $name"
         }
@@ -39,6 +39,8 @@ try {
     if ($xamlText.IndexOf('OverallProgressStatsGrid') -lt $xamlText.IndexOf('OverallProgressBar')) { throw 'Overall candidate summary is not placed below the overall progress bar.' }
     if ($xamlText.IndexOf('OverallEtaLabel') -gt $xamlText.IndexOf('OverallCandidatesTestedLabel')) { throw 'Overall ETA is not the first primary KPI.' }
     if ($xamlText.IndexOf('当前范围详情') -lt 0) { throw 'Bottom progress panel is not labeled as current coverage detail.' }
+    if ($xamlText.IndexOf('恢复初始化（当前压缩包）') -lt 0) { throw 'Current archive reset action is missing.' }
+    if ($xamlText.IndexOf('清除此压缩包由本工具保存的任务进度') -lt 0) { throw 'Current archive reset explanation is missing.' }
 
     'UI_XAML: PASS'
 }

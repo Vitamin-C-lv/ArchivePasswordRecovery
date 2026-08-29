@@ -401,6 +401,11 @@ try { $startupJobCleanup = @(Cleanup-TerminalRecoveryJobs -JobsRoot $jobsRoot) }
                     </Grid>
                     <TextBlock x:Name="AdvancedDeviceInfoText" Margin="0,14,0,0" TextWrapping="Wrap" Foreground="#687789" />
                     <Button x:Name="OpenJobButton" Width="150" Margin="0,12,0,0" HorizontalAlignment="Left" Content="打开已保存任务" />
+                    <TextBlock Margin="0,12,0,0" Foreground="#687789" TextWrapping="Wrap" Text="清除此压缩包由本工具保存的任务进度、断点、临时运行数据和测试状态，不会删除原压缩包或用户字典。" />
+                    <StackPanel Orientation="Horizontal" Margin="0,8,0,0">
+                        <Button x:Name="ResetCurrentArchiveButton" Width="190" MinHeight="28" HorizontalAlignment="Left" Content="恢复初始化（当前压缩包）" />
+                        <Button x:Name="ClearPerformanceProfilesButton" Width="150" Margin="10,0,0,0" MinHeight="28" HorizontalAlignment="Left" Content="清理性能估算缓存" />
+                    </StackPanel>
                     <TextBox x:Name="LogBox" Height="130" Margin="0,14,0,0" IsReadOnly="True" TextWrapping="Wrap" VerticalScrollBarVisibility="Auto" Background="#20242B" Foreground="#E6EDF3" BorderThickness="0" Padding="10" />
                 </StackPanel>
             </Expander>
@@ -422,7 +427,7 @@ foreach ($name in @(
 'StateValue', 'StageValue', 'CoverageValue', 'EngineValue', 'DeviceValue', 'ProgressMetricLabel', 'CandidatesValue', 'SpeedLabel', 'SpeedValue', 'ElapsedValue',
 'EstimatedRemainingValue', 'WorstCaseValue', 'SearchProgressBar', 'ProgressPercentValue', 'ResultCard', 'ResultStatusText', 'ResultValue',
 'ProgressBarLabel',
-        'ProgressMessageText', 'AdvancedDeviceInfoText', 'LogBox'
+'ProgressMessageText', 'AdvancedDeviceInfoText', 'ResetCurrentArchiveButton', 'ClearPerformanceProfilesButton', 'LogBox'
     )) {
     $controls[$name] = $window.FindName($name)
 }
@@ -441,9 +446,15 @@ if (Test-Path -LiteralPath $primaryIconPath -PathType Leaf) {
 }
 
 $script:CurrentJobDirectory = $null
+$script:CurrentJobId = ''
 $script:CurrentWorker = $null
 $script:CurrentInspection = $null
 $script:LastProgressUpdated = $null
+$script:LastProgressSnapshot = $null
+$script:UiElapsedRunId = ''
+$script:UiElapsedRunStartedUtc = $null
+$script:UiElapsedFrozenSeconds = $null
+$script:UiElapsedLastSeconds = 0.0
 
 function Write-UiLog {
     param([Parameter(Mandatory = $true)][string]$Message)
@@ -478,6 +489,7 @@ function Clear-SelectedArchive {
     $controls.ArchiveFileNameText.Text = ''
     $controls.ArchiveInfoText.Text = ''
     $script:CurrentInspection = $null
+    Reset-UiElapsedState
     Set-ArchiveDisplayState -HasValidArchive:$false
     Update-TaskControls
 }
@@ -551,6 +563,7 @@ function Convert-StateName {
         'Paused' { return '已暂停' }
         'Stopping' { return '正在停止' }
         'Stopped' { return '已停止' }
+        'Interrupted' { return '任务已中断，可继续' }
         'Finalizing' { return '正在收尾' }
         'Recovered' { return '已恢复' }
         'Exhausted' { return '已完成（未找到密码）' }
@@ -821,6 +834,76 @@ function Format-LocalDuration {
     return ('约 {0} 分钟 {1} 秒' -f $minutes, $remainingSeconds)
 }
 
+function Reset-UiElapsedState {
+    $script:LastProgressSnapshot = $null
+    $script:UiElapsedRunId = ''
+    $script:UiElapsedRunStartedUtc = $null
+    $script:UiElapsedFrozenSeconds = $null
+    $script:UiElapsedLastSeconds = 0.0
+}
+
+function Update-UiElapsedFromProgress {
+    param(
+        $Progress = $null,
+        [string]$DisplayState = ''
+    )
+
+    if ($null -eq $Progress) { $Progress = $script:LastProgressSnapshot }
+    if ($null -eq $Progress) { return }
+    if ([string]::IsNullOrWhiteSpace($DisplayState)) { $DisplayState = [string]$Progress.State }
+
+    $runId = if ($Progress.PSObject.Properties.Name -contains 'RunId') { [string]$Progress.RunId } else { '' }
+    $startedUtc = $null
+    if ($Progress.PSObject.Properties.Name -contains 'RunStartedUtc' -and -not [string]::IsNullOrWhiteSpace([string]$Progress.RunStartedUtc)) {
+        try {
+            $startedUtc = ([datetime]::Parse([string]$Progress.RunStartedUtc, [System.Globalization.CultureInfo]::InvariantCulture, [System.Globalization.DateTimeStyles]::RoundtripKind)).ToUniversalTime()
+        }
+        catch { $startedUtc = $null }
+    }
+    $runKey = if (-not [string]::IsNullOrWhiteSpace($runId)) { $runId } elseif ($null -ne $startedUtc) { $startedUtc.ToString('o') } else { '' }
+    if (-not [string]::Equals($runKey, $script:UiElapsedRunId, [System.StringComparison]::Ordinal) -or
+        (($null -eq $script:UiElapsedRunStartedUtc) -xor ($null -eq $startedUtc)) -or
+        ($null -ne $startedUtc -and $null -ne $script:UiElapsedRunStartedUtc -and $startedUtc -ne $script:UiElapsedRunStartedUtc)) {
+        $script:UiElapsedRunId = $runKey
+        $script:UiElapsedRunStartedUtc = $startedUtc
+        $script:UiElapsedFrozenSeconds = $null
+        $script:UiElapsedLastSeconds = 0.0
+    }
+
+    $reportedSeconds = $null
+    if ($Progress.PSObject.Properties.Name -contains 'ElapsedSeconds' -and $null -ne $Progress.ElapsedSeconds) {
+        try {
+            [double]$reportedValue = $Progress.ElapsedSeconds
+            if ($reportedValue -ge 0) { $reportedSeconds = $reportedValue }
+        }
+        catch { $reportedSeconds = $null }
+    }
+    $terminalStates = @('Paused', 'Stopped', 'Interrupted', 'Recovered', 'Exhausted', 'Failed', 'BackendUnavailable', 'NotEncrypted')
+    if ($DisplayState -in $terminalStates) {
+        if ($null -ne $reportedSeconds) {
+            $script:UiElapsedFrozenSeconds = [math]::Max([double]$script:UiElapsedLastSeconds, $reportedSeconds)
+        }
+        elseif ($null -eq $script:UiElapsedFrozenSeconds -and $null -ne $startedUtc) {
+            $script:UiElapsedFrozenSeconds = [math]::Max(0.0, ([datetime]::UtcNow - $startedUtc).TotalSeconds)
+        }
+        if ($null -ne $script:UiElapsedFrozenSeconds) {
+            $script:UiElapsedLastSeconds = [double]$script:UiElapsedFrozenSeconds
+            $controls.ElapsedValue.Text = Format-LocalDuration -Seconds $script:UiElapsedFrozenSeconds
+        }
+        return
+    }
+
+    [double]$currentSeconds = 0.0
+    if ($null -ne $startedUtc) {
+        $currentSeconds = [math]::Max(0.0, ([datetime]::UtcNow - $startedUtc).TotalSeconds)
+    }
+    elseif ($null -ne $reportedSeconds) {
+        $currentSeconds = $reportedSeconds
+    }
+    $script:UiElapsedLastSeconds = [math]::Max([double]$script:UiElapsedLastSeconds, $currentSeconds)
+    $controls.ElapsedValue.Text = Format-LocalDuration -Seconds $script:UiElapsedLastSeconds
+}
+
 function Format-LocalEta {
     param($Seconds)
 
@@ -1009,13 +1092,72 @@ function Inspect-SelectedArchive {
     return $inspection
 }
 
-function Get-WorkerIsRunning {
-    if ($null -eq $script:CurrentWorker) { return $false }
+function Get-CurrentJobRuntimeActivity {
+    if ([string]::IsNullOrWhiteSpace($script:CurrentJobDirectory)) {
+        return [pscustomobject]@{ Known = $true; Active = $false; Reason = ''; WorkerProcessIds = @(); HashcatProcessIds = @() }
+    }
+
+    $jobId = [string]$script:CurrentJobId
+    if ([string]::IsNullOrWhiteSpace($jobId)) {
+        $jobPath = Join-Path $script:CurrentJobDirectory 'job.json'
+        if (-not (Test-Path -LiteralPath $jobPath -PathType Leaf)) {
+            return [pscustomobject]@{ Known = $false; Active = $false; Reason = '当前任务缺少 job.json，无法确认 Worker 状态。'; WorkerProcessIds = @(); HashcatProcessIds = @() }
+        }
+        try {
+            $job = Read-LocalJson -Path $jobPath
+            $jobId = if ($job.PSObject.Properties.Name -contains 'JobId') { [string]$job.JobId } else { '' }
+            if ([string]::IsNullOrWhiteSpace($jobId)) {
+                $jobId = [System.IO.Path]::GetFileName(([System.IO.Path]::GetFullPath($script:CurrentJobDirectory)).TrimEnd('\'))
+            }
+            $script:CurrentJobId = $jobId
+        }
+        catch {
+            return [pscustomobject]@{ Known = $false; Active = $false; Reason = $_.Exception.Message; WorkerProcessIds = @(); HashcatProcessIds = @() }
+        }
+    }
     try {
-        return -not $script:CurrentWorker.HasExited
+        return Get-RecoveryRuntimeActivity -JobId $jobId -JobDirectory $script:CurrentJobDirectory -RuntimeRoot $runtimeRoot
     }
     catch {
-        return $false
+        return [pscustomobject]@{ Known = $false; Active = $false; Reason = $_.Exception.Message; WorkerProcessIds = @(); HashcatProcessIds = @() }
+    }
+}
+
+function Wait-CurrentJobRuntimeInactive {
+    param([int]$TimeoutSeconds = 5)
+
+    $deadline = [datetime]::UtcNow.AddSeconds([math]::Max(0, $TimeoutSeconds))
+    $activity = $null
+    do {
+        $activity = Get-CurrentJobRuntimeActivity
+        if (-not $activity.Known -or -not $activity.Active) { return $activity }
+        Start-Sleep -Milliseconds 100
+    } while ([datetime]::UtcNow -lt $deadline)
+    return $activity
+}
+
+function Get-WorkerIsRunning {
+    if ($null -ne $script:CurrentWorker) {
+        try {
+            if (-not $script:CurrentWorker.HasExited) { return $true }
+        }
+        catch { }
+    }
+    $activity = Get-CurrentJobRuntimeActivity
+    return [bool]($activity.Known -and $activity.Active)
+}
+
+function Assert-NoActiveArchiveJob {
+    param([Parameter(Mandatory = $true)][string]$ArchivePath)
+
+    foreach ($match in @(Get-RecoveryJobDirectoriesForArchive -JobsRoot $jobsRoot -ArchivePath $ArchivePath)) {
+        $activity = Get-RecoveryRuntimeActivity -JobId ([string]$match.JobId) -JobDirectory ([string]$match.JobDirectory) -RuntimeRoot $runtimeRoot
+        if (-not $activity.Known) {
+            throw ('无法确认压缩包任务 {0} 当前是否正在运行，已停止启动。' -f [string]$match.JobId)
+        }
+        if ($activity.Active) {
+            throw ('当前压缩包已有本地 Worker 或 Hashcat 正在运行（任务 {0}），不会启动第二个 Worker。' -f [string]$match.JobId)
+        }
     }
 }
 
@@ -1064,15 +1206,27 @@ function Update-TaskControls {
         }
     }
 
+    $runtimeActivity = Get-CurrentJobRuntimeActivity
+    if ($State -in @('Starting', 'Running', 'Pausing', 'Stopping') -and $runtimeActivity.Known -and -not $runtimeActivity.Active) {
+        $State = 'Interrupted'
+    }
     $visible = [System.Windows.Visibility]::Visible
     $collapsed = [System.Windows.Visibility]::Collapsed
     $isPaused = $State -eq 'Paused'
     $isStopped = $State -eq 'Stopped'
-    $isActive = $State -in @('Starting', 'Running', 'Pausing', 'Stopping') -or (Get-WorkerIsRunning)
+    $isRuntimeActive = [bool]($runtimeActivity.Known -and $runtimeActivity.Active)
+    $isCurrentWorkerActive = $false
+    if ($null -ne $script:CurrentWorker) {
+        try { $isCurrentWorkerActive = -not $script:CurrentWorker.HasExited } catch { $isCurrentWorkerActive = $false }
+    }
+    $isActive = $State -in @('Starting', 'Running', 'Pausing', 'Stopping') -or $isRuntimeActive -or $isCurrentWorkerActive
 
     $hasValidArchive = ($null -ne $script:CurrentInspection -and -not [string]::IsNullOrWhiteSpace($controls.ArchivePathBox.Text))
+    $controls.ResetCurrentArchiveButton.IsEnabled = $hasValidArchive -and -not $isActive
+    $controls.ClearPerformanceProfilesButton.IsEnabled = $true
     $controls.StartButton.IsEnabled = $hasValidArchive -and -not ($isActive -and -not $isPaused)
-    if ($isPaused -or $isStopped) {
+    $isInterrupted = $State -eq 'Interrupted'
+    if ($isPaused -or $isStopped -or $isInterrupted) {
         $controls.PauseButton.Visibility = $collapsed
         $controls.ResumeButton.Visibility = $visible
         $controls.ResumeButton.IsEnabled = $true
@@ -1111,6 +1265,7 @@ function Select-ArchivePath {
         $controls.ArchiveInfoText.Text = '正在本机检查文件…'
         $controls.ArchiveInfoText.ToolTip = $null
         $script:CurrentInspection = $null
+        Reset-UiElapsedState
         Set-ArchiveDisplayState -HasValidArchive:$false
         Update-TaskControls
         $null = Inspect-SelectedArchive
@@ -1167,6 +1322,30 @@ function Start-WorkerProcess {
         throw '尚未选择本地任务。'
     }
 
+    $jobPath = Join-Path $script:CurrentJobDirectory 'job.json'
+    if (-not (Test-Path -LiteralPath $jobPath -PathType Leaf)) {
+        throw '当前任务缺少 job.json，无法安全启动 Worker。'
+    }
+    if ([string]::IsNullOrWhiteSpace($script:CurrentJobId)) {
+        try {
+            $savedJob = Read-LocalJson -Path $jobPath
+            $script:CurrentJobId = if ($savedJob.PSObject.Properties.Name -contains 'JobId') { [string]$savedJob.JobId } else { '' }
+        }
+        catch {
+            throw ('无法读取当前任务的 JobId：' + $_.Exception.Message)
+        }
+    }
+    if ([string]::IsNullOrWhiteSpace($script:CurrentJobId)) {
+        $script:CurrentJobId = [System.IO.Path]::GetFileName(([System.IO.Path]::GetFullPath($script:CurrentJobDirectory)).TrimEnd('\'))
+    }
+    $activity = Get-CurrentJobRuntimeActivity
+    if (-not $activity.Known) {
+        throw ('无法确认当前 Job 是否已有 Worker，已停止启动：' + [string]$activity.Reason)
+    }
+    if ($activity.Active) {
+        throw '当前 Job 已有 Worker 或 Hashcat 正在运行，不会启动第二个 Worker。'
+    }
+
     $workerPath = Join-Path $PSScriptRoot 'RecoveryWorker.ps1'
     $arguments = @(
         '-NoProfile',
@@ -1179,6 +1358,7 @@ function Start-WorkerProcess {
 }
 
 function Reset-LiveTaskDisplay {
+    Reset-UiElapsedState
     $script:LastProgressUpdated = ''
     $controls.StateValue.Text = '正在启动'
     $controls.StageValue.Text = '等待阶段信息'
@@ -1229,6 +1409,7 @@ function Start-NewJob {
         $null = Inspect-SelectedArchive
         $controlJob = [pscustomobject](Get-JobFromControls)
         Test-RecoveryJobConfiguration -Job $controlJob
+        Assert-NoActiveArchiveJob -ArchivePath ([string]$controlJob.ArchivePath)
 
         $requestedLevel = [int]$controlJob.RecoveryLevel
         $reuseExistingJob = $false
@@ -1285,6 +1466,7 @@ function Start-NewJob {
             foreach ($property in $controlJob.PSObject.Properties) { $job[$property.Name] = $property.Value }
             $job['JobId'] = [System.IO.Path]::GetFileName($script:CurrentJobDirectory)
         }
+        $script:CurrentJobId = [string]$job.JobId
         if ($reuseExistingJob) {
             foreach ($flag in @('pause.flag', 'stop.flag')) {
                 $flagPath = Join-Path $script:CurrentJobDirectory $flag
@@ -1314,6 +1496,16 @@ function Pause-CurrentJob {
         return
     }
 
+    $activity = Get-CurrentJobRuntimeActivity
+    if (-not $activity.Known) {
+        Show-UiError ('无法确认当前 Worker 状态：' + [string]$activity.Reason)
+        return
+    }
+    if (-not $activity.Active) {
+        Show-UiError '当前 Worker 已退出，任务已中断；请点击“继续”使用现有断点。'
+        Update-TaskControls -State 'Interrupted'
+        return
+    }
     [System.IO.File]::WriteAllText((Join-Path $script:CurrentJobDirectory 'pause.flag'), 'pause')
     Write-UiLog '已请求暂停。Worker 会在当前本地候选测试完成后暂停。'
 }
@@ -1327,19 +1519,6 @@ function Resume-CurrentJob {
     try {
         $pausePath = Join-Path $script:CurrentJobDirectory 'pause.flag'
         $stopPath = Join-Path $script:CurrentJobDirectory 'stop.flag'
-        if (Test-Path -LiteralPath $pausePath) {
-            Remove-Item -LiteralPath $pausePath -Force
-            if (-not (Get-WorkerIsRunning)) {
-                Reset-LiveTaskDisplay
-                Start-WorkerProcess -ResumeJob
-                Write-UiLog '已从可用的本地会话断点重新启动暂停的 GPU 后端。'
-            }
-            else {
-                Write-UiLog '已继续暂停的本地 Worker。'
-            }
-            return
-        }
-
         $progressPath = Join-Path $script:CurrentJobDirectory 'progress.json'
         $state = if (Test-Path -LiteralPath $progressPath) { Read-LocalJson -Path $progressPath } else { $null }
         if ($null -ne $state -and
@@ -1349,15 +1528,39 @@ function Resume-CurrentJob {
             return
         }
 
-        if (Test-Path -LiteralPath $stopPath) { Remove-Item -LiteralPath $stopPath -Force }
-        if (-not (Get-WorkerIsRunning)) {
-            Reset-LiveTaskDisplay
-            Start-WorkerProcess -ResumeJob
-            Write-UiLog '已从保存的本地断点重新启动 Worker。'
+        $activity = Get-CurrentJobRuntimeActivity
+        if (-not $activity.Known) {
+            throw ('无法确认当前 Job 是否已经停止：' + [string]$activity.Reason)
         }
-        else {
-            Write-UiLog '本地 Worker 已在运行。'
+        if ($activity.Active) {
+            $hasStopFlag = Test-Path -LiteralPath $stopPath -PathType Leaf
+            $canReleaseCpuPause = $null -ne $state -and [string]$state.State -eq 'Paused' -and
+                -not $hasStopFlag -and (Test-Path -LiteralPath $pausePath -PathType Leaf) -and
+                @($activity.WorkerProcessIds).Count -gt 0 -and @($activity.HashcatProcessIds).Count -eq 0
+            if ($canReleaseCpuPause) {
+                Remove-Item -LiteralPath $pausePath -Force
+                Write-UiLog '已继续仍在后台等待的本地 CPU Worker。'
+            }
+            else {
+                throw '当前 Job 仍有 Worker 或 Hashcat 正在运行/停止，请等待其退出后再继续。'
+            }
+            return
         }
+
+        # A stopped GPU Worker may leave pause.flag and stop.flag together.
+        # Confirm quiescence again before removing either control flag; restore
+        # and coverage checkpoint files are deliberately untouched.
+        $activity = Wait-CurrentJobRuntimeInactive -TimeoutSeconds 5
+        if (-not $activity.Known) {
+            throw ('无法确认当前 Job 已退出：' + [string]$activity.Reason)
+        }
+        if ($activity.Active) {
+            throw '旧 Worker 尚未完全退出，请稍后再继续。'
+        }
+        $resumePreparation = Prepare-RecoveryJobResume -JobDirectory $script:CurrentJobDirectory -RuntimeRoot $runtimeRoot
+        Reset-LiveTaskDisplay
+        Start-WorkerProcess -ResumeJob
+        Write-UiLog '已从保存的本地断点重新启动 Worker。'
     }
     catch {
         Show-UiError $_.Exception.Message
@@ -1370,8 +1573,84 @@ function Stop-CurrentJob {
         return
     }
 
+    $activity = Get-CurrentJobRuntimeActivity
+    if (-not $activity.Known) {
+        Show-UiError ('无法确认当前 Worker 状态：' + [string]$activity.Reason)
+        return
+    }
+    if (-not $activity.Active) {
+        Show-UiError '当前 Worker 已退出，任务已中断；现有断点仍可点击“继续”。'
+        Update-TaskControls -State 'Interrupted'
+        return
+    }
     [System.IO.File]::WriteAllText((Join-Path $script:CurrentJobDirectory 'stop.flag'), 'stop')
     Write-UiLog '已请求停止。Worker 会在当前本地候选测试完成后写入断点。'
+}
+
+function Reset-CurrentArchiveInitialization {
+    try {
+        $activity = Get-CurrentJobRuntimeActivity
+        if (-not $activity.Known) {
+            throw ('无法确认当前任务是否仍在运行，已停止恢复初始化：' + [string]$activity.Reason)
+        }
+        if ($activity.Active) {
+            throw '当前任务仍在运行，请先暂停或停止后再恢复初始化。'
+        }
+        $archivePath = [string]$controls.ArchivePathBox.Text
+        if ([string]::IsNullOrWhiteSpace($archivePath) -or -not (Test-Path -LiteralPath $archivePath -PathType Leaf)) {
+            throw '请先选择一个仍存在的本地压缩包。'
+        }
+
+        $firstConfirmation = [System.Windows.MessageBox]::Show(
+            $window,
+            '将清除当前压缩包由本工具保存的任务进度、断点、临时运行数据和测试状态。原压缩包、用户字典、资源与其他任务不会删除。是否继续？',
+            '确认恢复初始化',
+            [System.Windows.MessageBoxButton]::YesNo,
+            [System.Windows.MessageBoxImage]::Warning
+        )
+        if ($firstConfirmation -ne [System.Windows.MessageBoxResult]::Yes) { return }
+
+        $secondConfirmation = [System.Windows.MessageBox]::Show(
+            $window,
+            '请再次确认：只清理与当前压缩包身份匹配的本地任务数据，操作完成后可重新开始恢复，但已保存的进度不能恢复。',
+            '再次确认恢复初始化',
+            [System.Windows.MessageBoxButton]::YesNo,
+            [System.Windows.MessageBoxImage]::Warning
+        )
+        if ($secondConfirmation -ne [System.Windows.MessageBoxResult]::Yes) { return }
+
+        $result = Reset-RecoveryJobData -JobsRoot $jobsRoot -RuntimeRoot $runtimeRoot -ArchivePath $archivePath -CurrentJobDirectory ([string]$script:CurrentJobDirectory)
+        $script:CurrentJobDirectory = $null
+        $script:CurrentJobId = ''
+        $script:CurrentWorker = $null
+        Reset-LiveTaskDisplay
+        $controls.StateValue.Text = '空闲'
+        $controls.ProgressPercentValue.Text = '当前没有本地任务正在运行。'
+        $controls.ProgressMessageText.Text = '当前压缩包的本地恢复状态已清除，可以重新开始。'
+        Update-TaskControls -State ''
+        Write-UiLog ('已完成当前压缩包的恢复初始化，清理 {0} 个本地任务；原压缩包和用户字典未删除。' -f $result.RemovedJobCount)
+    }
+    catch {
+        Show-UiError $_.Exception.Message
+    }
+}
+
+function Clear-PerformanceEstimateCache {
+    try {
+        $confirmation = [System.Windows.MessageBox]::Show(
+            $window,
+            '只清理本工具的本地性能估算缓存；任务进度、压缩包、用户字典和其他加速缓存不会删除。是否继续？',
+            '确认清理性能估算缓存',
+            [System.Windows.MessageBoxButton]::YesNo,
+            [System.Windows.MessageBoxImage]::Warning
+        )
+        if ($confirmation -ne [System.Windows.MessageBoxResult]::Yes) { return }
+        $removedCount = Clear-PerformanceProfiles
+        Write-UiLog ('已清理性能估算缓存（{0} 个缓存项）。首次运行将重新校准 ETA。' -f $removedCount)
+    }
+    catch {
+        Show-UiError $_.Exception.Message
+    }
 }
 
 function Open-SavedJob {
@@ -1394,6 +1673,13 @@ function Open-SavedJob {
             throw '压缩包自任务创建后已发生变化，无法继续使用原有恢复进度。请创建新任务。'
         }
         $script:CurrentJobDirectory = $dialog.SelectedPath
+        $script:CurrentJobId = if ($job.PSObject.Properties.Name -contains 'JobId' -and -not [string]::IsNullOrWhiteSpace([string]$job.JobId)) {
+            [string]$job.JobId
+        }
+        else {
+            [System.IO.Path]::GetFileName(([System.IO.Path]::GetFullPath($script:CurrentJobDirectory)).TrimEnd('\'))
+        }
+        Reset-UiElapsedState
         $controls.ArchivePathBox.Text = [string]$job.ArchivePath
         $script:CurrentInspection = $null
         Set-ArchiveDisplayState -HasValidArchive:$false
@@ -1437,14 +1723,27 @@ function Open-SavedJob {
 function Update-ProgressFromDisk {
     if ([string]::IsNullOrWhiteSpace($script:CurrentJobDirectory)) { return }
     $progressPath = Join-Path $script:CurrentJobDirectory 'progress.json'
-    if (-not (Test-Path -LiteralPath $progressPath -PathType Leaf)) { return }
+    if (-not (Test-Path -LiteralPath $progressPath -PathType Leaf)) {
+        Update-UiElapsedFromProgress
+        return
+    }
 
     try {
         $progress = Read-LocalJson -Path $progressPath
-        $displayState = [string]$progress.State
-        if ($displayState -eq 'Exhausted' -and -not (Test-IsFinalCumulativeExhausted -Progress $progress) -and (Get-WorkerIsRunning)) {
+        $script:LastProgressSnapshot = $progress
+        $persistedState = [string]$progress.State
+        $runtimeActivity = Get-CurrentJobRuntimeActivity
+        $displayState = $persistedState
+        $staleRunning = $persistedState -in @('Starting', 'Running', 'Pausing', 'Stopping') -and
+            $runtimeActivity.Known -and -not $runtimeActivity.Active
+        if ($staleRunning) {
+            $displayState = 'Interrupted'
+        }
+        elseif ($displayState -eq 'Exhausted' -and -not (Test-IsFinalCumulativeExhausted -Progress $progress) -and
+            $runtimeActivity.Known -and $runtimeActivity.Active) {
             $displayState = 'Running'
         }
+        Update-UiElapsedFromProgress -Progress $progress -DisplayState $displayState
         $controls.StateValue.Text = Convert-StateName -Value $displayState
         $stageText = if ($progress.PSObject.Properties.Name -contains 'StageNumber' -and $progress.StageNumber -gt 0) {
             $displayName = if ($progress.PSObject.Properties.Name -contains 'StageName' -and -not [string]::IsNullOrWhiteSpace([string]$progress.StageName)) {
@@ -1459,8 +1758,16 @@ function Update-ProgressFromDisk {
             Convert-StrategyName -Value ([string]$progress.Strategy)
         }
         $backendText = if ($progress.PSObject.Properties.Name -contains 'Backend') { Convert-BackendName -Value ([string]$progress.Backend) } else { Convert-BackendName -Value ([string]$progress.Engine) }
-        $activity = if ($progress.PSObject.Properties.Name -contains 'Activity' -and -not [string]::IsNullOrWhiteSpace([string]$progress.Activity)) { [string]$progress.Activity } else { $displayState }
-        $activityMessage = if ($progress.PSObject.Properties.Name -contains 'ActivityMessage' -and -not [string]::IsNullOrWhiteSpace([string]$progress.ActivityMessage)) { [string]$progress.ActivityMessage } else { [string]$progress.Message }
+        $activity = if ($staleRunning) { 'Interrupted' } elseif ($progress.PSObject.Properties.Name -contains 'Activity' -and -not [string]::IsNullOrWhiteSpace([string]$progress.Activity)) { [string]$progress.Activity } else { $displayState }
+        $activityMessage = if ($staleRunning) {
+            '任务已中断，未发现对应 Worker 或 Hashcat；当前断点和恢复状态已保留，请点击“继续”。'
+        }
+        elseif ($progress.PSObject.Properties.Name -contains 'ActivityMessage' -and -not [string]::IsNullOrWhiteSpace([string]$progress.ActivityMessage)) {
+            [string]$progress.ActivityMessage
+        }
+        else {
+            [string]$progress.Message
+        }
         $currentCoverageName = if ($progress.PSObject.Properties.Name -contains 'CurrentCoverageName' -and -not [string]::IsNullOrWhiteSpace([string]$progress.CurrentCoverageName)) { [string]$progress.CurrentCoverageName } else { '' }
         $preparationCurrent = if ($progress.PSObject.Properties.Name -contains 'PreparationCurrent') { $progress.PreparationCurrent } else { $null }
         $preparationTotal = if ($progress.PSObject.Properties.Name -contains 'PreparationTotal') { $progress.PreparationTotal } else { $null }
@@ -1880,6 +2187,7 @@ function Update-ProgressFromDisk {
     }
     catch {
         # A worker replaces this JSON atomically; a short read race is harmless and will be retried by the timer.
+        Update-UiElapsedFromProgress
     }
 }
 
@@ -1964,6 +2272,8 @@ $controls.PauseButton.Add_Click({ Pause-CurrentJob })
 $controls.ResumeButton.Add_Click({ Resume-CurrentJob })
 $controls.StopButton.Add_Click({ Stop-CurrentJob })
 $controls.OpenJobButton.Add_Click({ Open-SavedJob })
+$controls.ResetCurrentArchiveButton.Add_Click({ Reset-CurrentArchiveInitialization })
+$controls.ClearPerformanceProfilesButton.Add_Click({ Clear-PerformanceEstimateCache })
 
 $dropZoneDragHandler = {
         param($sender, $eventArgs)
