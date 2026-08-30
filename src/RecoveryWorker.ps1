@@ -138,6 +138,14 @@ $script:CoverageResult = ''
 $script:EngineLabel = $null
 $script:ComputeDevice = $null
 $script:BackendName = $null
+$script:CoverageSelectedUtc = $null
+$script:EngineSelectedUtc = $null
+$script:PreparationStartedUtc = $null
+$script:ExecutorStartedUtc = $null
+$script:FirstProgressSampleUtc = $null
+$script:GpuBatchSelectedCoverageIds = @()
+$script:ActiveGpuBatchCurrentCoverageId = ''
+$script:FutureUnreadyItemsPrepared = 0
 $script:Activity = 'PreparingBackend'
 $script:ActivityMessage = 'Preparing the local recovery backend.'
 $script:ProgressInvariantViolation = $false
@@ -1712,6 +1720,8 @@ function Publish-Progress {
         HashcatStartupMsAverage = if ($script:HashcatStartupSamples -gt 0) { [math]::Round($script:HashcatStartupMsTotal / [double]$script:HashcatStartupSamples, 1) } else { $null }
         HashcatActiveSearchMs = [long]$script:HashcatActiveSearchMs
         BuiltinBatchCacheHit = [bool]$script:BuiltinBatchCacheHit
+        GpuBatchSelectedCoverageIds = @($script:GpuBatchSelectedCoverageIds)
+        FutureUnreadyItemsPrepared = [int]$script:FutureUnreadyItemsPrepared
         GeneratedDictionaryPreparationMs = [long]$script:GeneratedDictionaryPreparationMs
         DerivedDictionaryPreparationMs = [long]$script:DerivedDictionaryPreparationMs
         BuiltinBatchPreparationMs = [long]$script:BuiltinBatchPreparationMs
@@ -1734,6 +1744,12 @@ function Publish-Progress {
         Engine            = $script:EngineLabel
         Backend           = $script:BackendName
         ComputeDevice     = $script:ComputeDevice
+        CoverageSelectedAtUtc = if ($null -ne $script:CoverageSelectedUtc) { $script:CoverageSelectedUtc.ToString('o') } else { $null }
+        EngineSelectedAtUtc = if ($null -ne $script:EngineSelectedUtc) { $script:EngineSelectedUtc.ToString('o') } else { $null }
+        PreparationStartedAtUtc = if ($null -ne $script:PreparationStartedUtc) { $script:PreparationStartedUtc.ToString('o') } else { $null }
+        ExecutorStartedAtUtc = if ($null -ne $script:ExecutorStartedUtc) { $script:ExecutorStartedUtc.ToString('o') } else { $null }
+        FirstProgressSampleAtUtc = if ($null -ne $script:FirstProgressSampleUtc) { $script:FirstProgressSampleUtc.ToString('o') } else { $null }
+        TimeEngineSelectedToExecutorStartMs = if ($null -ne $script:EngineSelectedUtc -and $null -ne $script:ExecutorStartedUtc) { [long](($script:ExecutorStartedUtc - $script:EngineSelectedUtc).TotalMilliseconds) } else { $null }
         CandidatesTested  = $recordCandidatesTested
         StageCandidatesTested = $recordStageCandidatesTested
         CandidateTotal    = $recordCandidateTotal
@@ -2389,6 +2405,18 @@ function New-CpuEngine {
     }
 }
 
+function Set-WorkerEngineSelection {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]$Engine
+    )
+
+    $script:EngineLabel = [string]$Engine.Label
+    $script:BackendName = [string]$Engine.Backend
+    $script:ComputeDevice = [string]$Engine.ComputeDevice
+    $script:EngineSelectedUtc = [datetime]::UtcNow
+}
+
 function Select-LocalEngine {
     [CmdletBinding()]
     param(
@@ -2566,6 +2594,7 @@ function Update-HashcatStatusFromLine {
 
     if ($null -eq $script:HashcatFirstStatusUtc -and $null -ne $script:HashcatProcessStartedUtc) {
         $script:HashcatFirstStatusUtc = [datetime]::UtcNow
+        $script:FirstProgressSampleUtc = $script:HashcatFirstStatusUtc
         $script:HashcatStartupMsTotal += [long](($script:HashcatFirstStatusUtc - $script:HashcatProcessStartedUtc).TotalMilliseconds)
         $script:HashcatStartupSamples++
     }
@@ -3338,6 +3367,7 @@ function Invoke-HashcatRecovery {
     [void]$process.Start()
     $script:HashcatProcessLaunchCount++
     $script:HashcatProcessStartedUtc = [datetime]::UtcNow
+    $script:ExecutorStartedUtc = $script:HashcatProcessStartedUtc
     $script:HashcatFirstStatusUtc = $null
     $script:ActiveHashcatProcess = $process
     $standardOutputTask = Start-LocalStreamPump -Reader $process.StandardOutput -OutputPath $statusPath
@@ -3585,16 +3615,18 @@ function Get-RuleCandidateCountFromDictionaryPath {
 function Get-PlanDictionaryPaths {
     [CmdletBinding()]
     param(
-        [Parameter(Mandatory = $true)]$Item
+        [Parameter(Mandatory = $true)]$Item,
+        [string]$PreparationCoverageName = ''
     )
 
     $paths = New-Object 'System.Collections.Generic.List[string]'
+    $preparationName = if ([string]::IsNullOrWhiteSpace($PreparationCoverageName)) { [string]$Item.DisplayName } else { $PreparationCoverageName }
     if ($null -eq $Item.CandidateCount -and $script:OverallCoverageTotals.ContainsKey([string]$Item.CoverageId)) {
         $Item.CandidateCount = $script:OverallCoverageTotals[[string]$Item.CoverageId]
     }
     if ([string]$Item.Kind -in @('DateRange', 'CommonSymbols')) {
         $preparationStopwatch = [System.Diagnostics.Stopwatch]::StartNew()
-        $callback = New-PreparationProgressCallback -CoverageName ([string]$Item.DisplayName) -Unit 'Entries'
+        $callback = New-PreparationProgressCallback -CoverageName $preparationName -Unit 'Entries'
         $dictionaryDirectory = Join-Path $script:RuntimeDirectory 'dictionaries'
         New-Item -ItemType Directory -Path $dictionaryDirectory -Force | Out-Null
         $safeId = ([string]$Item.CoverageId -replace '[^A-Za-z0-9_-]', '_')
@@ -3612,7 +3644,7 @@ function Get-PlanDictionaryPaths {
     foreach ($source in $sources) {
         $sourceType = [string]$source.SourceType
         $unit = if ($sourceType -eq 'Builtin') { 'Entries' } else { 'Bytes' }
-        $callback = New-PreparationProgressCallback -CoverageName ([string]$Item.DisplayName) -Unit $unit
+        $callback = New-PreparationProgressCallback -CoverageName $preparationName -Unit $unit
         if ([string]$Item.Kind -eq 'RuleCaseVariants') {
             $preparationStopwatch = [System.Diagnostics.Stopwatch]::StartNew()
             $result = Expand-CaseVariantDictionary -Item $Item -Source $source -ProgressCallback $callback
@@ -3777,6 +3809,50 @@ function Test-BuiltinGpuBatchNeighbor {
     return [math]::Abs($leftStage - $rightStage) -le 1
 }
 
+function Test-BuiltinGpuBatchItemReady {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]$Item
+    )
+
+    # This is intentionally a read-only admission check. It must never expand
+    # a built-in resource, generate coverage, or call Get-PlanDictionaryPaths.
+    # The current item does not pass through this function: it is allowed to
+    # prepare because its search is about to start.
+    if (-not (Test-BuiltinGpuBatchItem -Item $Item)) { return $false }
+
+    $kind = [string]$Item.Kind
+    if ($kind -eq 'BuiltinDictionary') {
+        try {
+            $language = [string](Get-ObjectPropertyValue -Object $Item -Name 'Language' -Default '')
+            $level = [int](Get-ObjectPropertyValue -Object $Item -Name 'DictionaryLevel' -Default 0)
+            if ($language -notin @('global', 'zh') -or $level -lt 1 -or $level -gt 3) { return $false }
+            $definition = Get-BuiltinDictionaryDefinition -Language $language -Level $level
+            $manifest = Get-BuiltinDictionaryManifest
+            $resourceVersion = if ($manifest.PSObject.Properties.Name -contains 'ResourceVersion') { [string]$manifest.ResourceVersion } else { 'v1' }
+            $cacheDirectory = Join-Path (Join-Path (Get-RecoveryDataRoot) ('Cache\BuiltinDerived\' + $resourceVersion)) ('dictionary-level{0}-{1}' -f $level, $language)
+            $candidatePath = Join-Path $cacheDirectory 'dictionary.txt'
+            $cachePath = Join-Path $cacheDirectory 'cache.json'
+            if (-not (Test-Path -LiteralPath $candidatePath -PathType Leaf) -or -not (Test-Path -LiteralPath $cachePath -PathType Leaf)) { return $false }
+            $cache = Read-LocalJson -Path $cachePath
+            return [int]$cache.CacheSchemaVersion -eq 1 -and [string]$cache.ResourceVersion -eq $resourceVersion -and
+                [string]$cache.Kind -eq 'BuiltinDictionary' -and [string]$cache.Language -eq $language -and [int]$cache.Level -eq $level -and
+                [long]$cache.OutputCount -eq [long]$definition.CandidateCount -and (Get-Item -LiteralPath $candidatePath -Force).Length -gt 0
+        }
+        catch { return $false }
+    }
+
+    $dictionaryDirectory = Join-Path $script:RuntimeDirectory 'dictionaries'
+    $safeId = ([string]$Item.CoverageId -replace '[^A-Za-z0-9_-]', '_')
+    $candidatePath = switch ($kind) {
+        'RuleCaseVariants' { Join-Path $dictionaryDirectory ('rule-case-{0}.txt' -f $safeId) }
+        'DateRange' { Join-Path $dictionaryDirectory 'generated-date-range.txt' }
+        'CommonSymbols' { Join-Path $dictionaryDirectory ('generated-common-symbols-{0}.txt' -f $safeId) }
+        default { return $false }
+    }
+    return (Test-Path -LiteralPath $candidatePath -PathType Leaf) -and (Get-Item -LiteralPath $candidatePath -Force).Length -gt 0
+}
+
 function Get-BuiltinGpuBatchItems {
     [CmdletBinding()]
     param(
@@ -3791,9 +3867,13 @@ function Get-BuiltinGpuBatchItems {
     for ($index = 0; $index -lt $Items.Count; $index++) {
         if ([string]$Items[$index].CoverageId -eq [string]$CurrentItem.CoverageId) {
             $start = $index
-            while ($start -gt 0 -and (Test-BuiltinGpuBatchNeighbor -Left $Items[$start - 1] -Right $Items[$start] -DefaultStageNumber $StageNumber)) { $start-- }
             $end = $index
-            while ($end + 1 -lt $Items.Count -and (Test-BuiltinGpuBatchNeighbor -Left $Items[$end] -Right $Items[$end + 1] -DefaultStageNumber $StageNumber)) { $end++ }
+            while ($end + 1 -lt $Items.Count) {
+                $future = $Items[$end + 1]
+                if (-not (Test-BuiltinGpuBatchNeighbor -Left $Items[$end] -Right $future -DefaultStageNumber $StageNumber)) { break }
+                if (-not (Test-BuiltinGpuBatchItemReady -Item $future)) { break }
+                $end++
+            }
             break
         }
     }
@@ -3815,6 +3895,10 @@ function New-BuiltinGpuExecutionBatch {
     # incomplete or differently composed cache without overwriting it.
     $batchSchemaVersion = 2
     $coverageIds = @($Items | ForEach-Object { [string]$_.CoverageId })
+    $batchPreparationName = if ($Items.Count -gt 1) {
+        'GPU batch: {0} + {1} cached coverage item(s)' -f [string]$Items[0].DisplayName, ($Items.Count - 1)
+    }
+    else { [string]$Items[0].DisplayName }
     $stageNumbers = @($Items | ForEach-Object {
             Get-BuiltinBatchItemStageNumber -Item $_ -DefaultStageNumber $StageNumber
         } | Select-Object -Unique)
@@ -3909,8 +3993,11 @@ function New-BuiltinGpuExecutionBatch {
         [long]$offset = 0
         try {
             foreach ($item in $Items) {
+                if ([string]$item.CoverageId -ne [string]$script:ActiveGpuBatchCurrentCoverageId -and -not (Test-BuiltinGpuBatchItemReady -Item $item)) {
+                    $script:FutureUnreadyItemsPrepared++
+                }
                 [long]$segmentCount = 0
-                $paths = @(Get-PlanDictionaryPaths -Item $item)
+                $paths = @(Get-PlanDictionaryPaths -Item $item -PreparationCoverageName $batchPreparationName)
                 foreach ($sourcePath in $paths) {
                     $reader = New-Object System.IO.StreamReader($sourcePath, $true)
                     try {
@@ -4003,6 +4090,14 @@ function Set-CumulativeCoverage {
     $script:BatchBaseCandidates = 0L
     $script:BatchResumeBase = 0L
     $script:CurrentCoverageName = [string]$Item.DisplayName
+    $script:CoverageSelectedUtc = [datetime]::UtcNow
+    $script:EngineSelectedUtc = $null
+    $script:PreparationStartedUtc = $null
+    $script:ExecutorStartedUtc = $null
+    $script:FirstProgressSampleUtc = $null
+    $script:GpuBatchSelectedCoverageIds = @()
+    $script:ActiveGpuBatchCurrentCoverageId = ''
+    $script:FutureUnreadyItemsPrepared = 0
     $script:CoverageCandidateTotal = $Item.CandidateCount
     Set-WorkerOverallCoverageTotal -CoverageId ([string]$Item.CoverageId) -CandidateCount $Item.CandidateCount
     $script:ResumeCoverageBase = if ($ResumeCoverage) { [long]$script:CoveragePosition } else { 0L }
@@ -4454,6 +4549,7 @@ function Invoke-CumulativeRecovery {
             else {
                 $engine = New-CpuEngine -Message ('Running the dynamic local coverage: ' + [string]$item.DisplayName)
             }
+            Set-WorkerEngineSelection -Engine $engine
 
             $artifact = $null
             $attackPlan = $null
@@ -4461,6 +4557,7 @@ function Invoke-CumulativeRecovery {
             $gpuBatch = $null
             $batchEligible = [bool]($engine.UseGpu -and (Test-BuiltinGpuBatchItem -Item $item))
             if ($engine.UseGpu) {
+                $script:PreparationStartedUtc = [datetime]::UtcNow
                 Set-WorkerActivity -Activity 'PreparingDictionary' -Message ('Preparing local dictionary data for coverage: {0}.' -f $item.DisplayName)
                 Publish-Progress -State 'Running' -Message ('Preparing local dictionary data for coverage: ' + [string]$item.DisplayName) -Result $null
                 if (-not (Test-Path -LiteralPath $script:RuntimeDirectory -PathType Container)) {
@@ -4469,6 +4566,7 @@ function Invoke-CumulativeRecovery {
                 $artifact = Get-RunArchiveHashcatArtifact -ArchivePath ([string]$job.ArchivePath) -ArchiveFormat ([string]$inspection.Format)
                 if (-not $artifact.Supported) {
                     $engine = New-CpuEngine -Message ($artifact.Message + ' CPU fallback was selected.')
+                    Set-WorkerEngineSelection -Engine $engine
                     $batchEligible = $false
                 }
                 elseif (-not $batchEligible) {
@@ -4479,6 +4577,7 @@ function Invoke-CumulativeRecovery {
                     }
                     if ($item.Kind -in @('BuiltinDictionary', 'CustomDictionary', 'RulesDictionary', 'CustomRules', 'HybridDictionary', 'CommonSymbols') -and $dictionaryPaths.Count -ne 1) {
                         $engine = New-CpuEngine -Message 'This coverage has multiple local dictionary streams; CPU streaming was selected.'
+                        Set-WorkerEngineSelection -Engine $engine
                     }
                     else {
                         $planDictionaryPath = ''
@@ -4487,6 +4586,7 @@ function Invoke-CumulativeRecovery {
                         $attackPlan = New-HashcatAttackPlan -Job $planJob -HashPath $artifact.HashPath -JobDirectory $script:RuntimeDirectory -RecoveryPlanYear $script:RecoveryPlanYear -Strategy ([string]$item.EngineStrategy)
                         if (-not $attackPlan.Supported) {
                             $engine = New-CpuEngine -Message ($attackPlan.Message + ' CPU fallback was selected.')
+                            Set-WorkerEngineSelection -Engine $engine
                         }
                     }
                 }
@@ -4498,6 +4598,8 @@ function Invoke-CumulativeRecovery {
                 # remain barriers inside Get-BuiltinGpuBatchItems.
                 $batchItems = @(Get-BuiltinGpuBatchItems -Items $script:OverallPlanItems.ToArray() -CurrentItem $item -StageNumber $stageNumber)
                 if ($batchItems.Count -gt 0) {
+                    $script:ActiveGpuBatchCurrentCoverageId = [string]$item.CoverageId
+                    $script:GpuBatchSelectedCoverageIds = @($batchItems | ForEach-Object { [string]$_.CoverageId })
                     $gpuBatch = New-BuiltinGpuExecutionBatch -Items $batchItems -StageNumber $stageNumber
                     $script:ActiveGpuBatch = $gpuBatch
                     # A resumed batch reports an absolute position from the
@@ -4515,7 +4617,7 @@ function Invoke-CumulativeRecovery {
                     $planJob = Get-PlanJob -Item $item -DictionaryPath ([string]$gpuBatch.CandidatePath)
                     $planJob.Strategy = 'Dictionary'
                     $attackPlan = New-HashcatAttackPlan -Job $planJob -HashPath $artifact.HashPath -JobDirectory $script:RuntimeDirectory -RecoveryPlanYear $script:RecoveryPlanYear -Strategy 'Dictionary'
-                    if (-not $attackPlan.Supported) { $engine = New-CpuEngine -Message ($attackPlan.Message + ' CPU fallback was selected.'); $script:ActiveGpuBatch = $null; $gpuBatch = $null }
+                    if (-not $attackPlan.Supported) { $engine = New-CpuEngine -Message ($attackPlan.Message + ' CPU fallback was selected.'); Set-WorkerEngineSelection -Engine $engine; $script:ActiveGpuBatch = $null; $gpuBatch = $null }
                 }
             }
 
@@ -4532,9 +4634,7 @@ function Invoke-CumulativeRecovery {
                     $batchItem | Add-Member -NotePropertyName HashMode -NotePropertyValue ([string]$speedMetadata.HashMode) -Force
                 }
             }
-            $script:EngineLabel = $engine.Label
-            $script:BackendName = $engine.Backend
-            $script:ComputeDevice = $engine.ComputeDevice
+            Set-WorkerEngineSelection -Engine $engine
             Reset-PreparationProgress
             Set-WorkerActivity -Activity 'RunningCoverage' -Message ($engine.Message + ' Coverage: ' + [string]$item.DisplayName)
             Publish-Progress -State 'Running' -Message ($engine.Message + ' Coverage: ' + [string]$item.DisplayName) -Result $null

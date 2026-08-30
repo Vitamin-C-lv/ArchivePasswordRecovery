@@ -74,8 +74,14 @@ try {
     $sevenZip = Resolve-SevenZip
     $batchDirectory = Join-Path (Join-Path (Join-Path (Get-RecoveryDataRoot) 'Cache\BuiltinBatches') 'v1') 'stage1-builtin-v2-gd1-zd1'
     if (Test-Path -LiteralPath $batchDirectory -PathType Container) { [System.IO.Directory]::Delete($batchDirectory, $true) }
-    $ruleBatchDirectory = Join-Path (Join-Path (Join-Path (Get-RecoveryDataRoot) 'Cache\BuiltinBatches') 'v1') 'stage3-builtin-v2-gd1-gc1-ga1-planYear2026'
-    if (Test-Path -LiteralPath $ruleBatchDirectory -PathType Container) { [System.IO.Directory]::Delete($ruleBatchDirectory, $true) }
+    $ruleBatchDirectories = @(
+        'stage3-builtin-v2-gd1-planYear2026',
+        'stage3-builtin-v2-gc1-planYear2026',
+        'stage3-builtin-v2-ga1-planYear2026'
+    ) | ForEach-Object { Join-Path (Join-Path (Join-Path (Get-RecoveryDataRoot) 'Cache\BuiltinBatches') 'v1') $_ }
+    foreach ($ruleBatchDirectory in $ruleBatchDirectories) {
+        if (Test-Path -LiteralPath $ruleBatchDirectory -PathType Container) { [System.IO.Directory]::Delete($ruleBatchDirectory, $true) }
+    }
     $globalRuntime = Join-Path $testRoot 'global-runtime'
     $zhRuntime = Join-Path $testRoot 'zh-runtime'
     $globalPath = Expand-BuiltinDictionary -Language global -Level 1 -RuntimeDirectory $globalRuntime
@@ -132,9 +138,9 @@ try {
     $warm = Invoke-TestWorker -WorkerPath $workerPath -JobDirectory $warmDirectory
     Assert-True ([bool]$warm.BuiltinBatchCacheHit -and [bool]$warm.HashcatRuntimeCacheHit) 'Warm batch/runtime cache was not reported as a hit.'
 
-    # Stage 3 fixture: compare the materialized global + case + append batch
-    # with the already validated logical rule generators, including append
-    # ordering and the six-variant planner count.
+    # Stage 3 fixture: new work must not pre-materialize future case/append
+    # coverage merely to reduce process starts. Compare the three ordered lazy
+    # batches with the already validated logical generators.
     $ruleContentPath = Join-Path $testRoot 'rule-fixture.txt'
     [System.IO.File]::WriteAllText($ruleContentPath, 'GPU batch Stage 3 rule equivalence fixture')
     $ruleArchivePath = Join-Path $testRoot 'rule-fixture.zip'
@@ -148,9 +154,9 @@ try {
             CharacterSet = 'digits'; CustomCharacters = ''; MinLength = 1; MaxLength = 1; UiCulture = 'zh-CN'; RecoveryPlanYear = 2026; CreatedUtc = [datetime]::UtcNow.ToString('o')
         })
     $ruleProgress = Invoke-TestWorker -WorkerPath $workerPath -JobDirectory $ruleJobDirectory
-    Assert-True ([string]$ruleProgress.State -eq 'Exhausted' -and [int]$ruleProgress.HashcatProcessLaunchCount -eq 1) ('Stage 3 rule fixture did not finish in one Hashcat batch process: state=' + [string]$ruleProgress.State + '; launches=' + [string]$ruleProgress.HashcatProcessLaunchCount + '; current=' + [string]$ruleProgress.CurrentCoverageId + '; completed=' + (@($ruleProgress.CompletedCoverageIds) -join ',') + '; message=' + [string]$ruleProgress.Message)
+    Assert-True ([string]$ruleProgress.State -eq 'Exhausted' -and [int]$ruleProgress.HashcatProcessLaunchCount -eq 3) ('Stage 3 rule fixture did not execute its three lazy ordered batches: state=' + [string]$ruleProgress.State + '; launches=' + [string]$ruleProgress.HashcatProcessLaunchCount + '; current=' + [string]$ruleProgress.CurrentCoverageId + '; completed=' + (@($ruleProgress.CompletedCoverageIds) -join ',') + '; message=' + [string]$ruleProgress.Message)
     Assert-True (@($ruleProgress.CompletedCoverageIds) -contains 'builtin:L1-global:v1' -and @($ruleProgress.CompletedCoverageIds) -contains 'rules:case:L1-global:v3' -and @($ruleProgress.CompletedCoverageIds) -contains 'rules:append:L1-global:v3') 'Stage 3 logical rule coverages were not all recorded.'
-    $ruleBatchCandidates = [System.IO.File]::ReadAllLines((Join-Path $ruleBatchDirectory 'candidates.txt'))
+    $ruleBatchCandidates = @($ruleBatchDirectories | ForEach-Object { [System.IO.File]::ReadAllLines((Join-Path $_ 'candidates.txt')) })
     $ruleGlobalCandidates = [System.IO.File]::ReadAllLines($globalPath)
     $ruleCasePath = Join-Path $testRoot 'expected-case.txt'
     $null = Expand-CaseVariantDictionaryFile -SourcePath $globalPath -OutputPath $ruleCasePath -RecoveryPlanYear 2026 -DeduplicateVariants
@@ -164,8 +170,8 @@ try {
     for ($index = 0; $index -lt $ruleExpected.Count; $index++) {
         if (-not [string]::Equals([string]$ruleBatchCandidates[$index], [string]$ruleExpected[$index], [System.StringComparison]::Ordinal)) { throw ('Stage 3 rule candidate sequence changed at index ' + $index) }
     }
-    $ruleSegments = Read-LocalJson -Path (Join-Path $ruleBatchDirectory 'segments.json')
-    Assert-True ([long]$ruleSegments.Segments[0].StartOffset -eq 0L -and [long]$ruleSegments.Segments[1].StartOffset -eq 1000L -and [long]$ruleSegments.Segments[2].StartOffset -eq (1000L + [long]$ruleCaseCandidates.Count)) 'Stage 3 rule segment offsets are not logical and contiguous.'
+    $ruleSegments = @($ruleBatchDirectories | ForEach-Object { (Read-LocalJson -Path (Join-Path $_ 'segments.json')).Segments[0] })
+    Assert-True ($ruleSegments.Count -eq 3 -and [long]$ruleSegments[0].StartOffset -eq 0L -and [long]$ruleSegments[1].StartOffset -eq 0L -and [long]$ruleSegments[2].StartOffset -eq 0L -and [long]$ruleSegments[0].CandidateCount -eq 1000L -and [long]$ruleSegments[1].CandidateCount -eq [long]$ruleCaseCandidates.Count -and [long]$ruleSegments[2].CandidateCount -eq [long]$ruleAppendCandidates.Count) 'Stage 3 lazy batch segments are not independently logical.'
 
     [pscustomobject]@{
         ColdProcessLaunches = [int]$cold.HashcatProcessLaunchCount
@@ -175,7 +181,7 @@ try {
         SegmentCount = @($segments.Segments).Count
         CandidateCount = $batchCandidates.Count
         LogicalOrder = 'global -> zh'
-        Stage3RuleBatch = 'PASS (global -> case -> append; append count = 6x source)'
+        Stage3RuleBatch = 'PASS (lazy global -> case -> append; append count = 6x source)'
         Stage3RuleCandidateCount = $ruleBatchCandidates.Count
         NanaZipVerified = [bool]$cold.Result.LocallyVerified
     } | Format-List
