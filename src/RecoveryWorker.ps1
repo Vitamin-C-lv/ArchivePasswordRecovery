@@ -83,6 +83,7 @@ $script:JohnPauseResume = 'NOT_VERIFIED'
 $script:JohnCandidateProgressReliable = $true
 $script:NanaZipVerifierProcessLaunchCount = 0
 $script:NanaZipVerificationMs = 0L
+$script:NanaZipVerificationCountsByCoverage = @{}
 $script:HashcatRuntimeExecutable = $null
 $script:HashcatRuntimePrepared = $false
 $script:HashcatRuntimeCacheHit = $false
@@ -90,15 +91,72 @@ $script:HashcatRuntimeBootstrapMs = 0L
 $script:HashcatRuntimeBootstrapCount = 0
 $script:HashcatRuntimeCopyFiles = 0
 $script:HashcatProcessLaunchCount = 0
+$script:HashcatExecutorCoverageBatches = New-Object 'System.Collections.Generic.List[object]'
 $script:HashcatStartupMsTotal = 0L
 $script:HashcatStartupSamples = 0
 $script:HashcatActiveSearchMs = 0L
 $script:CoverageTransitionMs = 0L
+$script:ExecutorShutdownMs = 0L
+$script:StreamPumpDrainMs = 0L
+$script:ProgressPersistenceMs = 0L
+$script:ProgressPublishMs = 0L
+$script:OverallPlanSnapshotMs = 0L
+$script:PlanEtaCalculationMs = 0L
+$script:OverallProgressCalculationMs = 0L
+$script:PlanEtaCacheKey = ''
+$script:PlanEtaCacheValue = $null
+$script:PlanEtaCacheHits = 0
+$script:PlanEtaCacheMisses = 0
+$script:CoverageStatePersistenceMs = 0L
+$script:AttackPlanConstructionMs = 0L
+$script:BatchLookupMs = 0L
+$script:BatchConstructionMs = 0L
+$script:CoverageExecutionMs = 0L
+$script:InterCoverageIdleMs = 0L
+$script:EngineSelectionMs = 0L
+$script:EngineSelectionCache = @{}
+$script:EngineSelectionCacheHits = 0
+$script:EngineSelectionCacheMisses = 0
+$script:ArchiveArtifactLookupMs = 0L
+$script:TransitionWindowActive = $false
+$script:TransitionWindowStartedUtc = $null
+$script:TransitionWindowProgressPersistenceMs = 0L
+$script:TransitionWindowProgressPublishMs = 0L
+$script:TransitionWindowOverallPlanSnapshotMs = 0L
+$script:TransitionWindowPlanEtaCalculationMs = 0L
+$script:TransitionWindowOverallProgressCalculationMs = 0L
+$script:TransitionWindowCoverageStatePersistenceMs = 0L
+$script:TransitionWindowAttackPlanConstructionMs = 0L
+$script:TransitionWindowBatchLookupMs = 0L
+$script:TransitionWindowBatchConstructionMs = 0L
+$script:TransitionWindowCoverageExecutionMs = 0L
+$script:TransitionWindowJohnActiveMs = 0L
+$script:TransitionWindowNanaZipVerificationMs = 0L
+$script:TransitionWindowEngineSelectionMs = 0L
+$script:TransitionWindowArchiveArtifactLookupMs = 0L
+$script:TransitionProgressPersistenceMsTotal = 0L
+$script:TransitionProgressPublishMsTotal = 0L
+$script:TransitionOverallPlanSnapshotMsTotal = 0L
+$script:TransitionPlanEtaCalculationMsTotal = 0L
+$script:TransitionOverallProgressCalculationMsTotal = 0L
+$script:TransitionCoverageStatePersistenceMsTotal = 0L
+$script:TransitionAttackPlanConstructionMsTotal = 0L
+$script:TransitionBatchLookupMsTotal = 0L
+$script:TransitionBatchConstructionMsTotal = 0L
+$script:TransitionCoverageExecutionMsTotal = 0L
+$script:TransitionJohnActiveMsTotal = 0L
+$script:TransitionNanaZipVerificationMsTotal = 0L
+$script:TransitionEngineSelectionMsTotal = 0L
+$script:TransitionArchiveArtifactLookupMsTotal = 0L
+$script:TransitionBusyIntervals = New-Object 'System.Collections.Generic.List[object]'
+$script:TransitionBusyUnionMs = 0L
+$script:TransitionBusyUnionMsTotal = 0L
 $script:FirstGpuExecutorStartedUtc = $null
 $script:LastGpuExecutorEndedUtc = $null
 $script:Level1To3ExecutionBatchCount = 0
 $script:NativeRuleCoverageIds = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::Ordinal)
 $script:MaterializedCoverageIds = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::Ordinal)
+$script:CoverageExecutionMsByCoverage = @{}
 $script:CoverageTransitionCount = 0
 $script:GeneratedDictionaryPreparationMs = 0L
 $script:DerivedDictionaryPreparationMs = 0L
@@ -1216,7 +1274,21 @@ function Get-WorkerOverallFlowSnapshot {
         }
     }
     $planIds = if ($script:IsCumulativeJob) { @($script:RequestedCoverageIds) } else { @() }
-    $planItems = if ($script:IsCumulativeJob) { @(Get-WorkerOverallPlanItems) } else { @() }
+    $planItemsOperationStartedUtc = [datetime]::UtcNow
+    $planItemsStopwatch = [System.Diagnostics.Stopwatch]::StartNew()
+    try {
+        $planItems = if ($script:IsCumulativeJob) { @(Get-WorkerOverallPlanItems) } else { @() }
+    }
+    finally {
+        $planItemsStopwatch.Stop()
+        [long]$planItemsMs = [long]$planItemsStopwatch.ElapsedMilliseconds
+        $script:OverallPlanSnapshotMs += $planItemsMs
+        if ($script:TransitionWindowActive) {
+            $script:TransitionWindowOverallPlanSnapshotMs += $planItemsMs
+            $script:TransitionOverallPlanSnapshotMsTotal += $planItemsMs
+        }
+        Add-WorkerTransitionInterval -StartUtc $planItemsOperationStartedUtc -EndUtc ([datetime]::UtcNow) -Name 'OverallPlanSnapshot'
+    }
     $currentTotal = if ($script:IsCumulativeJob -and $null -ne $script:ActivePlanItem) { $script:CoverageCandidateTotal } else { $null }
     $effectiveCandidatesTested = if ($null -ne $CandidatesTested) { $CandidatesTested } else { $script:CandidatesTested }
     $recentOverallSpeed = Get-WorkerRecentOverallSpeed
@@ -1236,7 +1308,66 @@ function Get-WorkerOverallFlowSnapshot {
     $planEtaForSnapshot = $null
     $planEtaReadiness = $null
     if ($script:IsCumulativeJob) {
-        $planEta = Get-CoverageDurationSumEta -PlanCoverageIds $planIds -PlanCoverageItems $planItems -CompletedCoverageIds @($script:CompletedCoverageIds | ForEach-Object { [string]$_ }) -CurrentCoverageId ([string]$script:CurrentCoverageId) -CurrentTested ([long]$script:CoverageCandidatesTested) -CurrentTotal $currentTotal -Activity ([string]$script:Activity) -CurrentSpeedPerSecond $currentSpeedForPlan -CurrentSpeedIsStable (Get-WorkerCurrentCoverageSpeedIsStable) -FallbackGpuSpeedPerSecond $script:ConservativeObservedGpuSpeed -SpeedProfiles $script:SpeedClassProfiles
+        $completedForEta = @($script:CompletedCoverageIds | ForEach-Object { [string]$_ } | Sort-Object)
+        $planItemSignature = @($planItems | ForEach-Object {
+                $itemId = [string](Get-ObjectPropertyValue -Object $_ -Name 'CoverageId' -Default '')
+                $itemCount = Get-ObjectPropertyValue -Object $_ -Name 'CandidateCount' -Default ''
+                $itemSpeedClass = [string](Get-ObjectPropertyValue -Object $_ -Name 'SpeedClassKey' -Default '')
+                $itemFamily = [string](Get-ObjectPropertyValue -Object $_ -Name 'AttackFamily' -Default '')
+                '{0}:{1}:{2}:{3}' -f $itemId, $itemCount, $itemSpeedClass, $itemFamily
+            }) -join ';'
+        $profileSignature = @($script:SpeedClassProfiles.Keys | Sort-Object | ForEach-Object {
+                $profile = $script:SpeedClassProfiles[[string]$_]
+                $profileSpeed = Get-ObjectPropertyValue -Object $profile -Name 'Speed' -Default ''
+                $profileSamples = Get-ObjectPropertyValue -Object $profile -Name 'SampleCount' -Default ''
+                '{0}:{1}:{2}' -f ([string]$_), $profileSpeed, $profileSamples
+            }) -join ';'
+        $planEtaCacheKey = @(
+            ($planIds -join "`n"),
+            ($completedForEta -join "`n"),
+            $planItemSignature,
+            $profileSignature,
+            [string]$script:CurrentCoverageId,
+            [string]$currentTotal,
+            [string]$script:CoverageCandidatesTested,
+            [string]$script:Activity,
+            [string]$currentSpeedForPlan,
+            [string]$script:ConservativeObservedGpuSpeed
+        ) -join "`0"
+        # The cache key includes the complete set of ETA inputs, including
+        # the current cursor and speed sample. Reusing an identical calculation
+        # is therefore exact while Hashcat is active. During a transition the
+        # display layer already holds the last valid ETA; reuse that snapshot
+        # until the next active executor supplies a fresh cursor/sample.
+        $canUsePlanEtaCache = $true
+        $canReuseTransitionPlanEta = $script:TransitionWindowActive -and $null -ne $script:PlanEtaCacheValue
+        if ($canUsePlanEtaCache -and $null -ne $script:PlanEtaCacheValue -and
+            ([string]::Equals($planEtaCacheKey, [string]$script:PlanEtaCacheKey, [System.StringComparison]::Ordinal) -or $canReuseTransitionPlanEta)) {
+            $planEta = $script:PlanEtaCacheValue
+            $script:PlanEtaCacheHits++
+        }
+        else {
+            $script:PlanEtaCacheMisses++
+            $planEtaOperationStartedUtc = [datetime]::UtcNow
+            $planEtaStopwatch = [System.Diagnostics.Stopwatch]::StartNew()
+            try {
+                $planEta = Get-CoverageDurationSumEta -PlanCoverageIds $planIds -PlanCoverageItems $planItems -CompletedCoverageIds $completedForEta -CurrentCoverageId ([string]$script:CurrentCoverageId) -CurrentTested ([long]$script:CoverageCandidatesTested) -CurrentTotal $currentTotal -Activity ([string]$script:Activity) -CurrentSpeedPerSecond $currentSpeedForPlan -CurrentSpeedIsStable (Get-WorkerCurrentCoverageSpeedIsStable) -FallbackGpuSpeedPerSecond $script:ConservativeObservedGpuSpeed -SpeedProfiles $script:SpeedClassProfiles
+            }
+            finally {
+                $planEtaStopwatch.Stop()
+                [long]$planEtaMs = [long]$planEtaStopwatch.ElapsedMilliseconds
+                $script:PlanEtaCalculationMs += $planEtaMs
+                if ($script:TransitionWindowActive) {
+                    $script:TransitionWindowPlanEtaCalculationMs += $planEtaMs
+                    $script:TransitionPlanEtaCalculationMsTotal += $planEtaMs
+                }
+                Add-WorkerTransitionInterval -StartUtc $planEtaOperationStartedUtc -EndUtc ([datetime]::UtcNow) -Name 'PlanEtaCalculation'
+            }
+            if ($canUsePlanEtaCache) {
+                $script:PlanEtaCacheKey = $planEtaCacheKey
+                $script:PlanEtaCacheValue = $planEta
+            }
+        }
         $planEtaReadiness = Update-WorkerEtaReadiness -PlanEta $planEta
         $planEtaForDisplay = [pscustomobject]@{
             PlanEtaSeconds = $planEta.PlanEtaSeconds
@@ -1289,7 +1420,21 @@ function Get-WorkerOverallFlowSnapshot {
         ProgressInvariantViolation = $ProgressInvariantViolation
         PlanEta = $planEtaForSnapshot
     }
-    $snapshot = Get-OverallFlowProgress @overallParameters
+    $overallProgressOperationStartedUtc = [datetime]::UtcNow
+    $overallProgressStopwatch = [System.Diagnostics.Stopwatch]::StartNew()
+    try {
+        $snapshot = Get-OverallFlowProgress @overallParameters
+    }
+    finally {
+        $overallProgressStopwatch.Stop()
+        [long]$overallProgressMs = [long]$overallProgressStopwatch.ElapsedMilliseconds
+        $script:OverallProgressCalculationMs += $overallProgressMs
+        if ($script:TransitionWindowActive) {
+            $script:TransitionWindowOverallProgressCalculationMs += $overallProgressMs
+            $script:TransitionOverallProgressCalculationMsTotal += $overallProgressMs
+        }
+        Add-WorkerTransitionInterval -StartUtc $overallProgressOperationStartedUtc -EndUtc ([datetime]::UtcNow) -Name 'OverallProgressCalculation'
+    }
 
     $stageDisplayName = if ($script:StageNumber -gt 0) {
         if (-not [string]::IsNullOrWhiteSpace([string]$script:StageName)) { [string]$script:StageName } else { [string]$script:Strategy }
@@ -1419,6 +1564,76 @@ function Save-WorkerPerformanceProfiles {
     }
 }
 
+function Start-WorkerTransitionWindow {
+    [CmdletBinding()]
+    param()
+
+    $script:TransitionWindowActive = $true
+    $script:TransitionWindowStartedUtc = [datetime]::UtcNow
+    $script:TransitionBusyIntervals.Clear()
+    $script:TransitionBusyUnionMs = 0L
+    $script:TransitionWindowProgressPersistenceMs = 0L
+    $script:TransitionWindowCoverageStatePersistenceMs = 0L
+    $script:TransitionWindowPlanEtaCalculationMs = 0L
+    $script:TransitionWindowOverallProgressCalculationMs = 0L
+    $script:TransitionWindowAttackPlanConstructionMs = 0L
+    $script:TransitionWindowBatchLookupMs = 0L
+    $script:TransitionWindowBatchConstructionMs = 0L
+    $script:TransitionWindowCoverageExecutionMs = 0L
+    $script:TransitionWindowJohnActiveMs = 0L
+    $script:TransitionWindowNanaZipVerificationMs = 0L
+    $script:TransitionWindowEngineSelectionMs = 0L
+    $script:TransitionWindowArchiveArtifactLookupMs = 0L
+}
+
+function Add-WorkerTransitionInterval {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][datetime]$StartUtc,
+        [Parameter(Mandatory = $true)][datetime]$EndUtc,
+        [Parameter(Mandatory = $true)][string]$Name
+    )
+
+    if (-not $script:TransitionWindowActive -or $null -eq $script:TransitionWindowStartedUtc) { return }
+    if ($EndUtc -le $StartUtc) { return }
+    [void]$script:TransitionBusyIntervals.Add([pscustomobject]@{ Name = $Name; StartUtc = $StartUtc; EndUtc = $EndUtc })
+}
+
+function Complete-WorkerTransitionWindow {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][datetime]$EndUtc
+    )
+
+    if (-not $script:TransitionWindowActive -or $null -eq $script:TransitionWindowStartedUtc) { return }
+    [long]$transitionMs = [long](($EndUtc - $script:TransitionWindowStartedUtc).TotalMilliseconds)
+    if ($transitionMs -lt 0) { $transitionMs = 0L }
+    $script:CoverageTransitionMs += $transitionMs
+
+    # Individual timers overlap (for example, atomic state writes are inside
+    # Publish-Progress). Merge their recorded wall intervals before deriving
+    # idle time; a sum of component durations would double-count nested work.
+    [long]$busyMs = 0L
+    $cursorUtc = $script:TransitionWindowStartedUtc
+    foreach ($interval in @($script:TransitionBusyIntervals | Sort-Object StartUtc, EndUtc)) {
+        $intervalStart = if ($interval.StartUtc -lt $script:TransitionWindowStartedUtc) { $script:TransitionWindowStartedUtc } else { $interval.StartUtc }
+        $intervalEnd = if ($interval.EndUtc -gt $EndUtc) { $EndUtc } else { $interval.EndUtc }
+        if ($intervalEnd -le $intervalStart) { continue }
+        if ($intervalStart -gt $cursorUtc) { $cursorUtc = $intervalStart }
+        if ($intervalEnd -gt $cursorUtc) {
+            $busyMs += [long](($intervalEnd - $cursorUtc).TotalMilliseconds)
+            $cursorUtc = $intervalEnd
+        }
+    }
+    $script:TransitionBusyUnionMs = $busyMs
+    $script:TransitionBusyUnionMsTotal += $busyMs
+    $idleMs = $transitionMs - $busyMs
+    if ($idleMs -lt 0) { $idleMs = 0L }
+    $script:InterCoverageIdleMs += [long]$idleMs
+    $script:TransitionWindowActive = $false
+    $script:TransitionWindowStartedUtc = $null
+}
+
 function Save-CoverageState {
     [CmdletBinding()]
     param()
@@ -1431,7 +1646,21 @@ function Save-CoverageState {
         CurrentCheckpoint = $script:CurrentCheckpoint
         UpdatedUtc = [datetime]::UtcNow.ToString('o')
     }
-    Write-LocalJsonAtomic -Path $coveragePath -Value $record
+    $stateOperationStartedUtc = [datetime]::UtcNow
+    $statePersistenceStopwatch = [System.Diagnostics.Stopwatch]::StartNew()
+    try {
+        Write-LocalJsonAtomic -Path $coveragePath -Value $record
+    }
+    finally {
+        $statePersistenceStopwatch.Stop()
+        [long]$statePersistenceMs = [long]$statePersistenceStopwatch.ElapsedMilliseconds
+        $script:CoverageStatePersistenceMs += $statePersistenceMs
+        if ($script:TransitionWindowActive) {
+            $script:TransitionWindowCoverageStatePersistenceMs += $statePersistenceMs
+            $script:TransitionCoverageStatePersistenceMsTotal += $statePersistenceMs
+        }
+        Add-WorkerTransitionInterval -StartUtc $stateOperationStartedUtc -EndUtc ([datetime]::UtcNow) -Name 'CoverageStatePersistence'
+    }
 }
 
 function Update-CoverageCheckpoint {
@@ -1529,7 +1758,7 @@ function Set-CoverageAttemptProgress {
     Update-CoverageCheckpoint
 }
 
-function Publish-Progress {
+function Publish-ProgressCore {
     [CmdletBinding()]
     param(
         [Parameter(Mandatory = $true)][string]$State,
@@ -1716,6 +1945,14 @@ function Publish-Progress {
         JohnCandidateProgressReliable = [bool]$script:JohnCandidateProgressReliable
         NanaZipVerifierProcessLaunchCount = [int]$script:NanaZipVerifierProcessLaunchCount
         NanaZipVerificationMs = [long]$script:NanaZipVerificationMs
+        NanaZipVerificationByCoverage = @(
+            foreach ($coverageId in @($script:NanaZipVerificationCountsByCoverage.Keys | Sort-Object)) {
+                [pscustomobject]@{
+                    CoverageId = [string]$coverageId
+                    VerifierLaunches = [int]$script:NanaZipVerificationCountsByCoverage[[string]$coverageId]
+                }
+            }
+        )
         ArchiveArtifactState = [string]$script:ArchiveArtifactState
         ArchiveArtifactExtractionCalls = [int]$script:ArchiveArtifactExtractionCalls
         ArchiveArtifactMessage = [string]$script:ArchiveArtifactMessage
@@ -1726,8 +1963,51 @@ function Publish-Progress {
         HashcatRuntimeCopyFiles = [int]$script:HashcatRuntimeCopyFiles
         HashcatStartupMsTotal = [long]$script:HashcatStartupMsTotal
         HashcatStartupMsAverage = if ($script:HashcatStartupSamples -gt 0) { [math]::Round($script:HashcatStartupMsTotal / [double]$script:HashcatStartupSamples, 1) } else { $null }
+        HashcatExecutorCoverageBatches = @($script:HashcatExecutorCoverageBatches.ToArray())
         HashcatActiveSearchMs = [long]$script:HashcatActiveSearchMs
         CoverageTransitionMs = [long]$script:CoverageTransitionMs
+        ExecutorShutdownMs = [long]$script:ExecutorShutdownMs
+        StreamPumpDrainMs = [long]$script:StreamPumpDrainMs
+        ProgressPersistenceMs = [long]$script:ProgressPersistenceMs
+        ProgressPublishMs = [long]$script:ProgressPublishMs
+        OverallPlanSnapshotMs = [long]$script:OverallPlanSnapshotMs
+        PlanEtaCalculationMs = [long]$script:PlanEtaCalculationMs
+        OverallProgressCalculationMs = [long]$script:OverallProgressCalculationMs
+        PlanEtaCacheHits = [int]$script:PlanEtaCacheHits
+        PlanEtaCacheMisses = [int]$script:PlanEtaCacheMisses
+        CoverageStatePersistenceMs = [long]$script:CoverageStatePersistenceMs
+        AttackPlanConstructionMs = [long]$script:AttackPlanConstructionMs
+        BatchLookupMs = [long]$script:BatchLookupMs
+        BatchConstructionMs = [long]$script:BatchConstructionMs
+        EngineSelectionMs = [long]$script:EngineSelectionMs
+        EngineSelectionCacheHits = [int]$script:EngineSelectionCacheHits
+        EngineSelectionCacheMisses = [int]$script:EngineSelectionCacheMisses
+        ArchiveArtifactLookupMs = [long]$script:ArchiveArtifactLookupMs
+        CoverageExecutionMs = [long]$script:CoverageExecutionMs
+        CoverageExecutionByCoverage = @(
+            foreach ($coverageId in @($script:CoverageExecutionMsByCoverage.Keys | Sort-Object)) {
+                [pscustomobject]@{
+                    CoverageId = [string]$coverageId
+                    ExecutionMs = [long]$script:CoverageExecutionMsByCoverage[[string]$coverageId]
+                }
+            }
+        )
+        TransitionBusyUnionMs = [long]$script:TransitionBusyUnionMsTotal
+        InterCoverageIdleMs = [long]$script:InterCoverageIdleMs
+        TransitionProgressPersistenceMs = [long]$script:TransitionProgressPersistenceMsTotal
+        TransitionProgressPublishMs = [long]$script:TransitionProgressPublishMsTotal
+        TransitionOverallPlanSnapshotMs = [long]$script:TransitionOverallPlanSnapshotMsTotal
+        TransitionPlanEtaCalculationMs = [long]$script:TransitionPlanEtaCalculationMsTotal
+        TransitionOverallProgressCalculationMs = [long]$script:TransitionOverallProgressCalculationMsTotal
+        TransitionCoverageStatePersistenceMs = [long]$script:TransitionCoverageStatePersistenceMsTotal
+        TransitionAttackPlanConstructionMs = [long]$script:TransitionAttackPlanConstructionMsTotal
+        TransitionBatchLookupMs = [long]$script:TransitionBatchLookupMsTotal
+        TransitionBatchConstructionMs = [long]$script:TransitionBatchConstructionMsTotal
+        TransitionCoverageExecutionMs = [long]$script:TransitionCoverageExecutionMsTotal
+        TransitionJohnActiveMs = [long]$script:TransitionJohnActiveMsTotal
+        TransitionNanaZipVerificationMs = [long]$script:TransitionNanaZipVerificationMsTotal
+        TransitionEngineSelectionMs = [long]$script:TransitionEngineSelectionMsTotal
+        TransitionArchiveArtifactLookupMs = [long]$script:TransitionArchiveArtifactLookupMsTotal
         TimeToFirstGpuExecutorMs = if ($null -ne $script:FirstGpuExecutorStartedUtc) { [long](($script:FirstGpuExecutorStartedUtc - $script:RunStartedUtc).TotalMilliseconds) } else { $null }
         Level1To3ExecutionBatches = [int]$script:Level1To3ExecutionBatchCount
         NativeRuleCoverages = @($script:NativeRuleCoverageIds | ForEach-Object { [string]$_ })
@@ -1850,11 +2130,54 @@ function Publish-Progress {
         UpdatedUtc        = [datetime]::UtcNow.ToString('o')
         Result            = $Result
     }
-    Write-LocalJsonAtomic -Path $progressPath -Value $record
+    $progressPersistenceOperationStartedUtc = [datetime]::UtcNow
+    $progressPersistenceStopwatch = [System.Diagnostics.Stopwatch]::StartNew()
+    try {
+        Write-LocalJsonAtomic -Path $progressPath -Value $record
+    }
+    finally {
+        $progressPersistenceStopwatch.Stop()
+        [long]$progressPersistenceMs = [long]$progressPersistenceStopwatch.ElapsedMilliseconds
+        $script:ProgressPersistenceMs += $progressPersistenceMs
+        if ($script:TransitionWindowActive) {
+            $script:TransitionWindowProgressPersistenceMs += $progressPersistenceMs
+            $script:TransitionProgressPersistenceMsTotal += $progressPersistenceMs
+        }
+        Add-WorkerTransitionInterval -StartUtc $progressPersistenceOperationStartedUtc -EndUtc ([datetime]::UtcNow) -Name 'ProgressPersistence'
+    }
     if ($script:IsCumulativeJob) {
         try { Save-CoverageState } catch { }
     }
     $script:LastPublishUtc = [datetime]::UtcNow
+}
+
+function Publish-Progress {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][string]$State,
+        [Parameter(Mandatory = $true)][string]$Message,
+        $Result,
+        [double]$BackendSpeed = $script:LastBackendSpeed,
+        [string]$Activity = '',
+        [string]$ActivityMessage = '',
+        [switch]$InitialSnapshot
+    )
+
+    $publishOperationStartedUtc = [datetime]::UtcNow
+    $publishStopwatch = [System.Diagnostics.Stopwatch]::StartNew()
+    try {
+        return (Publish-ProgressCore @PSBoundParameters)
+    }
+    finally {
+        $publishStopwatch.Stop()
+        [long]$publishMs = [long]$publishStopwatch.ElapsedMilliseconds
+        $script:ProgressPublishMs += $publishMs
+        if ($script:TransitionWindowActive) {
+            $script:TransitionWindowProgressPublishMs += $publishMs
+            $script:TransitionProgressPublishMsTotal += $publishMs
+        }
+        Add-WorkerTransitionInterval -StartUtc $publishOperationStartedUtc -EndUtc ([datetime]::UtcNow) -Name 'ProgressPublish'
+    }
 }
 
 function Publish-ProgressIfDue {
@@ -2140,13 +2463,30 @@ function Invoke-WorkerNanaZipVerification {
         [Parameter(Mandatory = $true)][string]$SevenZip
     )
 
+    $coverageId = if ($null -ne $script:ActivePlanItem) {
+        [string](Get-ObjectPropertyValue -Object $script:ActivePlanItem -Name 'CoverageId' -Default '')
+    }
+    if ([string]::IsNullOrWhiteSpace($coverageId)) { $coverageId = 'unscoped' }
+    if ($script:NanaZipVerificationCountsByCoverage.ContainsKey($coverageId)) {
+        $script:NanaZipVerificationCountsByCoverage[$coverageId] = [int]$script:NanaZipVerificationCountsByCoverage[$coverageId] + 1
+    }
+    else {
+        $script:NanaZipVerificationCountsByCoverage[$coverageId] = 1
+    }
+    $verificationOperationStartedUtc = [datetime]::UtcNow
     $stopwatch = [System.Diagnostics.Stopwatch]::StartNew()
     try {
         return (Test-ArchivePassword -ArchivePath ([string]$job.ArchivePath) -Password $Candidate -SevenZip $SevenZip)
     }
     finally {
         $stopwatch.Stop()
-        $script:NanaZipVerificationMs += [long]$stopwatch.ElapsedMilliseconds
+        [long]$nanaZipMs = [long]$stopwatch.ElapsedMilliseconds
+        $script:NanaZipVerificationMs += $nanaZipMs
+        if ($script:TransitionWindowActive) {
+            $script:TransitionWindowNanaZipVerificationMs += $nanaZipMs
+            $script:TransitionNanaZipVerificationMsTotal += $nanaZipMs
+        }
+        Add-WorkerTransitionInterval -StartUtc $verificationOperationStartedUtc -EndUtc ([datetime]::UtcNow) -Name 'NanaZipVerification'
     }
 }
 
@@ -2291,7 +2631,7 @@ function New-JohnCandidateWordlist {
     $isCumulativeItem = $null -ne $Item
     $kind = if ($isCumulativeItem) { [string](Get-ObjectPropertyValue -Object $Item -Name 'Kind' -Default '') } else { '' }
     $eligible = if ($isCumulativeItem) {
-        $kind -in @('BuiltinDictionary', 'Dictionary', 'CustomDictionary', 'RulesDictionary', 'CustomRules', 'RuleCaseVariants', 'RuleAppendVariants', 'DateRange', 'CommonSymbols')
+        $kind -in @('Quick', 'YearCombination', 'BuiltinDictionary', 'Dictionary', 'CustomDictionary', 'RulesDictionary', 'CustomRules', 'RuleCaseVariants', 'RuleAppendVariants', 'DateRange', 'CommonSymbols')
     }
     else {
         [string]$Strategy -in @('Dictionary', 'Rules')
@@ -2300,6 +2640,57 @@ function New-JohnCandidateWordlist {
         return [pscustomobject]@{
             Supported = $false
             Message = 'This candidate strategy is not exactly representable as a John wordlist; NanaZip CPU verification remains the fallback.'
+        }
+    }
+
+    # Quick and finite year-combination coverages are already small, ordered
+    # candidate sets. Use the existing app-owned John bulk path for supported
+    # archive formats instead of launching one NanaZip verifier per candidate.
+    # The wordlist is intentionally tiny and is never used as a derived
+    # dictionary for a large transformation family.
+    if ($isCumulativeItem -and $kind -in @('Quick', 'YearCombination')) {
+        $wordlistDirectory = Join-Path $script:RuntimeDirectory 'john'
+        $identity = [string](Get-ObjectPropertyValue -Object $Item -Name 'CoverageId' -Default 'finite')
+        $safeIdentity = [regex]::Replace($identity, '[^A-Za-z0-9_.-]', '_')
+        if ([string]::IsNullOrWhiteSpace($safeIdentity)) { $safeIdentity = 'finite' }
+        if ($safeIdentity.Length -gt 80) { $safeIdentity = $safeIdentity.Substring(0, 80) }
+        $wordlistPath = Join-Path $wordlistDirectory ('candidates-{0}.txt' -f $safeIdentity)
+        $finiteWriter = $null
+        [long]$finitePosition = 0L
+        try {
+            New-Item -ItemType Directory -Path $wordlistDirectory -Force -ErrorAction Stop | Out-Null
+            $finiteWriter = New-Object System.IO.StreamWriter($wordlistPath, $false, (New-Object System.Text.UTF8Encoding($false)))
+            if ($kind -eq 'Quick') {
+                foreach ($candidate in @($Item.Candidates)) {
+                    Add-JohnCandidateLine -Writer $finiteWriter -Candidate ([string]$candidate) -SkipCount $SkipCount -Position ([ref]$finitePosition)
+                }
+            }
+            else {
+                for ($year = [int]$Item.StartYear; $year -le [int]$Item.EndYear; $year++) {
+                    Add-JohnCandidateLine -Writer $finiteWriter -Candidate (('{0:D4}{0:D4}' -f $year)) -SkipCount $SkipCount -Position ([ref]$finitePosition)
+                    Add-JohnCandidateLine -Writer $finiteWriter -Candidate (('{0:D4}{1:D4}' -f $year, ($year + 1))) -SkipCount $SkipCount -Position ([ref]$finitePosition)
+                }
+            }
+        }
+        catch {
+            return [pscustomobject]@{
+                Supported = $false
+                Message = ('John finite candidate preparation was unavailable: ' + $_.Exception.Message)
+            }
+        }
+        finally {
+            if ($null -ne $finiteWriter) { $finiteWriter.Dispose() }
+        }
+        $Item.CandidateCount = $finitePosition
+        Set-WorkerOverallCoverageTotal -CoverageId ([string]$Item.CoverageId) -CandidateCount $finitePosition
+        $script:JohnWordlistSourceMode = 'Materialized'
+        return [pscustomobject]@{
+            Supported = $true
+            Path = $wordlistPath
+            TotalCount = $finitePosition
+            RemainingCount = [math]::Max(0L, $finitePosition - $SkipCount)
+            StartPosition = [math]::Min($finitePosition, [math]::Max(0L, $SkipCount))
+            SourceMode = 'Materialized'
         }
     }
 
@@ -2885,12 +3276,30 @@ function Copy-HashcatRestoreCheckpoint {
         [switch]$OverwriteDestination
     )
 
-    if (-not (Test-Path -LiteralPath $SourcePath -PathType Leaf)) {
-        return $false
-    }
-
+    [bool]$sourceSeen = $false
+    [bool]$copySucceeded = $false
+    $copyException = $null
     try {
-        [System.IO.File]::Copy($SourcePath, $DestinationPath, [bool]$OverwriteDestination)
+        # Hashcat may publish the restore file just before releasing its file
+        # handle. This is a bounded handoff retry, not a recovery watchdog.
+        for ([int]$copyAttempt = 0; $copyAttempt -lt 40; $copyAttempt++) {
+            if (Test-Path -LiteralPath $SourcePath -PathType Leaf) {
+                $sourceSeen = $true
+                try {
+                    [System.IO.File]::Copy($SourcePath, $DestinationPath, [bool]$OverwriteDestination)
+                    $copySucceeded = $true
+                    break
+                }
+                catch {
+                    $copyException = $_.Exception
+                }
+            }
+            if ($copyAttempt -lt 39) { Start-Sleep -Milliseconds 50 }
+        }
+        if (-not $copySucceeded) {
+            if (-not $sourceSeen) { return $false }
+            throw $copyException
+        }
 
         # A Hashcat restore file contains the previous command line. The
         # per-run directory changes on every Worker, so rewrite only the
@@ -3107,7 +3516,8 @@ function Invoke-JohnCpuRecovery {
 
         $script:JohnBinaryUsed = [string]$johnPath
         $script:JohnProcessLaunchCount++
-        $script:JohnProcessStartedUtc = [datetime]::UtcNow
+        $johnProcessStartedUtc = [datetime]::UtcNow
+        $script:JohnProcessStartedUtc = $johnProcessStartedUtc
         $script:JohnLastOutputPath = $outputPath
         $script:JohnLastErrorPath = $errorPath
         $script:JohnOutputByteOffset = 0L
@@ -3189,6 +3599,14 @@ function Invoke-JohnCpuRecovery {
         Import-JohnOutputFile -OutputPath $outputPath -ErrorPath $errorPath
         $script:ActiveJohnProcess = $null
         $process.Dispose()
+        $johnProcessEndedUtc = [datetime]::UtcNow
+        [long]$johnProcessMs = [long](($johnProcessEndedUtc - $johnProcessStartedUtc).TotalMilliseconds)
+        if ($johnProcessMs -lt 0) { $johnProcessMs = 0L }
+        if ($script:TransitionWindowActive) {
+            $script:TransitionWindowJohnActiveMs += $johnProcessMs
+            $script:TransitionJohnActiveMsTotal += $johnProcessMs
+        }
+        Add-WorkerTransitionInterval -StartUtc $johnProcessStartedUtc -EndUtc $johnProcessEndedUtc -Name 'JohnActive'
 
         if ($stopSent) {
             $script:TerminalState = 'Stopped'
@@ -3228,7 +3646,13 @@ function Invoke-JohnCpuRecovery {
                 try { $diagnostic += "`n" + ([string]::Join("`n", [System.IO.File]::ReadAllLines($path))) } catch { }
             }
         }
-        if ($processExitCode -ne 0 -or $diagnostic -match '(?i)no password hashes loaded|unknown ciphertext|format.*(not found|unknown)|invalid.*format|error:') {
+        # John returns exit code 1 after exhausting a finite wordlist without
+        # a crack. That is a normal completion for the two small finite
+        # coverages above; retain non-zero handling for all other paths and
+        # for explicit format/input errors.
+        $finiteBulkExhausted = $null -ne $Item -and [string]$Item.Kind -in @('Quick', 'YearCombination') -and $processExitCode -eq 1
+        if ((($processExitCode -ne 0) -and -not $finiteBulkExhausted) -or
+            $diagnostic -match '(?i)no password hashes loaded|unknown ciphertext|format.*(not found|unknown)|invalid.*format|error:') {
             $unsupportedGroup = $true
             $script:JohnCandidateProgressReliable = $true
             $script:JohnLastMessage = 'The bundled John Jumbo build did not accept one extracted archive record format; NanaZip CPU verification remains the fallback.'
@@ -3460,11 +3884,30 @@ function Invoke-HashcatRecovery {
     }
     Publish-Progress -State 'Running' -Message $startupMessage -Result $null
     [void]$process.Start()
+    $processStartedUtc = [datetime]::UtcNow
     $script:HashcatProcessLaunchCount++
-    $script:HashcatProcessStartedUtc = [datetime]::UtcNow
+    $launchCoverageIds = if ($null -ne $script:ActiveGpuBatch) {
+        @($script:ActiveGpuBatch.Items | ForEach-Object { [string](Get-ObjectPropertyValue -Object $_ -Name 'CoverageId' -Default '') })
+    }
+    elseif ($null -ne $script:ActivePlanItem) {
+        @([string](Get-ObjectPropertyValue -Object $script:ActivePlanItem -Name 'CoverageId' -Default ''))
+    }
+    else { @() }
+    [void]$script:HashcatExecutorCoverageBatches.Add([pscustomobject]@{
+            LaunchNumber = [int]$script:HashcatProcessLaunchCount
+            CoverageIds = @($launchCoverageIds)
+            HashMode = [string](Get-ObjectPropertyValue -Object $Artifact -Name 'HashMode' -Default '')
+            DeviceId = [int](Get-ObjectPropertyValue -Object $Engine -Name 'DeviceId' -Default -1)
+            AttackMode = [int](Get-ObjectPropertyValue -Object $AttackPlan -Name 'AttackMode' -Default -1)
+            ExecutionFamily = if ($null -ne $script:ActiveGpuBatch) { [string](Get-ObjectPropertyValue -Object $script:ActiveGpuBatch -Name 'ExecutionFamily' -Default '') } else { '' }
+        })
+    $script:HashcatProcessStartedUtc = $processStartedUtc
     $script:ExecutorStartedUtc = $script:HashcatProcessStartedUtc
     if ($null -eq $script:FirstGpuExecutorStartedUtc) {
         $script:FirstGpuExecutorStartedUtc = $script:HashcatProcessStartedUtc
+    }
+    elseif ($script:TransitionWindowActive) {
+        Complete-WorkerTransitionWindow -EndUtc $script:HashcatProcessStartedUtc
     }
     elseif ($null -ne $script:LastGpuExecutorEndedUtc) {
         $transitionMs = [long](($script:HashcatProcessStartedUtc - $script:LastGpuExecutorEndedUtc).TotalMilliseconds)
@@ -3537,10 +3980,12 @@ function Invoke-HashcatRecovery {
         Start-Sleep -Milliseconds 200
     }
 
+    $executorShutdownStopwatch = [System.Diagnostics.Stopwatch]::StartNew()
     $process.WaitForExit()
     $processExitCode = $process.ExitCode
     $searchStartedUtc = if ($null -ne $script:HashcatFirstStatusUtc) { $script:HashcatFirstStatusUtc } else { $script:HashcatProcessStartedUtc }
     if ($null -ne $searchStartedUtc) { $script:HashcatActiveSearchMs += [long](([datetime]::UtcNow - $searchStartedUtc).TotalMilliseconds) }
+    $streamPumpDrainStopwatch = [System.Diagnostics.Stopwatch]::StartNew()
     try {
         if (-not $standardOutputTask.Wait(5000)) {
             $process.StandardOutput.Dispose()
@@ -3555,10 +4000,15 @@ function Invoke-HashcatRecovery {
         # The backend has already exited. A trailing local diagnostic line is
         # optional and must not change the recovery outcome.
     }
+    $streamPumpDrainStopwatch.Stop()
+    $script:StreamPumpDrainMs += [long]$streamPumpDrainStopwatch.ElapsedMilliseconds
     Import-HashcatStatusFile -StatusPath $statusPath
     $process.Dispose()
     $script:ActiveHashcatProcess = $null
+    $executorShutdownStopwatch.Stop()
+    $script:ExecutorShutdownMs += [long]$executorShutdownStopwatch.ElapsedMilliseconds
     $script:LastGpuExecutorEndedUtc = [datetime]::UtcNow
+    Start-WorkerTransitionWindow
 
     if ($stopSent) {
         $hasRestore = (Copy-HashcatRestoreCheckpoint -SourcePath $runtimeRestorePath -DestinationPath $persistentRestorePath -OverwriteDestination) -or (Test-Path -LiteralPath $persistentRestorePath -PathType Leaf)
@@ -3625,6 +4075,139 @@ function Invoke-HashcatRecovery {
         $script:TerminalState = 'Exhausted'
         Set-WorkerActivity -Activity 'Exhausted' -Message 'The selected local Hashcat GPU search completed without a verified password.'
         Publish-Progress -State 'Exhausted' -Message 'The selected local Hashcat GPU search completed without a verified password.' -Result $null
+    }
+}
+
+function New-WorkerTimedHashcatAttackPlan {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]$PlanJob,
+        [Parameter(Mandatory = $true)][string]$HashPath,
+        [Parameter(Mandatory = $true)][string]$JobDirectory,
+        [Parameter(Mandatory = $true)][int]$RecoveryPlanYear,
+        [string]$Strategy = ''
+    )
+
+    $planOperationStartedUtc = [datetime]::UtcNow
+    $planStopwatch = [System.Diagnostics.Stopwatch]::StartNew()
+    try {
+        return (New-HashcatAttackPlan -Job $PlanJob -HashPath $HashPath -JobDirectory $JobDirectory -RecoveryPlanYear $RecoveryPlanYear -Strategy $Strategy)
+    }
+    finally {
+        $planStopwatch.Stop()
+        [long]$planMs = [long]$planStopwatch.ElapsedMilliseconds
+        $script:AttackPlanConstructionMs += $planMs
+        if ($script:TransitionWindowActive) {
+            $script:TransitionWindowAttackPlanConstructionMs += $planMs
+            $script:TransitionAttackPlanConstructionMsTotal += $planMs
+        }
+        Add-WorkerTransitionInterval -StartUtc $planOperationStartedUtc -EndUtc ([datetime]::UtcNow) -Name 'AttackPlanConstruction'
+    }
+}
+
+function Select-WorkerTimedLocalEngine {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]$Inspection,
+        [Parameter(Mandatory = $true)][string]$Strategy,
+        $PlanningJob = $null
+    )
+
+    $selectionOperationStartedUtc = [datetime]::UtcNow
+    $selectionStopwatch = [System.Diagnostics.Stopwatch]::StartNew()
+    try {
+        $preference = [string](Get-ObjectPropertyValue -Object $job -Name 'DevicePreference' -Default 'Auto')
+        if ([string]::IsNullOrWhiteSpace($preference)) { $preference = 'Auto' }
+        $strategyJob = if ($null -ne $PlanningJob) { $PlanningJob } else { $job }
+        $savedGpu = if ($job.PSObject.Properties.Name -contains 'SelectedGpu') { $job.SelectedGpu } else { $null }
+        $selectionKey = @(
+            [string](Get-ObjectPropertyValue -Object $Inspection -Name 'Format' -Default '')
+            $preference
+            $Strategy
+            [string](Get-ObjectPropertyValue -Object $strategyJob -Name 'PlanKind' -Default '')
+            [string](Get-ObjectPropertyValue -Object $strategyJob -Name 'Mask' -Default '')
+            [string](Get-ObjectPropertyValue -Object $strategyJob -Name 'CharacterSet' -Default '')
+            [string](Get-ObjectPropertyValue -Object $strategyJob -Name 'CustomCharacters' -Default '')
+            [string](Get-ObjectPropertyValue -Object $strategyJob -Name 'MinLength' -Default '')
+            [string](Get-ObjectPropertyValue -Object $strategyJob -Name 'MaxLength' -Default '')
+            [string](Get-ObjectPropertyValue -Object $savedGpu -Name 'Name' -Default '')
+            [string](Get-ObjectPropertyValue -Object $savedGpu -Name 'Vendor' -Default '')
+            [string](Get-ObjectPropertyValue -Object $savedGpu -Name 'DeviceId' -Default '')
+        ) -join "`0"
+        if ($script:EngineSelectionCache.ContainsKey($selectionKey)) {
+            $script:EngineSelectionCacheHits++
+            return $script:EngineSelectionCache[$selectionKey]
+        }
+        $script:EngineSelectionCacheMisses++
+        $engine = Select-LocalEngine -Inspection $Inspection -Strategy $Strategy -PlanningJob $PlanningJob
+        $script:EngineSelectionCache[$selectionKey] = $engine
+        return $engine
+    }
+    finally {
+        $selectionStopwatch.Stop()
+        [long]$selectionMs = [long]$selectionStopwatch.ElapsedMilliseconds
+        $script:EngineSelectionMs += $selectionMs
+        if ($script:TransitionWindowActive) {
+            $script:TransitionWindowEngineSelectionMs += $selectionMs
+            $script:TransitionEngineSelectionMsTotal += $selectionMs
+        }
+        Add-WorkerTransitionInterval -StartUtc $selectionOperationStartedUtc -EndUtc ([datetime]::UtcNow) -Name 'EngineSelection'
+    }
+}
+
+function Get-WorkerTimedHashcatArtifact {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][string]$ArchivePath,
+        [Parameter(Mandatory = $true)][string]$ArchiveFormat
+    )
+
+    $artifactOperationStartedUtc = [datetime]::UtcNow
+    $artifactStopwatch = [System.Diagnostics.Stopwatch]::StartNew()
+    try {
+        return (Get-RunArchiveHashcatArtifact -ArchivePath $ArchivePath -ArchiveFormat $ArchiveFormat)
+    }
+    finally {
+        $artifactStopwatch.Stop()
+        [long]$artifactMs = [long]$artifactStopwatch.ElapsedMilliseconds
+        $script:ArchiveArtifactLookupMs += $artifactMs
+        if ($script:TransitionWindowActive) {
+            $script:TransitionWindowArchiveArtifactLookupMs += $artifactMs
+            $script:TransitionArchiveArtifactLookupMsTotal += $artifactMs
+        }
+        Add-WorkerTransitionInterval -StartUtc $artifactOperationStartedUtc -EndUtc ([datetime]::UtcNow) -Name 'ArchiveArtifactLookup'
+    }
+}
+
+function Invoke-WorkerTimedCumulativePlanCpu {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]$Item,
+        [Parameter(Mandatory = $true)][string]$SevenZip
+    )
+
+    $coverageOperationStartedUtc = [datetime]::UtcNow
+    $coverageStopwatch = [System.Diagnostics.Stopwatch]::StartNew()
+    try {
+        return (Invoke-CumulativePlanCpu -Item $Item -SevenZip $SevenZip)
+    }
+    finally {
+        $coverageStopwatch.Stop()
+        [long]$coverageMs = [long]$coverageStopwatch.ElapsedMilliseconds
+        $script:CoverageExecutionMs += $coverageMs
+        $coverageId = [string](Get-ObjectPropertyValue -Object $Item -Name 'CoverageId' -Default 'unscoped')
+        if ([string]::IsNullOrWhiteSpace($coverageId)) { $coverageId = 'unscoped' }
+        if ($script:CoverageExecutionMsByCoverage.ContainsKey($coverageId)) {
+            $script:CoverageExecutionMsByCoverage[$coverageId] = [long]$script:CoverageExecutionMsByCoverage[$coverageId] + $coverageMs
+        }
+        else {
+            $script:CoverageExecutionMsByCoverage[$coverageId] = $coverageMs
+        }
+        if ($script:TransitionWindowActive) {
+            $script:TransitionWindowCoverageExecutionMs += $coverageMs
+            $script:TransitionCoverageExecutionMsTotal += $coverageMs
+        }
+        Add-WorkerTransitionInterval -StartUtc $coverageOperationStartedUtc -EndUtc ([datetime]::UtcNow) -Name 'CoverageExecution'
     }
 }
 
@@ -4429,7 +5012,13 @@ function New-BuiltinGpuExecutionBatch {
     }
     $script:BuiltinBatchCacheHit = $cacheHit
     $batchStopwatch.Stop()
-    $script:BuiltinBatchPreparationMs += [long]$batchStopwatch.ElapsedMilliseconds
+    [long]$batchConstructionMs = [long]$batchStopwatch.ElapsedMilliseconds
+    $script:BuiltinBatchPreparationMs += $batchConstructionMs
+    $script:BatchConstructionMs += $batchConstructionMs
+    if ($script:TransitionWindowActive) {
+        $script:TransitionWindowBatchConstructionMs += $batchConstructionMs
+        $script:TransitionBatchConstructionMsTotal += $batchConstructionMs
+    }
     return [pscustomobject]@{ BatchId = $batchId; BatchSchemaVersion = $batchSchemaVersion; StageNumbers = $stageNumbers; CandidatePath = $candidatePath; Segments = @($segments); TotalCandidateCount = [long](@($segments | Measure-Object -Property CandidateCount -Sum).Sum); CacheHit = $cacheHit; Items = $Items; ExecutionFamily = 'MaterializedDictionary' }
 }
 
@@ -4941,7 +5530,7 @@ function Invoke-CumulativeRecovery {
             Set-WorkerActivity -Activity 'PreparingBackend' -Message ('Preparing the local backend for coverage: {0}.' -f $item.DisplayName)
             Publish-Progress -State 'Running' -Message ('Preparing the local backend for coverage: ' + [string]$item.DisplayName) -Result $null
             if ($canGpu) {
-                $engine = Select-LocalEngine -Inspection $inspection -Strategy ([string]$item.EngineStrategy) -PlanningJob $planningJob
+                $engine = Select-WorkerTimedLocalEngine -Inspection $inspection -Strategy ([string]$item.EngineStrategy) -PlanningJob $planningJob
             }
             else {
                 $engine = New-CpuEngine -Message ('Running the dynamic local coverage: ' + [string]$item.DisplayName)
@@ -4966,7 +5555,7 @@ function Invoke-CumulativeRecovery {
                 if (-not (Test-Path -LiteralPath $script:RuntimeDirectory -PathType Container)) {
                     New-Item -ItemType Directory -Path $script:RuntimeDirectory -ErrorAction Stop | Out-Null
                 }
-                $artifact = Get-RunArchiveHashcatArtifact -ArchivePath ([string]$job.ArchivePath) -ArchiveFormat ([string]$inspection.Format)
+                $artifact = Get-WorkerTimedHashcatArtifact -ArchivePath ([string]$job.ArchivePath) -ArchiveFormat ([string]$inspection.Format)
                 if (-not $artifact.Supported) {
                     $engine = New-CpuEngine -Message ($artifact.Message + ' CPU fallback was selected.')
                     Set-WorkerEngineSelection -Engine $engine
@@ -4981,7 +5570,7 @@ function Invoke-CumulativeRecovery {
                     $planDictionaryPath = ''
                     if ($dictionaryPaths.Count -eq 1) { $planDictionaryPath = [string]$dictionaryPaths[0] }
                     $planJob = Get-PlanJob -Item $item -DictionaryPath $planDictionaryPath
-                    $attackPlan = New-HashcatAttackPlan -Job $planJob -HashPath $artifact.HashPath -JobDirectory $script:RuntimeDirectory -RecoveryPlanYear $script:RecoveryPlanYear -Strategy ([string]$item.EngineStrategy)
+                    $attackPlan = New-WorkerTimedHashcatAttackPlan -PlanJob $planJob -HashPath $artifact.HashPath -JobDirectory $script:RuntimeDirectory -RecoveryPlanYear $script:RecoveryPlanYear -Strategy ([string]$item.EngineStrategy)
                     if (-not $attackPlan.Supported) {
                         $engine = New-CpuEngine -Message ($attackPlan.Message + ' CPU fallback was selected.')
                         Set-WorkerEngineSelection -Engine $engine
@@ -5004,7 +5593,7 @@ function Invoke-CumulativeRecovery {
                         $planDictionaryPath = ''
                         if ($dictionaryPaths.Count -eq 1) { $planDictionaryPath = [string]$dictionaryPaths[0] }
                         $planJob = Get-PlanJob -Item $item -DictionaryPath $planDictionaryPath
-                        $attackPlan = New-HashcatAttackPlan -Job $planJob -HashPath $artifact.HashPath -JobDirectory $script:RuntimeDirectory -RecoveryPlanYear $script:RecoveryPlanYear -Strategy ([string]$item.EngineStrategy)
+                        $attackPlan = New-WorkerTimedHashcatAttackPlan -PlanJob $planJob -HashPath $artifact.HashPath -JobDirectory $script:RuntimeDirectory -RecoveryPlanYear $script:RecoveryPlanYear -Strategy ([string]$item.EngineStrategy)
                         if (-not $attackPlan.Supported) {
                             $engine = New-CpuEngine -Message ($attackPlan.Message + ' CPU fallback was selected.')
                             Set-WorkerEngineSelection -Engine $engine
@@ -5017,10 +5606,25 @@ function Invoke-CumulativeRecovery {
                 # The flattened ordered plan lets a compatible built-in GPU
                 # run continue over one stage boundary. Non-compatible items
                 # remain barriers inside Get-BuiltinGpuBatchItems.
-                $batchItems = @(Get-BuiltinGpuBatchItems -Items $script:OverallPlanItems.ToArray() -CurrentItem $item -StageNumber $stageNumber -HashMode ([string]$artifact.HashMode) -DeviceId ([int]$engine.DeviceId) -AttackMode 0 -ExecutionAttackFamily 'MaterializedDictionary')
+                $batchLookupOperationStartedUtc = [datetime]::UtcNow
+                $batchLookupStopwatch = [System.Diagnostics.Stopwatch]::StartNew()
+                try {
+                    $batchItems = @(Get-BuiltinGpuBatchItems -Items $script:OverallPlanItems.ToArray() -CurrentItem $item -StageNumber $stageNumber -HashMode ([string]$artifact.HashMode) -DeviceId ([int]$engine.DeviceId) -AttackMode 0 -ExecutionAttackFamily 'MaterializedDictionary')
+                }
+                finally {
+                    $batchLookupStopwatch.Stop()
+                    [long]$batchLookupMs = [long]$batchLookupStopwatch.ElapsedMilliseconds
+                    $script:BatchLookupMs += $batchLookupMs
+                    if ($script:TransitionWindowActive) {
+                        $script:TransitionWindowBatchLookupMs += $batchLookupMs
+                        $script:TransitionBatchLookupMsTotal += $batchLookupMs
+                    }
+                    Add-WorkerTransitionInterval -StartUtc $batchLookupOperationStartedUtc -EndUtc ([datetime]::UtcNow) -Name 'BatchLookup'
+                }
                 if ($batchItems.Count -gt 0) {
                     $script:ActiveGpuBatchCurrentCoverageId = [string]$item.CoverageId
                     $script:GpuBatchSelectedCoverageIds = @($batchItems | ForEach-Object { [string]$_.CoverageId })
+                    $batchConstructionOperationStartedUtc = [datetime]::UtcNow
                     try {
                         $gpuBatch = New-BuiltinGpuExecutionBatch -Items $batchItems -StageNumber $stageNumber
                     }
@@ -5035,6 +5639,9 @@ function Invoke-CumulativeRecovery {
                             $gpuBatch = New-BuiltinGpuExecutionBatch -Items $batchItems -StageNumber $stageNumber
                         }
                         else { throw }
+                    }
+                    finally {
+                        Add-WorkerTransitionInterval -StartUtc $batchConstructionOperationStartedUtc -EndUtc ([datetime]::UtcNow) -Name 'BatchConstruction'
                     }
                     $script:ActiveGpuBatch = $gpuBatch
                     foreach ($batchItem in @($gpuBatch.Items)) {
@@ -5057,17 +5664,45 @@ function Invoke-CumulativeRecovery {
                     }
                     $planJob = Get-PlanJob -Item $item -DictionaryPath ([string]$gpuBatch.CandidatePath)
                     $planJob.Strategy = 'Dictionary'
-                    $attackPlan = New-HashcatAttackPlan -Job $planJob -HashPath $artifact.HashPath -JobDirectory $script:RuntimeDirectory -RecoveryPlanYear $script:RecoveryPlanYear -Strategy 'Dictionary'
+                    $attackPlan = New-WorkerTimedHashcatAttackPlan -PlanJob $planJob -HashPath $artifact.HashPath -JobDirectory $script:RuntimeDirectory -RecoveryPlanYear $script:RecoveryPlanYear -Strategy 'Dictionary'
                     if (-not $attackPlan.Supported) { $engine = New-CpuEngine -Message ($attackPlan.Message + ' CPU fallback was selected.'); Set-WorkerEngineSelection -Engine $engine; $script:ActiveGpuBatch = $null; $gpuBatch = $null }
                 }
             }
 
             if ($engine.UseGpu -and $maskBatchEligible) {
-                $maskBatchItems = @(Get-BuiltinGpuMaskBatchItems -Items $script:OverallPlanItems.ToArray() -CurrentItem $item -StageNumber $stageNumber)
+                $maskBatchLookupOperationStartedUtc = [datetime]::UtcNow
+                $maskBatchLookupStopwatch = [System.Diagnostics.Stopwatch]::StartNew()
+                try {
+                    $maskBatchItems = @(Get-BuiltinGpuMaskBatchItems -Items $script:OverallPlanItems.ToArray() -CurrentItem $item -StageNumber $stageNumber)
+                }
+                finally {
+                    $maskBatchLookupStopwatch.Stop()
+                    [long]$maskBatchLookupMs = [long]$maskBatchLookupStopwatch.ElapsedMilliseconds
+                    $script:BatchLookupMs += $maskBatchLookupMs
+                    if ($script:TransitionWindowActive) {
+                        $script:TransitionWindowBatchLookupMs += $maskBatchLookupMs
+                        $script:TransitionBatchLookupMsTotal += $maskBatchLookupMs
+                    }
+                    Add-WorkerTransitionInterval -StartUtc $maskBatchLookupOperationStartedUtc -EndUtc ([datetime]::UtcNow) -Name 'BatchLookup'
+                }
                 if ($maskBatchItems.Count -gt 0) {
                     $script:ActiveGpuBatchCurrentCoverageId = [string]$item.CoverageId
                     $script:GpuBatchSelectedCoverageIds = @($maskBatchItems | ForEach-Object { [string]$_.CoverageId })
-                    $gpuBatch = New-BuiltinGpuMaskExecutionBatch -Items $maskBatchItems -StageNumber $stageNumber
+                    $maskBatchConstructionOperationStartedUtc = [datetime]::UtcNow
+                    $maskBatchConstructionStopwatch = [System.Diagnostics.Stopwatch]::StartNew()
+                    try {
+                        $gpuBatch = New-BuiltinGpuMaskExecutionBatch -Items $maskBatchItems -StageNumber $stageNumber
+                    }
+                    finally {
+                        $maskBatchConstructionStopwatch.Stop()
+                        [long]$maskBatchConstructionMs = [long]$maskBatchConstructionStopwatch.ElapsedMilliseconds
+                        $script:BatchConstructionMs += $maskBatchConstructionMs
+                        if ($script:TransitionWindowActive) {
+                            $script:TransitionWindowBatchConstructionMs += $maskBatchConstructionMs
+                            $script:TransitionBatchConstructionMsTotal += $maskBatchConstructionMs
+                        }
+                        Add-WorkerTransitionInterval -StartUtc $maskBatchConstructionOperationStartedUtc -EndUtc ([datetime]::UtcNow) -Name 'BatchConstruction'
+                    }
                     $script:ActiveGpuBatch = $gpuBatch
                     $currentSegment = @($gpuBatch.Segments | Where-Object { [string]$_.CoverageId -eq [string]$item.CoverageId } | Select-Object -First 1)[0]
                     if ($null -ne $currentSegment) {
@@ -5090,7 +5725,7 @@ function Invoke-CumulativeRecovery {
                         $planJob | Add-Member -NotePropertyName IncrementMin -NotePropertyValue ([int]$maskBatchItems[0].SuffixLength) -Force
                         $planJob | Add-Member -NotePropertyName IncrementMax -NotePropertyValue $maxSuffixLength -Force
                     }
-                    $attackPlan = New-HashcatAttackPlan -Job $planJob -HashPath $artifact.HashPath -JobDirectory $script:RuntimeDirectory -RecoveryPlanYear $script:RecoveryPlanYear -Strategy ([string]$item.EngineStrategy)
+                    $attackPlan = New-WorkerTimedHashcatAttackPlan -PlanJob $planJob -HashPath $artifact.HashPath -JobDirectory $script:RuntimeDirectory -RecoveryPlanYear $script:RecoveryPlanYear -Strategy ([string]$item.EngineStrategy)
                     if (-not $attackPlan.Supported) {
                         $engine = New-CpuEngine -Message ($attackPlan.Message + ' CPU fallback was selected.')
                         Set-WorkerEngineSelection -Engine $engine
@@ -5122,7 +5757,7 @@ function Invoke-CumulativeRecovery {
             }
             else {
                 $johnResult = $null
-                if ([string]$item.Kind -in @('BuiltinDictionary', 'Dictionary', 'CustomDictionary', 'RulesDictionary', 'CustomRules', 'RuleCaseVariants', 'RuleAppendVariants', 'DateRange', 'CommonSymbols')) {
+                if ([string]$item.Kind -in @('Quick', 'YearCombination', 'BuiltinDictionary', 'Dictionary', 'CustomDictionary', 'RulesDictionary', 'CustomRules', 'RuleCaseVariants', 'RuleAppendVariants', 'DateRange', 'CommonSymbols')) {
                     $johnResult = Invoke-JohnCpuRecovery -SevenZip $sevenZip -ArchiveFormat ([string]$inspection.Format) -Item $item -SkipCount ([long]$script:CoveragePosition)
                 }
                 if ($null -ne $johnResult -and [string]$johnResult.Status -in @('Completed', 'Recovered', 'Paused', 'Stopped', 'Failed')) {
@@ -5139,7 +5774,7 @@ function Invoke-CumulativeRecovery {
                         Set-WorkerActivity -Activity 'RunningCoverage' -Message ([string]$johnResult.Message + ' CPU fallback was selected.')
                         Publish-Progress -State 'Running' -Message ([string]$johnResult.Message + ' CPU fallback was selected.') -Result $null
                     }
-                    Invoke-CumulativePlanCpu -Item $item -SevenZip $sevenZip | Out-Null
+                    Invoke-WorkerTimedCumulativePlanCpu -Item $item -SevenZip $sevenZip | Out-Null
                     if ($null -eq $script:TerminalState) { $script:CoverageResult = 'CoverageCompleted' }
                 }
             }
@@ -5342,7 +5977,7 @@ try {
 
         Set-WorkerActivity -Activity 'PreparingBackend' -Message ('Preparing the local backend for stage {0}.' -f $stage.DisplayName)
         Publish-Progress -State 'Running' -Message ('Preparing the local backend for stage ' + [string]$stage.DisplayName) -Result $null
-        $engine = Select-LocalEngine -Inspection $inspection -Strategy ([string]$stage.Strategy)
+        $engine = Select-WorkerTimedLocalEngine -Inspection $inspection -Strategy ([string]$stage.Strategy)
         $script:EngineLabel = $engine.Label
         $script:BackendName = $engine.Backend
         $script:ComputeDevice = $engine.ComputeDevice
@@ -5356,7 +5991,7 @@ try {
             if (-not (Test-Path -LiteralPath $script:RuntimeDirectory -PathType Container)) {
                 New-Item -ItemType Directory -Path $script:RuntimeDirectory -ErrorAction Stop | Out-Null
             }
-            $artifact = Get-RunArchiveHashcatArtifact -ArchivePath ([string]$job.ArchivePath) -ArchiveFormat ([string]$inspection.Format)
+            $artifact = Get-WorkerTimedHashcatArtifact -ArchivePath ([string]$job.ArchivePath) -ArchiveFormat ([string]$inspection.Format)
             if (-not $artifact.Supported) {
                 $engine = New-CpuEngine -Label 'CPU / NanaZip fallback' -Message ($artifact.Message + ' CPU fallback was selected.')
                 $script:EngineLabel = $engine.Label
@@ -5364,7 +5999,7 @@ try {
                 $script:ComputeDevice = $engine.ComputeDevice
             }
             else {
-                $attackPlan = New-HashcatAttackPlan -Job $job -HashPath $artifact.HashPath -JobDirectory $script:RuntimeDirectory -RecoveryPlanYear $script:RecoveryPlanYear -Strategy ([string]$stage.Strategy)
+                $attackPlan = New-WorkerTimedHashcatAttackPlan -PlanJob $job -HashPath $artifact.HashPath -JobDirectory $script:RuntimeDirectory -RecoveryPlanYear $script:RecoveryPlanYear -Strategy ([string]$stage.Strategy)
                 if (-not $attackPlan.Supported) {
                     $engine = New-CpuEngine -Label 'CPU / NanaZip fallback' -Message ($attackPlan.Message + ' CPU fallback was selected.')
                     $script:EngineLabel = $engine.Label
