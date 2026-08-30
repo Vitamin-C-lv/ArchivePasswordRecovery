@@ -19,8 +19,9 @@ New-Item -ItemType Directory -Path $testRoot | Out-Null
 $heldDerivedCaches = New-Object 'System.Collections.Generic.List[object]'
 try {
     # Keep the actual local Hashcat runtime intact. To make the L1 selection a
-    # fresh/cache-miss decision, temporarily move only the two exact app-owned
-    # future built-in source caches and restore them in finally.
+    # foreground cache-miss decision, use an isolated plan year so a persistent
+    # super-batch from another run cannot admit the held future sources. The
+    # separate lazy-preparation regression covers persistent admission.
     $resourceVersion = [string](Get-BuiltinDictionaryManifest).ResourceVersion
     $derivedRoot = Join-Path (Join-Path (Get-RecoveryDataRoot) 'Cache\BuiltinDerived') $resourceVersion
     $holdRoot = Join-Path $testRoot 'held-derived-caches'
@@ -63,7 +64,7 @@ try {
         MinLength = 1
         MaxLength = 1
         UiCulture = 'en-US'
-        RecoveryPlanYear = 2026
+        RecoveryPlanYear = 2099
         CreatedUtc = [datetime]::UtcNow.ToString('o')
     }
     Write-LocalJsonAtomic -Path (Join-Path $jobDirectory 'job.json') -Value $job
@@ -81,10 +82,10 @@ try {
     Assert-True (@($progress.GpuBatchSelectedCoverageIds) -join ' -> ' -eq 'builtin:L1-global:v1') 'Fresh L1 selected a future coverage for its GPU batch.'
     Assert-True ([int]$progress.FutureUnreadyItemsPrepared -eq 0) 'A future unready coverage was prepared before L1 execution.'
     Assert-True ($null -ne $progress.EngineSelectedAtUtc -and $null -ne $progress.PreparationStartedAtUtc -and $null -ne $progress.ExecutorStartedAtUtc -and $null -ne $progress.FirstProgressSampleAtUtc) 'The engine/preparation/executor/first-progress transition diagnostics are incomplete.'
-    $engineSelectedAt = [datetime]::Parse([string]$progress.EngineSelectedAtUtc).ToUniversalTime()
-    $preparationStartedAt = [datetime]::Parse([string]$progress.PreparationStartedAtUtc).ToUniversalTime()
-    $executorStartedAt = [datetime]::Parse([string]$progress.ExecutorStartedAtUtc).ToUniversalTime()
-    $firstProgressSampleAt = [datetime]::Parse([string]$progress.FirstProgressSampleAtUtc).ToUniversalTime()
+    $engineSelectedAt = ([datetime]$progress.EngineSelectedAtUtc).ToUniversalTime()
+    $preparationStartedAt = ([datetime]$progress.PreparationStartedAtUtc).ToUniversalTime()
+    $executorStartedAt = ([datetime]$progress.ExecutorStartedAtUtc).ToUniversalTime()
+    $firstProgressSampleAt = ([datetime]$progress.FirstProgressSampleAtUtc).ToUniversalTime()
     $timestampOrder = $engineSelectedAt -le $preparationStartedAt -and $preparationStartedAt -le $executorStartedAt -and $executorStartedAt -le $firstProgressSampleAt
     Assert-True $timestampOrder 'Engine/preparation/executor/first-progress timestamp order is not monotonic.'
     $measuredSelectionToExecutorMs = [long](($executorStartedAt - $engineSelectedAt).TotalMilliseconds)

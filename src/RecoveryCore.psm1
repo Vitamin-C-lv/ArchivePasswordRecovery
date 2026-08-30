@@ -3965,7 +3965,7 @@ function Get-RecoveryLevel4PlanItems {
         # transformations, each as a single-language GPU-capable coverage.
         $items.Add([pscustomobject]@{
                 CoverageId = ('hybrid:L4-word-symbol-{0}:v3' -f $language); Kind = 'CommonSymbols'; DisplayName = ('字典词 + 常见符号（{0}）' -f $language); Language = $language; Languages = @($language); DictionaryLevels = @(1); DictionaryLevel = 1;
-                GeneratorKind = 'CommonSymbols'; SuffixKind = 'Symbols'; Symbols = @('@', '#', '$', '_', '-'); CandidateCount = ($l1Count * 5); EngineStrategy = 'GeneratedDictionary'; GpuSupported = $true
+                GeneratorKind = 'CommonSymbols'; RuleFamily = 'CommonSymbols'; SuffixKind = 'Symbols'; Symbols = @('@', '#', '$', '_', '-'); CandidateCount = ($l1Count * 5); EngineStrategy = 'Rules'; GpuSupported = $true
             })
         [long]$capitalVariantCount = Get-CapitalInitialVariantCount -Language $language -Level 1
         if ($capitalVariantCount -gt 0) {
@@ -4274,7 +4274,8 @@ function New-HashcatRuleFile {
     [CmdletBinding()]
     param(
         [Parameter(Mandatory = $true)][string]$JobDirectory,
-        [Parameter(Mandatory = $true)][int]$RecoveryPlanYear
+        [Parameter(Mandatory = $true)][int]$RecoveryPlanYear,
+        [ValidateSet('All', 'Case', 'Append', 'CommonSymbols', 'CapitalInitial')][string]$Family = 'All'
     )
 
     $currentYear = $RecoveryPlanYear.ToString()
@@ -4283,14 +4284,39 @@ function New-HashcatRuleFile {
         param([string]$Text)
         return (($Text.ToCharArray() | ForEach-Object { '$' + $_ }) -join '')
     }
-    $rules = @(
-        '$1',
-        '$1$2$3',
-        '$!',
-        (& $appendRule $previousYear),
-        (& $appendRule $currentYear),
-        'Z1'
-    )
+    $rules = switch ($Family) {
+        'Case' {
+            @('l', 'u')
+        }
+        'Append' {
+            @(
+                '$1',
+                '$1$2$3',
+                '$!',
+                (& $appendRule $previousYear),
+                (& $appendRule $currentYear),
+                'Z1'
+            )
+        }
+        'CommonSymbols' {
+            # Hashcat's $X rule appends one literal character. A doubled
+            # dollar therefore represents the literal '$' suffix.
+            @('$@', '$#', '$$', '$_', '$-')
+        }
+        'CapitalInitial' {
+            @('c')
+        }
+        default {
+            @(
+                '$1',
+                '$1$2$3',
+                '$!',
+                (& $appendRule $previousYear),
+                (& $appendRule $currentYear),
+                'Z1'
+            )
+        }
+    }
     $rulePath = Join-Path $JobDirectory 'hashcat-rules.rule'
     [System.IO.File]::WriteAllLines($rulePath, [string[]]$rules, (New-Object System.Text.UTF8Encoding($false)))
     return $rulePath
@@ -4324,14 +4350,22 @@ function New-HashcatAttackPlan {
             }
         }
         'Rules' {
-            $rulePath = New-HashcatRuleFile -JobDirectory $JobDirectory -RecoveryPlanYear $RecoveryPlanYear
             $planKind = if ($Job.PSObject.Properties.Name -contains 'PlanKind') { [string]$Job.PlanKind } else { '' }
+            $ruleFamily = if ($Job.PSObject.Properties.Name -contains 'RuleFamily') { [string]$Job.RuleFamily } else { '' }
+            if ([string]::IsNullOrWhiteSpace($ruleFamily)) {
+                $ruleFamily = if ($planKind -eq 'RuleAppendVariants') { 'Append' } else { 'All' }
+            }
+            # The legacy RuleCase stream omits no-op variants and performs
+            # ordinal deduplication. Hashcat's l/u rule pair cannot preserve
+            # that exact candidate stream, so keep the existing materialized
+            # fallback for this one family.
             if ($planKind -eq 'RuleCaseVariants') {
                 return [pscustomobject]@{
                     Supported = $true
                     Arguments = @('-a', '0', $HashPath, [string]$Job.DictionaryPath)
                 }
             }
+            $rulePath = New-HashcatRuleFile -JobDirectory $JobDirectory -RecoveryPlanYear $RecoveryPlanYear -Family $ruleFamily
             return [pscustomobject]@{
                 Supported = $true
                 Arguments = @('-a', '0', $HashPath, [string]$Job.DictionaryPath, '-r', $rulePath)
@@ -4347,21 +4381,33 @@ function New-HashcatAttackPlan {
             $maskDefinition = Get-HashcatMaskDefinition -Tokens $tokens
             $mask = [string]$maskDefinition.Mask
             if ($wordPositions.Count -eq 0) {
+                $arguments = @($maskDefinition.CustomCharsetArguments + @('-a', '3', $HashPath, $mask))
+                if ($Job.PSObject.Properties.Name -contains 'IncrementMin' -and $Job.PSObject.Properties.Name -contains 'IncrementMax') {
+                    $arguments += @('-i', '--increment-min', [string]$Job.IncrementMin, '--increment-max', [string]$Job.IncrementMax)
+                }
                 return [pscustomobject]@{
                     Supported = $true
-                    Arguments = @($maskDefinition.CustomCharsetArguments + @('-a', '3', $HashPath, $mask))
+                    Arguments = $arguments
                 }
             }
             if ($wordPositions[0] -eq 0) {
+                $arguments = @($maskDefinition.CustomCharsetArguments + @('-a', '6', $HashPath, [string]$Job.DictionaryPath, $mask))
+                if ($Job.PSObject.Properties.Name -contains 'IncrementMin' -and $Job.PSObject.Properties.Name -contains 'IncrementMax') {
+                    $arguments += @('-i', '--increment-min', [string]$Job.IncrementMin, '--increment-max', [string]$Job.IncrementMax)
+                }
                 return [pscustomobject]@{
                     Supported = $true
-                    Arguments = @($maskDefinition.CustomCharsetArguments + @('-a', '6', $HashPath, [string]$Job.DictionaryPath, $mask))
+                    Arguments = $arguments
                 }
             }
             if ($wordPositions[0] -eq ($tokens.Count - 1)) {
+                $arguments = @($maskDefinition.CustomCharsetArguments + @('-a', '7', $HashPath, $mask, [string]$Job.DictionaryPath))
+                if ($Job.PSObject.Properties.Name -contains 'IncrementMin' -and $Job.PSObject.Properties.Name -contains 'IncrementMax') {
+                    $arguments += @('-i', '--increment-min', [string]$Job.IncrementMin, '--increment-max', [string]$Job.IncrementMax)
+                }
                 return [pscustomobject]@{
                     Supported = $true
-                    Arguments = @($maskDefinition.CustomCharsetArguments + @('-a', '7', $HashPath, $mask, [string]$Job.DictionaryPath))
+                    Arguments = $arguments
                 }
             }
             return [pscustomobject]@{
@@ -4376,7 +4422,7 @@ function New-HashcatAttackPlan {
                 Arguments = @(
                     $maskDefinition.CustomCharsetArguments +
                     @('-a', '6', $HashPath, [string]$Job.DictionaryPath, [string]$maskDefinition.Mask,
-                        '-i', '--increment-min', '1', '--increment-max', '4')
+                        '-j', 'c', '-i', '--increment-min', '1', '--increment-max', '4')
                 )
             }
         }

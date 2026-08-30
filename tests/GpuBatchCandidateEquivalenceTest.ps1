@@ -76,8 +76,7 @@ try {
     if (Test-Path -LiteralPath $batchDirectory -PathType Container) { [System.IO.Directory]::Delete($batchDirectory, $true) }
     $ruleBatchDirectories = @(
         'stage3-builtin-v2-gd1-planYear2026',
-        'stage3-builtin-v2-gc1-planYear2026',
-        'stage3-builtin-v2-ga1-planYear2026'
+        'stage3-builtin-v2-gc1-planYear2026'
     ) | ForEach-Object { Join-Path (Join-Path (Join-Path (Get-RecoveryDataRoot) 'Cache\BuiltinBatches') 'v1') $_ }
     foreach ($ruleBatchDirectory in $ruleBatchDirectories) {
         if (Test-Path -LiteralPath $ruleBatchDirectory -PathType Container) { [System.IO.Directory]::Delete($ruleBatchDirectory, $true) }
@@ -154,24 +153,21 @@ try {
             CharacterSet = 'digits'; CustomCharacters = ''; MinLength = 1; MaxLength = 1; UiCulture = 'zh-CN'; RecoveryPlanYear = 2026; CreatedUtc = [datetime]::UtcNow.ToString('o')
         })
     $ruleProgress = Invoke-TestWorker -WorkerPath $workerPath -JobDirectory $ruleJobDirectory
-    Assert-True ([string]$ruleProgress.State -eq 'Exhausted' -and [int]$ruleProgress.HashcatProcessLaunchCount -eq 3) ('Stage 3 rule fixture did not execute its three lazy ordered batches: state=' + [string]$ruleProgress.State + '; launches=' + [string]$ruleProgress.HashcatProcessLaunchCount + '; current=' + [string]$ruleProgress.CurrentCoverageId + '; completed=' + (@($ruleProgress.CompletedCoverageIds) -join ',') + '; message=' + [string]$ruleProgress.Message)
+    Assert-True ([string]$ruleProgress.State -eq 'Exhausted' -and [int]$ruleProgress.HashcatProcessLaunchCount -eq 3) ('Stage 3 rule fixture did not execute its two materialized batches plus native append batch: state=' + [string]$ruleProgress.State + '; launches=' + [string]$ruleProgress.HashcatProcessLaunchCount + '; current=' + [string]$ruleProgress.CurrentCoverageId + '; completed=' + (@($ruleProgress.CompletedCoverageIds) -join ',') + '; message=' + [string]$ruleProgress.Message)
     Assert-True (@($ruleProgress.CompletedCoverageIds) -contains 'builtin:L1-global:v1' -and @($ruleProgress.CompletedCoverageIds) -contains 'rules:case:L1-global:v3' -and @($ruleProgress.CompletedCoverageIds) -contains 'rules:append:L1-global:v3') 'Stage 3 logical rule coverages were not all recorded.'
+    Assert-True ([int]$ruleProgress.NativeRuleCoverageCount -eq 1 -and @($ruleProgress.NativeRuleCoverages) -contains 'rules:append:L1-global:v3') 'Stage 3 append coverage did not execute through the native Hashcat rule path.'
     $ruleBatchCandidates = @($ruleBatchDirectories | ForEach-Object { [System.IO.File]::ReadAllLines((Join-Path $_ 'candidates.txt')) })
     $ruleGlobalCandidates = [System.IO.File]::ReadAllLines($globalPath)
     $ruleCasePath = Join-Path $testRoot 'expected-case.txt'
     $null = Expand-CaseVariantDictionaryFile -SourcePath $globalPath -OutputPath $ruleCasePath -RecoveryPlanYear 2026 -DeduplicateVariants
     $ruleCaseCandidates = [System.IO.File]::ReadAllLines($ruleCasePath)
-    $ruleAppendCandidates = New-Object 'System.Collections.Generic.List[string]'
-    foreach ($word in $ruleGlobalCandidates) {
-        foreach ($candidate in @(Get-RuleVariants -Word $word -RecoveryPlanYear 2026 -Family Append)) { [void]$ruleAppendCandidates.Add([string]$candidate) }
-    }
-    $ruleExpected = @($ruleGlobalCandidates + $ruleCaseCandidates + $ruleAppendCandidates.ToArray())
+    $ruleExpected = @($ruleGlobalCandidates + $ruleCaseCandidates)
     Assert-True ($ruleBatchCandidates.Count -eq $ruleExpected.Count) 'Stage 3 rule batch candidate count differs from logical generators.'
     for ($index = 0; $index -lt $ruleExpected.Count; $index++) {
         if (-not [string]::Equals([string]$ruleBatchCandidates[$index], [string]$ruleExpected[$index], [System.StringComparison]::Ordinal)) { throw ('Stage 3 rule candidate sequence changed at index ' + $index) }
     }
     $ruleSegments = @($ruleBatchDirectories | ForEach-Object { (Read-LocalJson -Path (Join-Path $_ 'segments.json')).Segments[0] })
-    Assert-True ($ruleSegments.Count -eq 3 -and [long]$ruleSegments[0].StartOffset -eq 0L -and [long]$ruleSegments[1].StartOffset -eq 0L -and [long]$ruleSegments[2].StartOffset -eq 0L -and [long]$ruleSegments[0].CandidateCount -eq 1000L -and [long]$ruleSegments[1].CandidateCount -eq [long]$ruleCaseCandidates.Count -and [long]$ruleSegments[2].CandidateCount -eq [long]$ruleAppendCandidates.Count) 'Stage 3 lazy batch segments are not independently logical.'
+    Assert-True ($ruleSegments.Count -eq 2 -and [long]$ruleSegments[0].StartOffset -eq 0L -and [long]$ruleSegments[1].StartOffset -eq 0L -and [long]$ruleSegments[0].CandidateCount -eq 1000L -and [long]$ruleSegments[1].CandidateCount -eq [long]$ruleCaseCandidates.Count) 'Stage 3 materialized batch segments are not independently logical.'
 
     [pscustomobject]@{
         ColdProcessLaunches = [int]$cold.HashcatProcessLaunchCount
@@ -181,7 +177,7 @@ try {
         SegmentCount = @($segments.Segments).Count
         CandidateCount = $batchCandidates.Count
         LogicalOrder = 'global -> zh'
-        Stage3RuleBatch = 'PASS (lazy global -> case -> append; append count = 6x source)'
+        Stage3RuleBatch = 'PASS (materialized global -> case; append uses native rule file)'
         Stage3RuleCandidateCount = $ruleBatchCandidates.Count
         NanaZipVerified = [bool]$cold.Result.LocallyVerified
     } | Format-List
