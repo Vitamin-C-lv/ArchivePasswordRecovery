@@ -80,7 +80,15 @@ try {
     Assert-True ([string]$progress.Backend -eq 'Hashcat OpenCL' -and -not [string]::IsNullOrWhiteSpace([string]$progress.ComputeDevice)) 'Auto did not select a live Hashcat GPU backend.'
     Assert-True (@($progress.GpuBatchSelectedCoverageIds) -join ' -> ' -eq 'builtin:L1-global:v1') 'Fresh L1 selected a future coverage for its GPU batch.'
     Assert-True ([int]$progress.FutureUnreadyItemsPrepared -eq 0) 'A future unready coverage was prepared before L1 execution.'
-    Assert-True ($null -ne $progress.EngineSelectedAtUtc -and $null -ne $progress.ExecutorStartedAtUtc -and $null -ne $progress.FirstProgressSampleAtUtc) 'The engine/executor/first-progress transition diagnostics are incomplete.'
+    Assert-True ($null -ne $progress.EngineSelectedAtUtc -and $null -ne $progress.PreparationStartedAtUtc -and $null -ne $progress.ExecutorStartedAtUtc -and $null -ne $progress.FirstProgressSampleAtUtc) 'The engine/preparation/executor/first-progress transition diagnostics are incomplete.'
+    $engineSelectedAt = [datetime]::Parse([string]$progress.EngineSelectedAtUtc).ToUniversalTime()
+    $preparationStartedAt = [datetime]::Parse([string]$progress.PreparationStartedAtUtc).ToUniversalTime()
+    $executorStartedAt = [datetime]::Parse([string]$progress.ExecutorStartedAtUtc).ToUniversalTime()
+    $firstProgressSampleAt = [datetime]::Parse([string]$progress.FirstProgressSampleAtUtc).ToUniversalTime()
+    $timestampOrder = $engineSelectedAt -le $preparationStartedAt -and $preparationStartedAt -le $executorStartedAt -and $executorStartedAt -le $firstProgressSampleAt
+    Assert-True $timestampOrder 'Engine/preparation/executor/first-progress timestamp order is not monotonic.'
+    $measuredSelectionToExecutorMs = [long](($executorStartedAt - $engineSelectedAt).TotalMilliseconds)
+    Assert-True ([long]$progress.TimeEngineSelectedToExecutorStartMs -eq $measuredSelectionToExecutorMs) 'Selection-to-executor diagnostic does not match its timestamps.'
     Assert-True ([bool]$progress.Result.LocallyVerified) 'NanaZip did not verify the Hashcat candidate.'
 
     [pscustomobject]@{
@@ -91,9 +99,11 @@ try {
         L1_SELECTED_BACKEND = [string]$progress.Backend
         L1_SELECTED_DEVICE = [string]$progress.ComputeDevice
         L1_ENGINE_SELECTED_AT = [string]$progress.EngineSelectedAtUtc
+        L1_PREPARATION_STARTED_AT = [string]$progress.PreparationStartedAtUtc
         L1_EXECUTOR_STARTED_AT = [string]$progress.ExecutorStartedAtUtc
         L1_FIRST_PROGRESS_SAMPLE_AT = [string]$progress.FirstProgressSampleAtUtc
         TIME_ENGINE_SELECTED_TO_EXECUTOR_START_MS = $progress.TimeEngineSelectedToExecutorStartMs
+        TIMESTAMP_ORDER = $timestampOrder
         FIRST_PROGRESS_SAMPLE_OBSERVED = ($null -ne $progress.FirstProgressSampleAtUtc)
         NANAZIP_FINAL_VERIFY = [bool]$progress.Result.LocallyVerified
     } | Format-List

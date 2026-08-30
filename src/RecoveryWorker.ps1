@@ -2411,10 +2411,14 @@ function Set-WorkerEngineSelection {
         [Parameter(Mandatory = $true)]$Engine
     )
 
+    $identityChanged = $null -eq $script:EngineSelectedUtc -or
+        -not [string]::Equals([string]$script:EngineLabel, [string]$Engine.Label, [System.StringComparison]::Ordinal) -or
+        -not [string]::Equals([string]$script:BackendName, [string]$Engine.Backend, [System.StringComparison]::Ordinal) -or
+        -not [string]::Equals([string]$script:ComputeDevice, [string]$Engine.ComputeDevice, [System.StringComparison]::Ordinal)
     $script:EngineLabel = [string]$Engine.Label
     $script:BackendName = [string]$Engine.Backend
     $script:ComputeDevice = [string]$Engine.ComputeDevice
-    $script:EngineSelectedUtc = [datetime]::UtcNow
+    if ($identityChanged) { $script:EngineSelectedUtc = [datetime]::UtcNow }
 }
 
 function Select-LocalEngine {
