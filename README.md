@@ -1,4 +1,42 @@
-# Archive Password Recovery — local Windows MVP
+# Archive Password Recovery
+
+Windows 本地离线压缩包密码恢复工具。
+
+- Fully offline / local only
+- Windows PowerShell 5.1 + WPF
+- ZIP / 7z current support
+- CPU + single GPU
+- Dynamic GPU enumeration
+- Hashcat GPU backend
+- John Jumbo CPU bulk backend
+- NanaZip final verification
+- Five recovery levels
+- Pause / Stop / saved jobs
+- No cloud cracking, telemetry, or archive/password upload
+
+This tool is intended for recovering passwords for archives you own or are authorized to access.
+
+License: GPL-3.0-or-later
+
+This license applies only to this project's original source code; bundled third-party components retain their own licenses.
+
+The bundled John Windows runtime uses `tools\extractors\cygwin1.dll`, whose local file and product version is `3.5.6`; the bundled John build reports Cygwin `3.5.6-1.x86_64`. Cygwin is the Windows runtime dependency for the bundled John/`zip2john` executables. Its official licensing terms are documented at <https://cygwin.com/licensing.html> and the repository copy is in `third_party/licenses/cygwin/`.
+
+## Support matrix
+
+| Archive / encryption type | GPU Hashcat | CPU John bulk | CPU NanaZip verifier | Status |
+| --- | --- | --- | --- | --- |
+| ZIP WinZip AES (`$zip2$`) | Supported | Supported | Supported | Supported |
+| ZIP ZipCrypto (`$pkzip$`) | Unsupported | Supported | Supported | Supported |
+| 7z AES (`$7z$`) | Supported | Supported when the bundled build accepts the extracted record | Supported | Supported |
+| RAR | Unsupported | Unsupported | Supported | CPU fallback only |
+| Other NanaZip-recognized formats | Unsupported | Unsupported | Supported | CPU fallback only |
+| Quick exact candidates | Not used | Not used | Supported | CPU only by design |
+| Hybrid with `?w` in the middle | Unsupported | Unsupported | Supported | CPU fallback only |
+
+Bundled third-party components and their accompanying license texts are listed in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md). NanaZip / 7-Zip is a locally installed runtime prerequisite and is not bundled in this repository.
+
+## Detailed implementation status
 
 这是一个 Windows 原生、本地运行的压缩包密码恢复工具的第一阶段实现。界面使用系统自带的 Windows PowerShell 5.1 + WPF；Worker 保留本机 NanaZip/7-Zip 兼容命令行验证，并为受支持的 ZIP AES 与 7z AES 接入完全本地的 Hashcat OpenCL 和 John Jumbo CPU bulk。项目没有网络客户端、在线破解 API、账号体系、遥测、分析或崩溃上传逻辑。
 
@@ -37,7 +75,7 @@
 & .\Start-ArchivePasswordRecovery.cmd
 ```
 
-运行前需要本机可用的 `7z.exe`（本电脑已由 NanaZip 提供）。GPU 路径使用项目 `tools\hashcat`、`tools\extractors\zip2john.exe` 和 `tools\extractors\7z2hashcat.exe` 中的本地组件；CPU bulk 路径使用项目 `tools\extractors\john.exe` 启动器。程序运行时不会安装、下载或更新任何组件。
+运行前需要本机可用的 `7z.exe`（NanaZip 或兼容的 7-Zip CLI）。GPU 路径使用项目 `tools\hashcat`、`tools\extractors\zip2john.exe` 和 `tools\extractors\7z2hashcat.exe` 中的本地组件；CPU bulk 路径使用项目 `tools\extractors\john.exe` 启动器。程序运行时不会安装、下载或更新任何组件。
 
 操作建议是先使用 `Quick`，再尝试自己的小字典、规则和明确的 mask/hybrid；只有确实需要时才使用限定范围的 brute force。受支持的字典、规则和有限生成集 CPU 搜索会由 John Jumbo 批量处理；不完全可表达的 mask/hybrid/brute-force 仍使用 NanaZip 逐候选 fallback，不会生成巨型临时字典。
 

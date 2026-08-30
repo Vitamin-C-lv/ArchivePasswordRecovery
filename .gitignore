@@ -10,13 +10,19 @@ desktop.ini
 # PowerShell / debug leftovers
 *.log
 *.pid
+*.clixml
+*.dmp
+*.stackdump
 
 # Local temporary/staging directories
 /tmp/
 /temp/
+/Temp/
 /staging/
 /backup/
 /backups/
+/output/
+/crash/
 
 # Local audit/export packages at the project root
 /*-AUDIT-*.zip
@@ -32,6 +38,9 @@ hashcat.potfile
 # Accidental runtime output at the project root
 /Runtime/
 /Jobs/
+/Cache/
+*.pot
+*.rec
 
 # Common local test output at the project root
 /test-output/

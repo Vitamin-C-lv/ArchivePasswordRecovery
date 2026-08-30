@@ -15,7 +15,7 @@ function Assert-True {
 }
 
 function Get-GitStatusText {
-    $git = 'C:\Program Files\Git\cmd\git.exe'
+    $git = (Get-Command git -CommandType Application -ErrorAction Stop).Source
     $lines = @(& $git status --short)
     return [string]::Join("`n", [string[]]$lines)
 }
