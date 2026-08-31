@@ -38,6 +38,7 @@ try {
     $timer.Stop()
 
     $progress = Read-LocalJson -Path (Join-Path $testJobDirectory 'progress.json')
+    $verifiedCoverage = @($progress.NanaZipVerificationByCoverage | Where-Object { [int]$_.VerifierLaunches -gt 0 } | Select-Object -First 1)
     [pscustomobject]@{
         WorkerExit = [int]$workerExitCode
         ExternalWallMs = [long]$timer.ElapsedMilliseconds
@@ -45,6 +46,8 @@ try {
         RunElapsedMs = [long]$progress.RunElapsedMs
         PreparationMs = [long]$progress.PreparationMs
         HashcatLaunches = [int]$progress.HashcatProcessLaunchCount
+        HashcatRuntimeBootstrapCount = [int]$progress.HashcatRuntimeBootstrapCount
+        HashcatRuntimeCacheHit = [bool]$progress.HashcatRuntimeCacheHit
         HashcatStartupMs = [long]$progress.HashcatStartupMsTotal
         HashcatActiveMs = [long]$progress.HashcatActiveSearchMs
         JohnActiveMs = [long]$progress.JohnActiveSearchMs
@@ -53,9 +56,23 @@ try {
         StreamPumpDrainMs = [long]$progress.StreamPumpDrainMs
         ProgressPersistenceMs = [long]$progress.ProgressPersistenceMs
         ProgressPublishMs = [long]$progress.ProgressPublishMs
+        ProgressPublishCount = [int]$progress.ProgressPublishCount
+        ProgressPublishAttemptCount = [int]$progress.ProgressPublishAttemptCount
+        ProgressPublishSuppressedCount = [int]$progress.ProgressPublishSuppressedCount
+        TransitionProgressPublishCount = [int]$progress.TransitionProgressPublishCount
+        RunningProgressPublishCount = [int]$progress.RunningProgressPublishCount
+        TerminalProgressPublishCount = [int]$progress.TerminalProgressPublishCount
+        ProgressObjectConstructionMs = [long]$progress.ProgressObjectConstructionMs
+        ConvertToJsonMs = [long]$progress.ConvertToJsonMs
+        AtomicProgressWriteMs = [long]$progress.AtomicProgressWriteMs
+        OtherPublishMs = [long]$progress.OtherPublishMs
         OverallPlanSnapshotMs = [long]$progress.OverallPlanSnapshotMs
         PlanEtaCalculationMs = [long]$progress.PlanEtaCalculationMs
         OverallProgressCalculationMs = [long]$progress.OverallProgressCalculationMs
+        OverallPlanSnapshotCacheBuildCount = [int]$progress.OverallPlanSnapshotCacheBuildCount
+        OverallPlanSnapshotCacheHitCount = [int]$progress.OverallPlanSnapshotCacheHitCount
+        PlanEtaCacheHits = [int]$progress.PlanEtaCacheHits
+        PlanEtaCacheMisses = [int]$progress.PlanEtaCacheMisses
         CoverageStatePersistenceMs = [long]$progress.CoverageStatePersistenceMs
         AttackPlanConstructionMs = [long]$progress.AttackPlanConstructionMs
         BatchLookupMs = [long]$progress.BatchLookupMs
@@ -79,10 +96,18 @@ try {
         InterCoverageIdleMs = [long]$progress.InterCoverageIdleMs
         NanaZipLaunches = [int]$progress.NanaZipVerifierProcessLaunchCount
         NanaZipMs = [long]$progress.NanaZipVerificationMs
+        ArchiveInspectionMs = [long]$progress.ArchiveInspectionMs
+        QuickBulkMs = [long]$progress.QuickBulkMs
+        HashArtifactExtractionMs = [long]$progress.HashArtifactExtractionMs
+        HashcatRuntimePreparationMs = [long]$progress.HashcatRuntimePreparationMs
+        InitialProgressPublicationMs = [long]$progress.InitialProgressPublicationMs
+        FirstEngineSelectionMs = [long]$progress.FirstEngineSelectionMs
+        OtherPreGpuMs = [long]$progress.OtherPreGpuMs
         FirstGpuMs = [long]$progress.TimeToFirstGpuExecutorMs
         FutureUnready = [int]$progress.FutureUnreadyItemsPrepared
         Device = [string]$progress.ComputeDevice
-        LocallyVerified = [bool]$progress.Result.LocallyVerified
+        LocallyVerified = [bool]($null -ne $progress.Result -and $progress.Result.PSObject.Properties.Name -contains 'LocallyVerified' -and $progress.Result.LocallyVerified)
+        RecoveredCoverage = if($verifiedCoverage.Count -gt 0){[string]$verifiedCoverage[0].CoverageId}else{''}
         NanaZipByCoverage = (@($progress.NanaZipVerificationByCoverage | ForEach-Object { '{0}={1}' -f $_.CoverageId, $_.VerifierLaunches }) -join '|')
         CoverageExecByCoverage = (@($progress.CoverageExecutionByCoverage | Sort-Object ExecutionMs -Descending | ForEach-Object { '{0}={1}' -f $_.CoverageId, $_.ExecutionMs }) -join '|')
     }

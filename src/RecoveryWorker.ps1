@@ -100,6 +100,31 @@ $script:ExecutorShutdownMs = 0L
 $script:StreamPumpDrainMs = 0L
 $script:ProgressPersistenceMs = 0L
 $script:ProgressPublishMs = 0L
+$script:ProgressObjectConstructionMs = 0L
+$script:ConvertToJsonMs = 0L
+$script:AtomicProgressWriteMs = 0L
+$script:OtherPublishMs = 0L
+$script:ProgressPublishCount = 0
+$script:ProgressPublishAttemptCount = 0
+$script:ProgressPublishSuppressedCount = 0
+$script:TransitionProgressPublishCount = 0
+$script:RunningProgressPublishCount = 0
+$script:TerminalProgressPublishCount = 0
+$script:LastPublishedState = ''
+$script:LastPublishedCoverageId = ''
+$script:LastPublishedBackend = ''
+$script:LastPublishedComputeDevice = ''
+$script:ProgressPublishMinIntervalMs = 1000L
+$script:CurrentProgressPublishObjectMs = 0L
+$script:CurrentProgressPublishConvertToJsonMs = 0L
+$script:CurrentProgressPublishAtomicWriteMs = 0L
+$script:ArchiveInspectionMs = 0L
+$script:QuickBulkMs = 0L
+$script:HashArtifactExtractionMs = 0L
+$script:HashcatRuntimePreparationMs = 0L
+$script:InitialProgressPublicationMs = 0L
+$script:FirstEngineSelectionMs = 0L
+$script:OtherPreGpuMs = 0L
 $script:OverallPlanSnapshotMs = 0L
 $script:PlanEtaCalculationMs = 0L
 $script:OverallProgressCalculationMs = 0L
@@ -118,6 +143,19 @@ $script:EngineSelectionCache = @{}
 $script:EngineSelectionCacheHits = 0
 $script:EngineSelectionCacheMisses = 0
 $script:ArchiveArtifactLookupMs = 0L
+$script:OverallPlanSnapshotCache = $null
+$script:OverallPlanSnapshotDirty = $true
+$script:OverallPlanSnapshotSourceCount = -1
+$script:OverallPlanStructureRevision = 0L
+$script:OverallPlanSnapshotBuildCount = 0
+$script:OverallPlanSnapshotCacheHitCount = 0
+$script:PlanEtaLastComputedUtc = $null
+$script:PlanEtaLastStructureRevision = -1L
+$script:PlanEtaLastSpeedClassKey = ''
+$script:PlanEtaLastSpeed = 0.0
+$script:PlanEtaLastCurrentCoverageId = ''
+$script:PlanEtaLastCurrentTotal = $null
+$script:PlanEtaRefreshIntervalMs = 3000L
 $script:TransitionWindowActive = $false
 $script:TransitionWindowStartedUtc = $null
 $script:TransitionWindowProgressPersistenceMs = 0L
@@ -534,7 +572,7 @@ function Publish-PreparationSample {
     Update-PreparationProgress -Processed ([long]$Sample.Processed) -Total $sampleTotal -Unit $Unit -Elapsed $sampleElapsed
     $message = 'Stage {0}/{1}: Preparing local dictionary: {2}.' -f $script:StageNumber, $script:StageCount, $CoverageName
     Set-WorkerActivity -Activity 'PreparingDictionary' -Message $message
-    Publish-Progress -State 'Running' -Message $message -Result $null
+    [void](Publish-Progress -State 'Running' -Message $message -Result $null)
 }
 
 function New-PreparationProgressCallback {
@@ -598,7 +636,12 @@ function Set-WorkerOverallCoverageTotal {
     if ([string]::IsNullOrWhiteSpace($CoverageId) -or $null -eq $CandidateCount) { return }
     try {
         [long]$normalizedCount = $CandidateCount
-        if ($normalizedCount -ge 0) { $script:OverallCoverageTotals[$CoverageId] = $normalizedCount }
+        if ($normalizedCount -ge 0) {
+            $changed = -not $script:OverallCoverageTotals.ContainsKey($CoverageId) -or
+                [long]$script:OverallCoverageTotals[$CoverageId] -ne $normalizedCount
+            $script:OverallCoverageTotals[$CoverageId] = $normalizedCount
+            if ($changed) { Set-WorkerOverallPlanStructureDirty }
+        }
     }
     catch { }
 }
@@ -768,6 +811,13 @@ function Set-WorkerCoverageSpeedClass {
         $metadata.AttackFamily = $ExecutionAttackFamily
         $metadata.SpeedClassKey = '{0}|{1}|{2}' -f $metadata.ArchiveBackendClass, $metadata.ComputeBackendClass, $metadata.AttackFamily
     }
+    $oldSpeedClassKey = [string](Get-ObjectPropertyValue -Object $Item -Name 'SpeedClassKey' -Default '')
+    $oldArchiveBackendClass = [string](Get-ObjectPropertyValue -Object $Item -Name 'ArchiveBackendClass' -Default '')
+    $oldComputeBackendClass = [string](Get-ObjectPropertyValue -Object $Item -Name 'ComputeBackendClass' -Default '')
+    $oldAttackFamily = [string](Get-ObjectPropertyValue -Object $Item -Name 'AttackFamily' -Default '')
+    $oldHashcatBackend = [string](Get-ObjectPropertyValue -Object $Item -Name 'HashcatBackend' -Default '')
+    $oldHashMode = [string](Get-ObjectPropertyValue -Object $Item -Name 'HashMode' -Default '')
+    $oldPreferredGpuComputeBackendClass = [string]$script:PreferredGpuComputeBackendClass
     $Item | Add-Member -NotePropertyName SpeedClassKey -NotePropertyValue ([string]$metadata.SpeedClassKey) -Force
     $Item | Add-Member -NotePropertyName ArchiveBackendClass -NotePropertyValue ([string]$metadata.ArchiveBackendClass) -Force
     $Item | Add-Member -NotePropertyName ComputeBackendClass -NotePropertyValue ([string]$metadata.ComputeBackendClass) -Force
@@ -781,6 +831,15 @@ function Set-WorkerCoverageSpeedClass {
     $script:CurrentHashMode = [string]$metadata.HashMode
     if ($metadata.ComputeBackendClass -like 'gpu:*') {
         $script:PreferredGpuComputeBackendClass = [string]$metadata.ComputeBackendClass
+    }
+    if (-not [string]::Equals($oldSpeedClassKey, [string]$metadata.SpeedClassKey, [System.StringComparison]::Ordinal) -or
+        -not [string]::Equals($oldArchiveBackendClass, [string]$metadata.ArchiveBackendClass, [System.StringComparison]::Ordinal) -or
+        -not [string]::Equals($oldComputeBackendClass, [string]$metadata.ComputeBackendClass, [System.StringComparison]::Ordinal) -or
+        -not [string]::Equals($oldAttackFamily, [string]$metadata.AttackFamily, [System.StringComparison]::Ordinal) -or
+        -not [string]::Equals($oldHashcatBackend, [string]$metadata.HashcatBackend, [System.StringComparison]::Ordinal) -or
+        -not [string]::Equals($oldHashMode, [string]$metadata.HashMode, [System.StringComparison]::Ordinal) -or
+        -not [string]::Equals($oldPreferredGpuComputeBackendClass, [string]$script:PreferredGpuComputeBackendClass, [System.StringComparison]::Ordinal)) {
+        Set-WorkerOverallPlanStructureDirty -RebuildSnapshot
     }
     return $metadata
 }
@@ -852,37 +911,73 @@ function Update-WorkerSpeedClassProfile {
     }
 }
 
+function Set-WorkerOverallPlanStructureDirty {
+    [CmdletBinding()]
+    param(
+        [switch]$RebuildSnapshot
+    )
+
+    $script:OverallPlanStructureRevision++
+    if ($RebuildSnapshot) {
+        $script:OverallPlanSnapshotDirty = $true
+    }
+}
+
+function Get-WorkerOverallPlanCandidateCount {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]$Item,
+        [Parameter(Mandatory = $true)][string]$CoverageId
+    )
+
+    $candidateCount = $null
+    if ([string]::Equals($CoverageId, [string]$script:CurrentCoverageId, [System.StringComparison]::Ordinal) -and
+        $null -ne $script:CoverageCandidateTotal) {
+        $candidateCount = $script:CoverageCandidateTotal
+    }
+    elseif ($script:OverallCoverageTotals.ContainsKey($CoverageId)) {
+        $candidateCount = $script:OverallCoverageTotals[$CoverageId]
+    }
+    elseif ($Item.PSObject.Properties.Name -contains 'CandidateCount' -and $null -ne $Item.CandidateCount) {
+        $candidateCount = $Item.CandidateCount
+    }
+    return $candidateCount
+}
+
 function Get-WorkerOverallPlanItems {
     [CmdletBinding()]
     param()
 
-    $items = New-Object 'System.Collections.Generic.List[object]'
-    $sourceItems = $script:OverallPlanItems.ToArray()
+    $sourceItems = @($script:OverallPlanItems.ToArray())
     $requestedCoverageIds = @($script:RequestedCoverageIds)
     if ($sourceItems.Count -eq 0 -and $requestedCoverageIds.Count -gt 0) {
-        foreach ($coverageId in $requestedCoverageIds) {
-            $sourceItems += [pscustomobject]@{
-                CoverageId = [string]$coverageId
-                CandidateCount = if ($script:OverallCoverageTotals.ContainsKey([string]$coverageId)) { $script:OverallCoverageTotals[[string]$coverageId] } else { $null }
+        $sourceItems = @(
+            foreach ($coverageId in $requestedCoverageIds) {
+                [pscustomobject]@{
+                    CoverageId = [string]$coverageId
+                    CandidateCount = if ($script:OverallCoverageTotals.ContainsKey([string]$coverageId)) { $script:OverallCoverageTotals[[string]$coverageId] } else { $null }
+                }
             }
-        }
+        )
     }
+
+    if ($null -ne $script:OverallPlanSnapshotCache -and
+        -not $script:OverallPlanSnapshotDirty -and
+        [int]$script:OverallPlanSnapshotSourceCount -eq [int]$sourceItems.Count) {
+        foreach ($cachedItem in @($script:OverallPlanSnapshotCache)) {
+            $coverageId = [string]$cachedItem.CoverageId
+            $cachedItem.CandidateCount = Get-WorkerOverallPlanCandidateCount -Item $cachedItem -CoverageId $coverageId
+        }
+        $script:OverallPlanSnapshotCacheHitCount++
+        return @($script:OverallPlanSnapshotCache)
+    }
+
+    $items = New-Object 'System.Collections.Generic.List[object]'
     foreach ($item in $sourceItems) {
         if ($null -eq $item -or $item.PSObject.Properties.Name -notcontains 'CoverageId') { continue }
         $coverageId = [string]$item.CoverageId
         if ([string]::IsNullOrWhiteSpace($coverageId)) { continue }
 
-        $candidateCount = $null
-        if ($item.PSObject.Properties.Name -contains 'CandidateCount' -and $null -ne $item.CandidateCount) {
-            $candidateCount = $item.CandidateCount
-        }
-        if ([string]::Equals($coverageId, [string]$script:CurrentCoverageId, [System.StringComparison]::Ordinal) -and
-            $null -ne $script:CoverageCandidateTotal) {
-            $candidateCount = $script:CoverageCandidateTotal
-        }
-        if ($null -eq $candidateCount -and $script:OverallCoverageTotals.ContainsKey($coverageId)) {
-            $candidateCount = $script:OverallCoverageTotals[$coverageId]
-        }
         $speedClass = Get-WorkerPlanSpeedClassMetadata -Item $item
         # Built-in GPU-compatible coverage is materialized into the same
         # dictionary execution family. Reflect that stable execution class in
@@ -901,7 +996,7 @@ function Get-WorkerOverallPlanItems {
         }
         [void]$items.Add([pscustomobject]@{
                 CoverageId          = $coverageId
-                CandidateCount       = $candidateCount
+                CandidateCount       = Get-WorkerOverallPlanCandidateCount -Item $item -CoverageId $coverageId
                 SpeedClassKey        = [string]$speedClass.SpeedClassKey
                 ArchiveBackendClass  = [string]$speedClass.ArchiveBackendClass
                 ComputeBackendClass  = [string]$speedClass.ComputeBackendClass
@@ -910,7 +1005,11 @@ function Get-WorkerOverallPlanItems {
                 HashMode             = [string]$speedClass.HashMode
             })
     }
-    return $items.ToArray()
+    $script:OverallPlanSnapshotCache = $items.ToArray()
+    $script:OverallPlanSnapshotSourceCount = [int]$sourceItems.Count
+    $script:OverallPlanSnapshotDirty = $false
+    $script:OverallPlanSnapshotBuildCount++
+    return @($script:OverallPlanSnapshotCache)
 }
 
 function Get-WorkerRecentOverallSpeed {
@@ -1258,6 +1357,20 @@ function Update-WorkerDisplayedPlanEta {
     }
 }
 
+function Test-WorkerPlanEtaSpeedMateriallyChanged {
+    [CmdletBinding()]
+    param(
+        [double]$CurrentSpeed = 0,
+        [double]$PreviousSpeed = 0
+    )
+
+    if ($CurrentSpeed -le 0) { return $PreviousSpeed -gt 0 }
+    if ($PreviousSpeed -le 0) { return $true }
+    $difference = [math]::Abs($CurrentSpeed - $PreviousSpeed)
+    $threshold = [math]::Max(1000.0, [math]::Abs($PreviousSpeed) * 0.25)
+    return $difference -ge $threshold
+}
+
 function Get-WorkerOverallFlowSnapshot {
     [CmdletBinding()]
     param(
@@ -1308,45 +1421,29 @@ function Get-WorkerOverallFlowSnapshot {
     $planEtaForSnapshot = $null
     $planEtaReadiness = $null
     if ($script:IsCumulativeJob) {
-        $completedForEta = @($script:CompletedCoverageIds | ForEach-Object { [string]$_ } | Sort-Object)
-        $planItemSignature = @($planItems | ForEach-Object {
-                $itemId = [string](Get-ObjectPropertyValue -Object $_ -Name 'CoverageId' -Default '')
-                $itemCount = Get-ObjectPropertyValue -Object $_ -Name 'CandidateCount' -Default ''
-                $itemSpeedClass = [string](Get-ObjectPropertyValue -Object $_ -Name 'SpeedClassKey' -Default '')
-                $itemFamily = [string](Get-ObjectPropertyValue -Object $_ -Name 'AttackFamily' -Default '')
-                '{0}:{1}:{2}:{3}' -f $itemId, $itemCount, $itemSpeedClass, $itemFamily
-            }) -join ';'
-        $profileSignature = @($script:SpeedClassProfiles.Keys | Sort-Object | ForEach-Object {
-                $profile = $script:SpeedClassProfiles[[string]$_]
-                $profileSpeed = Get-ObjectPropertyValue -Object $profile -Name 'Speed' -Default ''
-                $profileSamples = Get-ObjectPropertyValue -Object $profile -Name 'SampleCount' -Default ''
-                '{0}:{1}:{2}' -f ([string]$_), $profileSpeed, $profileSamples
-            }) -join ';'
-        $planEtaCacheKey = @(
-            ($planIds -join "`n"),
-            ($completedForEta -join "`n"),
-            $planItemSignature,
-            $profileSignature,
-            [string]$script:CurrentCoverageId,
-            [string]$currentTotal,
-            [string]$script:CoverageCandidatesTested,
-            [string]$script:Activity,
-            [string]$currentSpeedForPlan,
-            [string]$script:ConservativeObservedGpuSpeed
-        ) -join "`0"
-        # The cache key includes the complete set of ETA inputs, including
-        # the current cursor and speed sample. Reusing an identical calculation
-        # is therefore exact while Hashcat is active. During a transition the
-        # display layer already holds the last valid ETA; reuse that snapshot
-        # until the next active executor supplies a fresh cursor/sample.
-        $canUsePlanEtaCache = $true
-        $canReuseTransitionPlanEta = $script:TransitionWindowActive -and $null -ne $script:PlanEtaCacheValue
-        if ($canUsePlanEtaCache -and $null -ne $script:PlanEtaCacheValue -and
-            ([string]::Equals($planEtaCacheKey, [string]$script:PlanEtaCacheKey, [System.StringComparison]::Ordinal) -or $canReuseTransitionPlanEta)) {
-            $planEta = $script:PlanEtaCacheValue
-            $script:PlanEtaCacheHits++
+        $etaNow = [datetime]::UtcNow
+        # The displayed ETA continues to count down between recalculations.
+        # Rebuilding the full speed-class model every progress tick adds
+        # measurable Worker wall time without changing the logical cursor.
+        # Structural, coverage, calibration, and material speed changes below
+        # still invalidate immediately; this interval only bounds a stable
+        # model's staleness.
+        $etaAgeExpired = $null -eq $script:PlanEtaLastComputedUtc -or
+            ($etaNow - $script:PlanEtaLastComputedUtc.ToUniversalTime()).TotalMilliseconds -ge [double]$script:PlanEtaRefreshIntervalMs
+        $etaCurrentTotalKey = if ($null -eq $currentTotal) { '' } else { [string]$currentTotal }
+        $etaStructureChanged = [long]$script:PlanEtaLastStructureRevision -ne [long]$script:OverallPlanStructureRevision -or
+            -not [string]::Equals([string]$script:PlanEtaLastCurrentCoverageId, [string]$script:CurrentCoverageId, [System.StringComparison]::Ordinal) -or
+            -not [string]::Equals([string]$script:PlanEtaLastCurrentTotal, $etaCurrentTotalKey, [System.StringComparison]::Ordinal)
+        $etaSpeedClassChanged = -not [string]::Equals([string]$script:PlanEtaLastSpeedClassKey, [string]$script:CurrentSpeedClassKey, [System.StringComparison]::Ordinal)
+        $etaSpeedChanged = Test-WorkerPlanEtaSpeedMateriallyChanged -CurrentSpeed $currentSpeedForPlan -PreviousSpeed ([double]$script:PlanEtaLastSpeed)
+        $etaCalibrationChanged = $false
+        if ($null -ne $script:PlanEtaCacheValue -and $script:PlanEtaCacheValue.PSObject.Properties.Name -contains 'CurrentCoverageSpeedIsStable') {
+            $etaCalibrationChanged = (Get-WorkerCurrentCoverageSpeedIsStable) -ne [bool]$script:PlanEtaCacheValue.CurrentCoverageSpeedIsStable
         }
-        else {
+        $needsPlanEtaCalculation = $null -eq $script:PlanEtaCacheValue -or
+            ($etaAgeExpired -or $etaStructureChanged -or $etaSpeedClassChanged -or $etaCalibrationChanged -or $etaSpeedChanged)
+        if ($needsPlanEtaCalculation) {
+            $completedForEta = @($script:CompletedCoverageIds | ForEach-Object { [string]$_ })
             $script:PlanEtaCacheMisses++
             $planEtaOperationStartedUtc = [datetime]::UtcNow
             $planEtaStopwatch = [System.Diagnostics.Stopwatch]::StartNew()
@@ -1363,10 +1460,18 @@ function Get-WorkerOverallFlowSnapshot {
                 }
                 Add-WorkerTransitionInterval -StartUtc $planEtaOperationStartedUtc -EndUtc ([datetime]::UtcNow) -Name 'PlanEtaCalculation'
             }
-            if ($canUsePlanEtaCache) {
-                $script:PlanEtaCacheKey = $planEtaCacheKey
-                $script:PlanEtaCacheValue = $planEta
-            }
+            $script:PlanEtaCacheKey = '{0}:{1}' -f [long]$script:OverallPlanStructureRevision, [string]$script:CurrentCoverageId
+            $script:PlanEtaCacheValue = $planEta
+            $script:PlanEtaLastComputedUtc = [datetime]::UtcNow
+            $script:PlanEtaLastStructureRevision = [long]$script:OverallPlanStructureRevision
+            $script:PlanEtaLastSpeedClassKey = [string]$script:CurrentSpeedClassKey
+            $script:PlanEtaLastSpeed = $currentSpeedForPlan
+            $script:PlanEtaLastCurrentCoverageId = [string]$script:CurrentCoverageId
+            $script:PlanEtaLastCurrentTotal = $etaCurrentTotalKey
+        }
+        else {
+            $planEta = $script:PlanEtaCacheValue
+            $script:PlanEtaCacheHits++
         }
         $planEtaReadiness = Update-WorkerEtaReadiness -PlanEta $planEta
         $planEtaForDisplay = [pscustomobject]@{
@@ -1703,6 +1808,7 @@ function Complete-CoverageItem {
     )
 
     [void]$script:CompletedCoverageIds.Add([string]$Item.CoverageId)
+    Set-WorkerOverallPlanStructureDirty
     $script:CoverageTransitionCount++
     $script:CurrentCoverageId = ''
     $script:CurrentCheckpoint = $null
@@ -1741,6 +1847,7 @@ function Test-CumulativeCoverageCompleted {
         $legacyId = 'hybrid:L4-word-symbol-{0}:v2' -f ([string]$Item.Language)
         if ($script:CompletedCoverageIds.Contains($legacyId)) {
             [void]$script:CompletedCoverageIds.Add($coverageId)
+            Set-WorkerOverallPlanStructureDirty
             Save-CoverageState
             return $true
         }
@@ -1767,7 +1874,8 @@ function Publish-ProgressCore {
         [double]$BackendSpeed = $script:LastBackendSpeed,
         [string]$Activity = '',
         [string]$ActivityMessage = '',
-        [switch]$InitialSnapshot
+        [switch]$InitialSnapshot,
+        [switch]$Force
     )
 
     if ([string]::IsNullOrWhiteSpace($Activity)) {
@@ -1918,7 +2026,9 @@ function Publish-ProgressCore {
         $overallFlow.OverallEtaHasValidHistory = $false
     }
 
-    $record = [ordered]@{
+    $recordConstructionStopwatch = [System.Diagnostics.Stopwatch]::StartNew()
+    try {
+        $record = [ordered]@{
         SchemaVersion     = 4
         State             = $State
         Message           = $Message
@@ -1970,11 +2080,23 @@ function Publish-ProgressCore {
         StreamPumpDrainMs = [long]$script:StreamPumpDrainMs
         ProgressPersistenceMs = [long]$script:ProgressPersistenceMs
         ProgressPublishMs = [long]$script:ProgressPublishMs
+        ProgressObjectConstructionMs = [long]$script:ProgressObjectConstructionMs
+        ConvertToJsonMs = [long]$script:ConvertToJsonMs
+        AtomicProgressWriteMs = [long]$script:AtomicProgressWriteMs
+        OtherPublishMs = [long]$script:OtherPublishMs
+        ProgressPublishCount = [int]$script:ProgressPublishCount
+        ProgressPublishAttemptCount = [int]$script:ProgressPublishAttemptCount
+        ProgressPublishSuppressedCount = [int]$script:ProgressPublishSuppressedCount
+        TransitionProgressPublishCount = [int]$script:TransitionProgressPublishCount
+        RunningProgressPublishCount = [int]$script:RunningProgressPublishCount
+        TerminalProgressPublishCount = [int]$script:TerminalProgressPublishCount
         OverallPlanSnapshotMs = [long]$script:OverallPlanSnapshotMs
         PlanEtaCalculationMs = [long]$script:PlanEtaCalculationMs
         OverallProgressCalculationMs = [long]$script:OverallProgressCalculationMs
         PlanEtaCacheHits = [int]$script:PlanEtaCacheHits
         PlanEtaCacheMisses = [int]$script:PlanEtaCacheMisses
+        OverallPlanSnapshotCacheBuildCount = [int]$script:OverallPlanSnapshotBuildCount
+        OverallPlanSnapshotCacheHitCount = [int]$script:OverallPlanSnapshotCacheHitCount
         CoverageStatePersistenceMs = [long]$script:CoverageStatePersistenceMs
         AttackPlanConstructionMs = [long]$script:AttackPlanConstructionMs
         BatchLookupMs = [long]$script:BatchLookupMs
@@ -2014,6 +2136,13 @@ function Publish-ProgressCore {
         NativeRuleCoverageCount = [int]$script:NativeRuleCoverageIds.Count
         MaterializedCoverageCount = [int]$script:MaterializedCoverageIds.Count
         MaterializedCoveragesRemaining = [int]$script:MaterializedCoverageIds.Count
+        ArchiveInspectionMs = [long]$script:ArchiveInspectionMs
+        QuickBulkMs = [long]$script:QuickBulkMs
+        HashArtifactExtractionMs = [long]$script:HashArtifactExtractionMs
+        HashcatRuntimePreparationMs = [long]$script:HashcatRuntimePreparationMs
+        InitialProgressPublicationMs = [long]$script:InitialProgressPublicationMs
+        FirstEngineSelectionMs = [long]$script:FirstEngineSelectionMs
+        OtherPreGpuMs = [long]$script:OtherPreGpuMs
         BuiltinBatchCacheHit = [bool]$script:BuiltinBatchCacheHit
         GpuBatchSelectedCoverageIds = @($script:GpuBatchSelectedCoverageIds)
         FutureUnreadyItemsPrepared = [int]$script:FutureUnreadyItemsPrepared
@@ -2128,17 +2257,30 @@ function Publish-ProgressCore {
         CoverageResult     = $recordCoverageResult
         LastProgressUtc    = $script:LastProgressUtc.ToString('o')
         UpdatedUtc        = [datetime]::UtcNow.ToString('o')
-        Result            = $Result
+            Result            = $Result
+        }
+    }
+    finally {
+        $recordConstructionStopwatch.Stop()
+        $script:ProgressObjectConstructionMs += [long]$recordConstructionStopwatch.ElapsedMilliseconds
+        $script:CurrentProgressPublishObjectMs = [long]$recordConstructionStopwatch.ElapsedMilliseconds
     }
     $progressPersistenceOperationStartedUtc = [datetime]::UtcNow
     $progressPersistenceStopwatch = [System.Diagnostics.Stopwatch]::StartNew()
+    $progressWriteTiming = @{}
     try {
-        Write-LocalJsonAtomic -Path $progressPath -Value $record
+        Write-LocalJsonAtomic -Path $progressPath -Value $record -Timing $progressWriteTiming
     }
     finally {
         $progressPersistenceStopwatch.Stop()
         [long]$progressPersistenceMs = [long]$progressPersistenceStopwatch.ElapsedMilliseconds
         $script:ProgressPersistenceMs += $progressPersistenceMs
+        [long]$convertToJsonMs = if ($progressWriteTiming.ContainsKey('ConvertToJsonMs')) { $progressWriteTiming['ConvertToJsonMs'] } else { 0L }
+        [long]$atomicProgressWriteMs = if ($progressWriteTiming.ContainsKey('AtomicWriteMs')) { $progressWriteTiming['AtomicWriteMs'] } else { 0L }
+        $script:ConvertToJsonMs += $convertToJsonMs
+        $script:AtomicProgressWriteMs += $atomicProgressWriteMs
+        $script:CurrentProgressPublishConvertToJsonMs = $convertToJsonMs
+        $script:CurrentProgressPublishAtomicWriteMs = $atomicProgressWriteMs
         if ($script:TransitionWindowActive) {
             $script:TransitionWindowProgressPersistenceMs += $progressPersistenceMs
             $script:TransitionProgressPersistenceMsTotal += $progressPersistenceMs
@@ -2160,21 +2302,57 @@ function Publish-Progress {
         [double]$BackendSpeed = $script:LastBackendSpeed,
         [string]$Activity = '',
         [string]$ActivityMessage = '',
-        [switch]$InitialSnapshot
+        [switch]$InitialSnapshot,
+        [switch]$Force
     )
 
+    $script:ProgressPublishAttemptCount++
+    $terminalState = $State -in @('Paused', 'Pausing', 'Stopping', 'Stopped', 'Recovered', 'Exhausted', 'Failed', 'NotEncrypted')
+    $coverageChanged = -not [string]::Equals([string]$script:LastPublishedCoverageId, [string]$script:CurrentCoverageId, [System.StringComparison]::Ordinal)
+    $backendChanged = -not [string]::Equals([string]$script:LastPublishedBackend, [string]$script:BackendName, [System.StringComparison]::Ordinal)
+    $deviceChanged = -not [string]::Equals([string]$script:LastPublishedComputeDevice, [string]$script:ComputeDevice, [System.StringComparison]::Ordinal)
+    $stateChanged = -not [string]::Equals([string]$script:LastPublishedState, $State, [System.StringComparison]::Ordinal)
+    $mustPublish = [bool]$Force -or [bool]$InitialSnapshot -or $script:ProgressPublishCount -eq 0 -or
+        $terminalState -or $coverageChanged -or $backendChanged -or $deviceChanged -or $stateChanged
+    if (-not $mustPublish -and $State -eq 'Running') {
+        $publishAgeMs = ([datetime]::UtcNow - $script:LastPublishUtc).TotalMilliseconds
+        if ($publishAgeMs -lt [double]$script:ProgressPublishMinIntervalMs) {
+            $script:ProgressPublishSuppressedCount++
+            return $null
+        }
+    }
+
+    $script:CurrentProgressPublishObjectMs = 0L
+    $script:CurrentProgressPublishConvertToJsonMs = 0L
+    $script:CurrentProgressPublishAtomicWriteMs = 0L
+    $script:ProgressPublishCount++
+    $isTransitionPublish = [bool]$script:TransitionWindowActive
+    if ($isTransitionPublish) { $script:TransitionProgressPublishCount++ }
+    if ($State -eq 'Running') { $script:RunningProgressPublishCount++ } else { $script:TerminalProgressPublishCount++ }
     $publishOperationStartedUtc = [datetime]::UtcNow
     $publishStopwatch = [System.Diagnostics.Stopwatch]::StartNew()
+    $publishSucceeded = $false
     try {
-        return (Publish-ProgressCore @PSBoundParameters)
+        $resultValue = Publish-ProgressCore @PSBoundParameters
+        $publishSucceeded = $true
+        return $resultValue
     }
     finally {
         $publishStopwatch.Stop()
         [long]$publishMs = [long]$publishStopwatch.ElapsedMilliseconds
         $script:ProgressPublishMs += $publishMs
-        if ($script:TransitionWindowActive) {
+        if ($isTransitionPublish) {
             $script:TransitionWindowProgressPublishMs += $publishMs
             $script:TransitionProgressPublishMsTotal += $publishMs
+        }
+        if ($publishSucceeded) {
+            [long]$otherPublishMs = [math]::Max(0, $publishMs - [long]$script:CurrentProgressPublishObjectMs - [long]$script:CurrentProgressPublishConvertToJsonMs - [long]$script:CurrentProgressPublishAtomicWriteMs)
+            $script:OtherPublishMs += $otherPublishMs
+            if ($InitialSnapshot) { $script:InitialProgressPublicationMs += $publishMs }
+            $script:LastPublishedState = [string]$State
+            $script:LastPublishedCoverageId = [string]$script:CurrentCoverageId
+            $script:LastPublishedBackend = [string]$script:BackendName
+            $script:LastPublishedComputeDevice = [string]$script:ComputeDevice
         }
         Add-WorkerTransitionInterval -StartUtc $publishOperationStartedUtc -EndUtc ([datetime]::UtcNow) -Name 'ProgressPublish'
     }
@@ -2184,7 +2362,7 @@ function Publish-ProgressIfDue {
     [CmdletBinding()]
     param()
 
-    if (([datetime]::UtcNow - $script:LastPublishUtc).TotalMilliseconds -ge 500) {
+    if (([datetime]::UtcNow - $script:LastPublishUtc).TotalMilliseconds -ge [double]$script:ProgressPublishMinIntervalMs) {
         Publish-Progress -State 'Running' -Message ([string]$script:ActivityMessage) -Result $null
     }
 }
@@ -3466,7 +3644,7 @@ function Invoke-JohnCpuRecovery {
         $script:ArchiveBackendClass = [string]$johnSpeedMetadata.ArchiveBackendClass
     }
     Set-WorkerActivity -Activity 'StartingJohn' -Message 'Starting the local John Jumbo bulk CPU search.'
-    Publish-Progress -State 'Running' -Message 'Starting the local John Jumbo bulk CPU search; exact tested count will be reported after completion.' -Result $null
+    Publish-Progress -State 'Running' -Message 'Starting the local John Jumbo bulk CPU search; exact tested count will be reported after completion.' -Result $null -Force
 
     $groupNumber = 0
     $unsupportedGroup = $false
@@ -3581,7 +3759,7 @@ function Invoke-JohnCpuRecovery {
                 try { $process.Kill() } catch { }
             }
             if (-not $stopSent -and -not $pauseSent -and
-                ([datetime]::UtcNow - $script:LastPublishUtc).TotalMilliseconds -ge 500) {
+                ([datetime]::UtcNow - $script:LastPublishUtc).TotalMilliseconds -ge [double]$script:ProgressPublishMinIntervalMs) {
                 Publish-Progress -State 'Running' -Message $lastStatusMessage -Result $null -BackendSpeed $script:JohnLastSpeed
             }
             Start-Sleep -Milliseconds 200
@@ -3757,6 +3935,7 @@ function Prepare-HashcatRuntimeExecutable {
     $stopwatch.Stop()
     $script:HashcatRuntimeBootstrapCount++
     $script:HashcatRuntimeBootstrapMs += [long]$stopwatch.ElapsedMilliseconds
+    $script:HashcatRuntimePreparationMs += [long]$stopwatch.ElapsedMilliseconds
     $script:HashcatRuntimeExecutable = Join-Path $workingDirectory 'hashcat.exe'
     $script:HashcatRuntimePrepared = $true
     return [string]$script:HashcatRuntimeExecutable
@@ -3882,7 +4061,7 @@ function Invoke-HashcatRecovery {
     else {
         Set-WorkerActivity -Activity 'StartingHashcat' -Message 'Starting the local Hashcat backend.'
     }
-    Publish-Progress -State 'Running' -Message $startupMessage -Result $null
+    Publish-Progress -State 'Running' -Message $startupMessage -Result $null -Force
     [void]$process.Start()
     $processStartedUtc = [datetime]::UtcNow
     $script:HashcatProcessLaunchCount++
@@ -3905,6 +4084,9 @@ function Invoke-HashcatRecovery {
     $script:ExecutorStartedUtc = $script:HashcatProcessStartedUtc
     if ($null -eq $script:FirstGpuExecutorStartedUtc) {
         $script:FirstGpuExecutorStartedUtc = $script:HashcatProcessStartedUtc
+        [long]$firstGpuElapsedMs = [long](($script:FirstGpuExecutorStartedUtc - $script:RunStartedUtc).TotalMilliseconds)
+        [long]$knownPreGpuMs = [long]$script:ArchiveInspectionMs + [long]$script:QuickBulkMs + [long]$script:HashArtifactExtractionMs + [long]$script:HashcatRuntimePreparationMs + [long]$script:InitialProgressPublicationMs + [long]$script:FirstEngineSelectionMs
+        $script:OtherPreGpuMs = [math]::Max(0L, $firstGpuElapsedMs - $knownPreGpuMs)
     }
     elseif ($script:TransitionWindowActive) {
         Complete-WorkerTransitionWindow -EndUtc $script:HashcatProcessStartedUtc
@@ -3970,7 +4152,7 @@ function Invoke-HashcatRecovery {
         }
 
         if (-not $stopSent -and -not $pauseSent -and
-            ([datetime]::UtcNow - $script:LastPublishUtc).TotalMilliseconds -ge 500) {
+            ([datetime]::UtcNow - $script:LastPublishUtc).TotalMilliseconds -ge [double]$script:ProgressPublishMinIntervalMs) {
             Publish-Progress -State 'Running' -Message $lastStatusMessage -Result $null
         }
         if (($stopSent -or $pauseSent) -and -not $process.HasExited -and
@@ -4115,6 +4297,7 @@ function Select-WorkerTimedLocalEngine {
 
     $selectionOperationStartedUtc = [datetime]::UtcNow
     $selectionStopwatch = [System.Diagnostics.Stopwatch]::StartNew()
+    $selectionWasCacheMiss = $false
     try {
         $preference = [string](Get-ObjectPropertyValue -Object $job -Name 'DevicePreference' -Default 'Auto')
         if ([string]::IsNullOrWhiteSpace($preference)) { $preference = 'Auto' }
@@ -4139,6 +4322,7 @@ function Select-WorkerTimedLocalEngine {
             return $script:EngineSelectionCache[$selectionKey]
         }
         $script:EngineSelectionCacheMisses++
+        $selectionWasCacheMiss = $true
         $engine = Select-LocalEngine -Inspection $Inspection -Strategy $Strategy -PlanningJob $PlanningJob
         $script:EngineSelectionCache[$selectionKey] = $engine
         return $engine
@@ -4147,11 +4331,31 @@ function Select-WorkerTimedLocalEngine {
         $selectionStopwatch.Stop()
         [long]$selectionMs = [long]$selectionStopwatch.ElapsedMilliseconds
         $script:EngineSelectionMs += $selectionMs
+        if ($selectionWasCacheMiss -and [long]$script:FirstEngineSelectionMs -eq 0) {
+            $script:FirstEngineSelectionMs = $selectionMs
+        }
         if ($script:TransitionWindowActive) {
             $script:TransitionWindowEngineSelectionMs += $selectionMs
             $script:TransitionEngineSelectionMsTotal += $selectionMs
         }
         Add-WorkerTransitionInterval -StartUtc $selectionOperationStartedUtc -EndUtc ([datetime]::UtcNow) -Name 'EngineSelection'
+    }
+}
+
+function Get-WorkerTimedArchiveInspection {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][string]$ArchivePath,
+        [Parameter(Mandatory = $true)][string]$SevenZip
+    )
+
+    $inspectionStopwatch = [System.Diagnostics.Stopwatch]::StartNew()
+    try {
+        return (Get-ArchiveInspection -ArchivePath $ArchivePath -SevenZip $SevenZip)
+    }
+    finally {
+        $inspectionStopwatch.Stop()
+        $script:ArchiveInspectionMs += [long]$inspectionStopwatch.ElapsedMilliseconds
     }
 }
 
@@ -4171,6 +4375,7 @@ function Get-WorkerTimedHashcatArtifact {
         $artifactStopwatch.Stop()
         [long]$artifactMs = [long]$artifactStopwatch.ElapsedMilliseconds
         $script:ArchiveArtifactLookupMs += $artifactMs
+        $script:HashArtifactExtractionMs += $artifactMs
         if ($script:TransitionWindowActive) {
             $script:TransitionWindowArchiveArtifactLookupMs += $artifactMs
             $script:TransitionArchiveArtifactLookupMsTotal += $artifactMs
@@ -4324,7 +4529,7 @@ function Get-PlanDictionaryPaths {
             }
             $path = Expand-BuiltinDictionary -Language ([string]$source.Language) -Level ([int]$source.Level) -RuntimeDirectory $script:RuntimeDirectory
             $sourceCount = Get-BuiltinDictionaryCount -Language ([string]$source.Language) -Level ([int]$source.Level)
-            Publish-PreparationSample -Sample ([pscustomobject]@{ Processed = $sourceCount; Total = $sourceCount; Elapsed = 0.0 }) -CoverageName ([string]$Item.DisplayName) -Unit 'Entries'
+            [void](Publish-PreparationSample -Sample ([pscustomobject]@{ Processed = $sourceCount; Total = $sourceCount; Elapsed = 0.0 }) -CoverageName ([string]$Item.DisplayName) -Unit 'Entries')
             [void]$paths.Add([string]$path)
             if ([string]$Item.Kind -eq 'CapitalInitialDigits') {
                 $nativeCount = [long]$sourceCount * 11110L
@@ -5118,6 +5323,7 @@ function Publish-PlanSkipped {
             CoverageId = [string]$Item.CoverageId
             Reason = $Reason
         })
+    Set-WorkerOverallPlanStructureDirty
     $script:StageMessage = $Reason
     $script:CurrentCoverageId = ''
     $script:CurrentCoverageName = ''
@@ -5130,7 +5336,7 @@ function Publish-PlanSkipped {
     Reset-PreparationProgress
     Save-CoverageState
     Set-WorkerActivity -Activity 'AdvancingCoverage' -Message ('Coverage {0} was skipped; advancing to the next local coverage.' -f $Item.DisplayName)
-    Publish-Progress -State 'Running' -Message ('Coverage {0} skipped: {1}' -f $Item.DisplayName, $Reason) -Result $null
+    Publish-Progress -State 'Running' -Message ('Coverage {0} skipped: {1}' -f $Item.DisplayName, $Reason) -Result $null -Force
 }
 
 function Publish-PlanAlreadyCompleted {
@@ -5144,7 +5350,7 @@ function Publish-PlanAlreadyCompleted {
     # item that the outer loop has not reached yet.
     $script:StageMessage = ('Coverage {0} was already completed in this local job.' -f [string]$Item.DisplayName)
     Set-WorkerActivity -Activity 'AdvancingCoverage' -Message 'Advancing to the next local coverage.'
-    Publish-Progress -State 'Running' -Message $script:StageMessage -Result $null
+    Publish-Progress -State 'Running' -Message $script:StageMessage -Result $null -Force
 }
 
 function Test-CumulativeCandidateAtPosition {
@@ -5462,7 +5668,7 @@ function Invoke-CumulativeRecovery {
 
     Test-RecoveryJobConfiguration -Job $job -RequireArchiveIdentity:$Resume
     $sevenZip = Resolve-SevenZip
-    $inspection = Get-ArchiveInspection -ArchivePath ([string]$job.ArchivePath) -SevenZip $sevenZip
+    $inspection = Get-WorkerTimedArchiveInspection -ArchivePath ([string]$job.ArchivePath) -SevenZip $sevenZip
     $script:ArchiveBackendClass = Get-WorkerArchiveBackendClass -Inspection $inspection
     if ($inspection.EncryptionState -eq 'No') {
         $script:TerminalState = 'NotEncrypted'
@@ -5484,9 +5690,10 @@ function Invoke-CumulativeRecovery {
         }
     }
     $script:RequestedCoverageIds = $requested.ToArray()
+    Set-WorkerOverallPlanStructureDirty -RebuildSnapshot
     Save-CoverageState
     Set-WorkerActivity -Activity 'PreparingBackend' -Message 'The overall recovery plan is ready; preparing the local recovery backend.'
-    Publish-Progress -State 'Running' -Message 'The overall recovery plan is ready; preparing the local recovery backend.' -Result $null
+    Publish-Progress -State 'Running' -Message 'The overall recovery plan is ready; preparing the local recovery backend.' -Result $null -Force
 
     [int]$resumeStageNumber = 0
     if ($script:ResumeStage -and $null -ne $previous -and $previous.PSObject.Properties.Name -contains 'StageNumber') {
@@ -5562,7 +5769,14 @@ function Invoke-CumulativeRecovery {
                     $batchEligible = $false
                 }
                 elseif ($nativeRuleEligible) {
-                    $dictionaryPaths = @(Get-PlanDictionaryPaths -Item $item -UseNativeRules)
+                    $dictionaryPaths = @(
+                        Get-PlanDictionaryPaths -Item $item -UseNativeRules |
+                            Where-Object {
+                                $_ -is [string] -and
+                                -not [string]::IsNullOrWhiteSpace([string]$_) -and
+                                (Test-Path -LiteralPath ([string]$_) -PathType Leaf)
+                            }
+                    )
                     if ([string]$item.Kind -eq 'CapitalInitialDigits' -and $item.PSObject.Properties.Name -contains 'NativeCandidateCount') {
                         $script:CoverageCandidateTotal = [long]$item.NativeCandidateCount
                         Set-WorkerOverallCoverageTotal -CoverageId ([string]$item.CoverageId) -CandidateCount ([long]$item.NativeCandidateCount)
@@ -5751,14 +5965,23 @@ function Invoke-CumulativeRecovery {
             Set-WorkerEngineSelection -Engine $engine
             Reset-PreparationProgress
             Set-WorkerActivity -Activity 'RunningCoverage' -Message ($engine.Message + ' Coverage: ' + [string]$item.DisplayName)
-            Publish-Progress -State 'Running' -Message ($engine.Message + ' Coverage: ' + [string]$item.DisplayName) -Result $null
+            Publish-Progress -State 'Running' -Message ($engine.Message + ' Coverage: ' + [string]$item.DisplayName) -Result $null -Force
             if ($engine.UseGpu) {
                 Invoke-HashcatRecovery -SevenZip $sevenZip -Engine $engine -Artifact $artifact -AttackPlan $attackPlan -StageNumber $stageNumber -ExecutionId $(if ($null -ne $gpuBatch) { [string]$gpuBatch.BatchId } else { '' }) -ResumeStage:$resumeThisCoverage
             }
             else {
                 $johnResult = $null
                 if ([string]$item.Kind -in @('Quick', 'YearCombination', 'BuiltinDictionary', 'Dictionary', 'CustomDictionary', 'RulesDictionary', 'CustomRules', 'RuleCaseVariants', 'RuleAppendVariants', 'DateRange', 'CommonSymbols')) {
-                    $johnResult = Invoke-JohnCpuRecovery -SevenZip $sevenZip -ArchiveFormat ([string]$inspection.Format) -Item $item -SkipCount ([long]$script:CoveragePosition)
+                    $quickBulkStopwatch = [System.Diagnostics.Stopwatch]::StartNew()
+                    try {
+                        $johnResult = Invoke-JohnCpuRecovery -SevenZip $sevenZip -ArchiveFormat ([string]$inspection.Format) -Item $item -SkipCount ([long]$script:CoveragePosition)
+                    }
+                    finally {
+                        $quickBulkStopwatch.Stop()
+                        if ([string]$item.Kind -in @('Quick', 'YearCombination')) {
+                            $script:QuickBulkMs += [long]$quickBulkStopwatch.ElapsedMilliseconds
+                        }
+                    }
                 }
                 if ($null -ne $johnResult -and [string]$johnResult.Status -in @('Completed', 'Recovered', 'Paused', 'Stopped', 'Failed')) {
                     if ([string]$johnResult.Status -eq 'Completed' -and $null -eq $script:TerminalState) { $script:CoverageResult = 'CoverageCompleted' }
@@ -5772,7 +5995,7 @@ function Invoke-CumulativeRecovery {
                         $fallbackEngine = New-CpuEngine -Label 'CPU / NanaZip fallback' -Message ([string]$johnResult.Message + ' CPU fallback was selected.')
                         [void](Set-WorkerCoverageSpeedClass -Item $item -Engine $fallbackEngine -Artifact $artifact)
                         Set-WorkerActivity -Activity 'RunningCoverage' -Message ([string]$johnResult.Message + ' CPU fallback was selected.')
-                        Publish-Progress -State 'Running' -Message ([string]$johnResult.Message + ' CPU fallback was selected.') -Result $null
+                        Publish-Progress -State 'Running' -Message ([string]$johnResult.Message + ' CPU fallback was selected.') -Result $null -Force
                     }
                     Invoke-WorkerTimedCumulativePlanCpu -Item $item -SevenZip $sevenZip | Out-Null
                     if ($null -eq $script:TerminalState) { $script:CoverageResult = 'CoverageCompleted' }
@@ -5801,7 +6024,7 @@ function Invoke-CumulativeRecovery {
                 Save-CoverageState
                 $script:TerminalState = $null
                 Set-WorkerActivity -Activity 'AdvancingCoverage' -Message 'GPU batch completed; advancing logical coverage.'
-                Publish-Progress -State 'Running' -Message 'GPU batch completed; logical coverage was recorded in order.' -Result $null
+                Publish-Progress -State 'Running' -Message 'GPU batch completed; logical coverage was recorded in order.' -Result $null -Force
                 $script:ResumeStage = $false
                 $resumeThisStage = $false
                 continue
@@ -5817,7 +6040,7 @@ function Invoke-CumulativeRecovery {
                 if ($null -ne $item.CandidateCount) { $stageCompletedKnown += [long]$item.CandidateCount }
                 $script:TerminalState = $null
                 Set-WorkerActivity -Activity 'AdvancingCoverage' -Message 'Coverage completed; advancing to the next local coverage.'
-                Publish-Progress -State 'Running' -Message 'Coverage completed; advancing to the next local coverage.' -Result $null
+                Publish-Progress -State 'Running' -Message 'Coverage completed; advancing to the next local coverage.' -Result $null -Force
             }
             else {
                 $script:TerminalState = 'Failed'
@@ -5831,7 +6054,7 @@ function Invoke-CumulativeRecovery {
         $script:StageStatus = 'Completed'
         $script:StageMessage = 'All planned coverage items in this stage completed without recovering a password.'
         Set-WorkerActivity -Activity 'AdvancingCoverage' -Message ('Stage {0} completed; advancing to the next local stage.' -f $stage.DisplayName)
-        Publish-Progress -State 'Running' -Message ('Stage {0} completed without recovering a password.' -f $stage.DisplayName) -Result $null
+        Publish-Progress -State 'Running' -Message ('Stage {0} completed without recovering a password.' -f $stage.DisplayName) -Result $null -Force
     }
 
     $script:TerminalState = 'Exhausted'
@@ -5939,8 +6162,9 @@ function Publish-StageSkipped {
             StageName   = [string]$Stage.DisplayName
             Reason      = $Reason
         })
+    Set-WorkerOverallPlanStructureDirty
     Set-WorkerActivity -Activity 'AdvancingCoverage' -Message ('Stage {0} was skipped; advancing to the next local stage.' -f $Stage.DisplayName)
-    Publish-Progress -State 'Running' -Message ('Stage {0} skipped: {1}' -f $Stage.DisplayName, $Reason) -Result $null
+    Publish-Progress -State 'Running' -Message ('Stage {0} skipped: {1}' -f $Stage.DisplayName, $Reason) -Result $null -Force
 }
 
 try {
@@ -5953,7 +6177,7 @@ try {
 
     Test-RecoveryJobConfiguration -Job $job -RequireArchiveIdentity:$Resume
     $sevenZip = Resolve-SevenZip
-    $inspection = Get-ArchiveInspection -ArchivePath ([string]$job.ArchivePath) -SevenZip $sevenZip
+    $inspection = Get-WorkerTimedArchiveInspection -ArchivePath ([string]$job.ArchivePath) -SevenZip $sevenZip
 
     if ($inspection.EncryptionState -eq 'No') {
         $script:TerminalState = 'NotEncrypted'
@@ -6011,12 +6235,12 @@ try {
 
         if ($engine.UseGpu) {
             Set-WorkerActivity -Activity 'RunningCoverage' -Message ($engine.Message + ' ' + $artifact.Message)
-            Publish-Progress -State 'Running' -Message ($engine.Message + ' ' + $artifact.Message) -Result $null
+            Publish-Progress -State 'Running' -Message ($engine.Message + ' ' + $artifact.Message) -Result $null -Force
             Invoke-HashcatRecovery -SevenZip $sevenZip -Engine $engine -Artifact $artifact -AttackPlan $attackPlan -StageNumber ([int]$stage.StageNumber) -ResumeStage:$resumeThisStage
         }
         else {
             Set-WorkerActivity -Activity 'RunningCoverage' -Message $engine.Message
-            Publish-Progress -State 'Running' -Message $engine.Message -Result $null
+            Publish-Progress -State 'Running' -Message $engine.Message -Result $null -Force
             $skipCount = $script:StageCandidatesTested
 
             $johnResult = $null
@@ -6035,7 +6259,7 @@ try {
                     $script:BackendName = $engine.Backend
                     $script:ComputeDevice = $engine.ComputeDevice
                     Set-WorkerActivity -Activity 'RunningCoverage' -Message $engine.Message
-                    Publish-Progress -State 'Running' -Message $engine.Message -Result $null
+                    Publish-Progress -State 'Running' -Message $engine.Message -Result $null -Force
                 }
                 switch ([string]$stage.Strategy) {
                     'Quick' { Invoke-QuickRecovery -SevenZip $sevenZip -SkipCount $skipCount }
@@ -6058,7 +6282,7 @@ try {
         $script:StageStatus = 'Completed'
         $script:StageMessage = 'No verified password was found in this stage.'
         Set-WorkerActivity -Activity 'AdvancingCoverage' -Message ('Stage {0} completed; advancing to the next local stage.' -f $stage.DisplayName)
-        Publish-Progress -State 'Running' -Message ('Stage {0} completed without recovering a password.' -f $stage.DisplayName) -Result $null
+        Publish-Progress -State 'Running' -Message ('Stage {0} completed without recovering a password.' -f $stage.DisplayName) -Result $null -Force
     }
 
     if ($null -eq $script:TerminalState) {

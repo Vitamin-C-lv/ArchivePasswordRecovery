@@ -195,7 +195,8 @@ function Write-LocalJsonAtomic {
     [CmdletBinding()]
     param(
         [Parameter(Mandatory = $true)][string]$Path,
-        [Parameter(Mandatory = $true)]$Value
+        [Parameter(Mandatory = $true)]$Value,
+        [System.Collections.IDictionary]$Timing = $null
     )
 
     $directory = Split-Path -Path $Path -Parent
@@ -205,7 +206,15 @@ function Write-LocalJsonAtomic {
 
     $temporaryPath = Join-Path $directory ('.' + [System.IO.Path]::GetFileName($Path) + '.' + [guid]::NewGuid().ToString('N') + '.tmp')
     try {
-        $Value | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $temporaryPath -Encoding UTF8
+        $convertStopwatch = [System.Diagnostics.Stopwatch]::StartNew()
+        $jsonText = $Value | ConvertTo-Json -Depth 8
+        $convertStopwatch.Stop()
+        if ($null -ne $Timing) {
+            $Timing['ConvertToJsonMs'] = [long]$convertStopwatch.ElapsedMilliseconds
+        }
+
+        $atomicWriteStopwatch = [System.Diagnostics.Stopwatch]::StartNew()
+        $jsonText | Set-Content -LiteralPath $temporaryPath -Encoding UTF8
         $moveError = $null
         for ($attempt = 0; $attempt -lt 3; $attempt++) {
             try {
@@ -219,6 +228,10 @@ function Write-LocalJsonAtomic {
             }
         }
         if ($null -ne $moveError) { throw $moveError }
+        $atomicWriteStopwatch.Stop()
+        if ($null -ne $Timing) {
+            $Timing['AtomicWriteMs'] = [long]$atomicWriteStopwatch.ElapsedMilliseconds
+        }
     }
     finally {
         if (Test-Path -LiteralPath $temporaryPath) {
