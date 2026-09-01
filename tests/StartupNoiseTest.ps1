@@ -19,6 +19,8 @@ $projectRoot = Split-Path $PSScriptRoot -Parent
 $guiPath = Join-Path $projectRoot 'src\ArchivePasswordRecovery.ps1'
 $powershellPath = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
 $process = $null
+$startupWatch = [System.Diagnostics.Stopwatch]::StartNew()
+$windowVisibleMs = $null
 
 try {
     $startInfo = New-Object System.Diagnostics.ProcessStartInfo
@@ -40,8 +42,9 @@ try {
         if ($process.HasExited) { throw ('The GUI process exited during startup with code ' + $process.ExitCode) }
         if ($process.MainWindowHandle -ne [IntPtr]::Zero -and -not [string]::IsNullOrWhiteSpace($process.MainWindowTitle)) {
             $windowFound = $true
+            $windowVisibleMs = [long]$startupWatch.ElapsedMilliseconds
         }
-        else { Start-Sleep -Milliseconds 200 }
+        else { Start-Sleep -Milliseconds 50 }
     }
     if (-not $windowFound) { throw 'The GUI window did not appear during the startup-noise test.' }
 
@@ -65,7 +68,9 @@ try {
         StdoutLength = $stdout.Length
         StderrLength = $stderr.Length
         WindowTitle = $process.MainWindowTitle
+        WindowVisibleMs = $windowVisibleMs
     } | Format-List
+    "STARTUP_WINDOW_VISIBLE_MS=$windowVisibleMs"
     'STARTUP_NOISE_STDOUT=Removed'
     'STARTUP_NOISE_STDERR=Removed'
     'STARTUP_NO_BARE_BOOLEAN=Removed'

@@ -66,7 +66,7 @@ $uiErrors = $null
 $uiAst = [System.Management.Automation.Language.Parser]::ParseInput($uiText, [ref]$uiTokens, [ref]$uiErrors)
 if ($uiErrors.Count -gt 0) { throw 'ArchivePasswordRecovery.ps1 contains a PowerShell parse error.' }
 $uiDefinitions = New-Object System.Collections.Generic.List[string]
-foreach ($functionName in @('Format-LocalDuration', 'Format-LocalEta', 'Format-LocalEtaRange', 'Get-OverallEtaPrimaryText')) {
+foreach ($functionName in @('Format-LocalDuration', 'Format-LocalEta', 'Format-LocalEtaRange', 'Format-FriendlyOverallEta', 'Get-OverallEtaPrimaryText')) {
     $functionAst = $uiAst.Find(({
                 param($node)
                 return ($node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq $functionName)
@@ -142,7 +142,9 @@ $preliminary = Get-CoverageDurationSumEta -PlanCoverageIds (Get-PlanIds -Items $
 Assert-Equal -Actual $preliminary.EtaReadiness -Expected 'Preliminary' -Message 'finite 70-percent plan did not become Preliminary'
 Assert-True ($null -ne $preliminary.PlanEtaSeconds -and $null -ne $preliminary.PlanEtaLowSeconds -and $null -ne $preliminary.PlanEtaHighSeconds -and [double]$preliminary.PlanEtaHighSeconds -gt [double]$preliminary.PlanEtaLowSeconds) 'Preliminary ETA range was not finite'
 $preliminaryPrimary = Get-OverallEtaPrimaryText -DisplayState Running -Readiness $preliminary.EtaReadiness -EtaSeconds $preliminary.PlanEtaSeconds -EtaLowSeconds $preliminary.PlanEtaLowSeconds -EtaHighSeconds $preliminary.PlanEtaHighSeconds
-Assert-True ($preliminaryPrimary -match '–' -and $preliminaryPrimary -notmatch '以上') ('Preliminary primary was not a bounded range: ' + $preliminaryPrimary)
+$preliminaryReference = ([double]$preliminary.PlanEtaLowSeconds + [double]$preliminary.PlanEtaHighSeconds) / 2.0
+Assert-Equal -Actual $preliminaryPrimary -Expected (Format-FriendlyOverallEta -Seconds $preliminaryReference) -Message 'Preliminary primary did not use the coarse midpoint reference'
+Assert-True ($preliminaryPrimary -match '^约 ' -and $preliminaryPrimary -notmatch '–' -and $preliminaryPrimary -notmatch '\d+ 分钟 \d+ 秒') ('Preliminary primary was not a single coarse value: ' + $preliminaryPrimary)
 
 # Once all required classes are calibrated, Stable returns one point value.
 $stableProfiles = @{}
@@ -153,7 +155,34 @@ $stable = Get-CoverageDurationSumEta -PlanCoverageIds (Get-PlanIds -Items $preli
 Assert-Equal -Actual $stable.EtaReadiness -Expected 'Stable' -Message 'fully calibrated plan did not become Stable'
 Assert-True ($null -ne $stable.PlanEtaSeconds -and [double]$stable.PlanEtaLowSeconds -eq [double]$stable.PlanEtaSeconds -and [double]$stable.PlanEtaHighSeconds -eq [double]$stable.PlanEtaSeconds) 'Stable ETA was not a single point'
 $stablePrimary = Get-OverallEtaPrimaryText -DisplayState Running -Readiness $stable.EtaReadiness -EtaSeconds $stable.PlanEtaSeconds -EtaLowSeconds $stable.PlanEtaLowSeconds -EtaHighSeconds $stable.PlanEtaHighSeconds
-Assert-True ($stablePrimary -match '^约 ' -and $stablePrimary -notmatch '–') ('Stable primary was not a point ETA: ' + $stablePrimary)
+Assert-Equal -Actual $stablePrimary -Expected (Format-FriendlyOverallEta -Seconds $stable.PlanEtaSeconds) -Message 'Stable primary did not use the coarse ETA formatter'
+Assert-True ($stablePrimary -match '^约 ' -and $stablePrimary -notmatch '–' -and $stablePrimary -notmatch '\d+ 分钟 \d+ 秒') ('Stable primary was not a single coarse value: ' + $stablePrimary)
+
+$coarseExamples = [ordered]@{
+    FiftyThreeSeconds = Format-FriendlyOverallEta -Seconds 53
+    SeventySevenSeconds = Format-FriendlyOverallEta -Seconds 77
+    OneHundredNineteenSeconds = Format-FriendlyOverallEta -Seconds 119
+    ThreeHundredTwentyOneSeconds = Format-FriendlyOverallEta -Seconds 321
+    SixHundredOneSeconds = Format-FriendlyOverallEta -Seconds 601
+    ThreeThousandSixHundredSeconds = Format-FriendlyOverallEta -Seconds 3600
+}
+Assert-Equal -Actual $coarseExamples.FiftyThreeSeconds -Expected '约 1 分钟' -Message '53-second ETA was rendered with false precision'
+Assert-Equal -Actual $coarseExamples.SeventySevenSeconds -Expected '约 1 分钟' -Message '77-second ETA was rendered with false precision'
+Assert-Equal -Actual $coarseExamples.OneHundredNineteenSeconds -Expected '约 2 分钟' -Message '119-second ETA was not coarse formatted'
+Assert-Equal -Actual $coarseExamples.ThreeHundredTwentyOneSeconds -Expected '约 5 分钟' -Message '321-second ETA was not coarse formatted'
+Assert-Equal -Actual $coarseExamples.SixHundredOneSeconds -Expected '约 10 分钟' -Message '601-second ETA was not coarse formatted'
+Assert-Equal -Actual $coarseExamples.ThreeThousandSixHundredSeconds -Expected '约 1 小时' -Message 'one-hour ETA was not coarse formatted'
+
+$activityStateCases = [ordered]@{}
+foreach ($activityState in @('Pausing', 'Paused', 'Stopping', 'Stopped')) {
+    $activityStateCases[$activityState] = Get-OverallEtaPrimaryText -DisplayState $activityState -Readiness Stable -EtaSeconds 77 -EtaLowSeconds 60 -EtaHighSeconds 120 -Activity $activityState
+    Assert-Equal -Actual $activityStateCases[$activityState] -Expected '继续搜索后更新' -Message ($activityState + ' ETA status regressed to a numeric value')
+}
+$pausedPrimary = $activityStateCases.Paused
+$recoveredPrimary = Get-OverallEtaPrimaryText -DisplayState Recovered -Readiness Stable -EtaSeconds 77 -EtaLowSeconds 60 -EtaHighSeconds 120 -Activity Recovered
+$exhaustedPrimary = Get-OverallEtaPrimaryText -DisplayState Exhausted -Readiness Stable -EtaSeconds 0 -EtaLowSeconds 0 -EtaHighSeconds 0 -Activity Exhausted
+Assert-Equal -Actual $recoveredPrimary -Expected '已找到密码' -Message 'Recovered ETA status regressed'
+Assert-Equal -Actual $exhaustedPrimary -Expected '已完成' -Message 'Exhausted ETA status regressed'
 
 foreach ($field in @('EtaReadiness', 'PlanEtaLowSeconds', 'PlanEtaHighSeconds', 'PlanEtaKnownLowerBoundSeconds', 'RequiredFutureSpeedClassCount', 'CalibratedRequiredSpeedClassCount')) {
     Assert-True ($uiText.IndexOf($field) -ge 0) ('UI binding is missing ETA calibration field: ' + $field)
@@ -168,5 +197,10 @@ Assert-True ($uiText.IndexOf("`$overallEtaReadiness -eq 'Partial'") -lt 0) 'ETA 
     ScreenshotBKnownLowerBound = $screenB.PlanEtaKnownLowerBoundSeconds
     Preliminary = $preliminaryPrimary
     Stable = $stablePrimary
+    Paused = $pausedPrimary
+    Pausing = $activityStateCases.Pausing
+    Stopping = $activityStateCases.Stopping
+    Stopped = $activityStateCases.Stopped
+    Recovered = $recoveredPrimary
 } | Format-List
 'ETA_CALIBRATION_UX_REGRESSION: PASS'

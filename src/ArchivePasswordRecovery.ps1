@@ -36,10 +36,6 @@ $jobsRoot = Join-Path $env:LOCALAPPDATA 'ArchivePasswordRecovery\Jobs'
 New-Item -ItemType Directory -Path $jobsRoot -Force | Out-Null
 $runtimeRoot = Get-RecoveryRuntimeRoot
 New-Item -ItemType Directory -Path $runtimeRoot -Force | Out-Null
-$startupRuntimeCleanup = @()
-try { $startupRuntimeCleanup = @(Cleanup-StaleRecoveryRuntime -RuntimeRoot $runtimeRoot) } catch { $startupRuntimeCleanup = @() }
-$startupJobCleanup = @()
-try { $startupJobCleanup = @(Cleanup-TerminalRecoveryJobs -JobsRoot $jobsRoot) } catch { $startupJobCleanup = @() }
 
 [xml]$xaml = @'
 <Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
@@ -456,6 +452,12 @@ $script:UiElapsedRunId = ''
 $script:UiElapsedRunStartedUtc = $null
 $script:UiElapsedFrozenSeconds = $null
 $script:UiElapsedLastSeconds = 0.0
+$script:DeviceProbeState = 'Pending'
+$script:DeviceProbeResult = $null
+$script:DeviceProbeError = ''
+$script:DeviceChoicesPopulated = $false
+$script:DeferredStartupScheduled = $false
+$script:DeferredStartupStarted = $false
 
 function Write-UiLog {
     param([Parameter(Mandatory = $true)][string]$Message)
@@ -994,6 +996,35 @@ function Format-LocalEtaRange {
     return ('约 {0}–{1}' -f $lowText, $highText)
 }
 
+function Format-FriendlyOverallEta {
+    param($Seconds)
+
+    if ($null -eq $Seconds) { return '无法可靠估算' }
+    try { [double]$value = [double]$Seconds } catch { return '无法可靠估算' }
+    if ([double]::IsNaN($value) -or [double]::IsInfinity($value) -or $value -lt 0) {
+        return '无法可靠估算'
+    }
+    if ($value -eq 0) { return '已完成' }
+    if ($value -lt 45) { return '约 30 秒' }
+    if ($value -lt 90) { return '约 1 分钟' }
+    if ($value -lt 150) { return '约 2 分钟' }
+    if ($value -lt 240) { return '约 3 分钟' }
+    if ($value -lt 450) { return '约 5 分钟' }
+    if ($value -lt 750) { return '约 10 分钟' }
+    if ($value -lt 1125) { return '约 15 分钟' }
+    if ($value -lt 2700) { return '约 30 分钟' }
+    if ($value -lt 5400) { return '约 1 小时' }
+    if ($value -lt 8100) { return '约 1 小时 30 分钟' }
+    if ($value -lt 10800) { return '约 2 小时' }
+
+    [long]$halfHours = [math]::Ceiling($value / 1800.0)
+    [long]$hours = [math]::Floor($halfHours / 2)
+    if (($halfHours % 2) -eq 1) {
+        return ('约 {0} 小时 30 分钟' -f $hours)
+    }
+    return ('约 {0} 小时' -f $hours)
+}
+
 function Get-OverallEtaPrimaryText {
     param(
         [string]$DisplayState,
@@ -1008,27 +1039,119 @@ function Get-OverallEtaPrimaryText {
 
     if ($DisplayState -eq 'Recovered') { return '已找到密码' }
     if ($DisplayState -eq 'Exhausted') { return '已完成' }
+    if ($Activity -in @('Pausing', 'Paused', 'Stopping', 'Stopped')) { return '继续搜索后更新' }
     if ($InvariantViolation) { return '正在同步…' }
     if ($Readiness -eq 'Calibrating') { return '正在校准…' }
-    if ($Readiness -eq 'Preliminary' -and $null -ne $EtaLowSeconds -and $null -ne $EtaHighSeconds) {
-        return (Format-LocalEtaRange -LowSeconds $EtaLowSeconds -HighSeconds $EtaHighSeconds)
+    if ($Readiness -eq 'Preliminary') {
+        $referenceSeconds = $EtaSeconds
+        if ($null -ne $EtaLowSeconds -and $null -ne $EtaHighSeconds) {
+            try { $referenceSeconds = ([double]$EtaLowSeconds + [double]$EtaHighSeconds) / 2.0 } catch { }
+        }
+        return (Format-FriendlyOverallEta -Seconds $referenceSeconds)
     }
     if ($Readiness -eq 'Stable' -and $null -ne $EtaSeconds) {
         try {
-            if ([double]$EtaSeconds -ge 0) { return (Format-LocalEta -Seconds $EtaSeconds) }
+            if ([double]$EtaSeconds -ge 0) { return (Format-FriendlyOverallEta -Seconds $EtaSeconds) }
         }
         catch { }
     }
-    if ($Activity -in @('Pausing', 'Paused', 'Stopping', 'Stopped')) { return '继续搜索后更新' }
     if ($HasValidHistory) { return '正在重新校正' }
     return '开始搜索后显示'
 }
 
-function Update-DeviceInfo {
-    $devices = @(Get-LocalComputeDevices)
-    $gpuDescriptions = @($devices | Where-Object { $_.Kind -eq 'GPU' } | ForEach-Object { Convert-ComputeDeviceName -Value $_.ChoiceName })
+function Invoke-DeviceProbe {
+    [CmdletBinding()]
+    param()
+
+    if ($script:DeviceProbeState -in @('Completed', 'Failed', 'Running')) {
+        return $script:DeviceProbeResult
+    }
+
+    $script:DeviceProbeState = 'Running'
+    $script:DeviceProbeError = ''
     $format = if ($null -ne $script:CurrentInspection) { [string]$script:CurrentInspection.Format } else { 'Unknown' }
-    $backend = Get-LocalGpuBackendStatus -Format $format -ProjectRoot $projectRoot
+    $backend = $null
+    $windowsDevices = @()
+    try {
+        $backend = Get-LocalGpuBackendStatus -Format $format -ProjectRoot $projectRoot
+    }
+    catch {
+        $script:DeviceProbeError = $_.Exception.Message
+    }
+    try {
+        $windowsDevices = @(Get-LocalComputeDevices)
+    }
+    catch {
+        if ([string]::IsNullOrWhiteSpace($script:DeviceProbeError)) { $script:DeviceProbeError = $_.Exception.Message }
+        $windowsDevices = @()
+    }
+    if ($null -eq $backend) {
+        $backend = [pscustomobject]@{
+            HashcatPath           = $null
+            Zip2JohnPath          = $null
+            SevenZipExtractorPath = $null
+            Devices               = @()
+            AdapterAvailable      = $false
+            Ready                 = $false
+            Message               = 'Local GPU discovery did not complete; CPU remains available.'
+        }
+    }
+    $script:DeviceProbeResult = [pscustomobject]@{
+        Backend = $backend
+        WindowsDevices = $windowsDevices
+    }
+    $script:DeviceProbeState = if ([string]::IsNullOrWhiteSpace($script:DeviceProbeError)) { 'Completed' } else { 'Failed' }
+    return $script:DeviceProbeResult
+}
+
+function Get-DeviceBackendMessage {
+    param(
+        [Parameter(Mandatory = $true)]$Probe
+    )
+
+    $backend = $Probe.Backend
+    $format = if ($null -ne $script:CurrentInspection) { [string]$script:CurrentInspection.Format } else { 'Unknown' }
+    $formatKey = $format.ToUpperInvariant()
+    if ($formatKey -notin @('ZIP', '7Z')) {
+        return [string]$backend.Message
+    }
+
+    # The initial probe can run before an archive is selected and therefore
+    # reports Unknown. Re-project that cached raw result after selection;
+    # this does not invoke Hashcat or enumerate devices again.
+    $openClReady = (-not [string]::IsNullOrWhiteSpace([string]$backend.HashcatPath) -and @($backend.Devices).Count -gt 0)
+    if ($formatKey -eq 'ZIP') {
+        if ([string]::IsNullOrWhiteSpace([string]$backend.HashcatPath)) {
+            return 'ZIP GPU backend unavailable: the bundled local Hashcat executable was not found.'
+        }
+        if ([string]::IsNullOrWhiteSpace([string]$backend.Zip2JohnPath)) {
+            return 'ZIP GPU backend unavailable: the bundled local zip2john extractor was not found.'
+        }
+        if (-not $openClReady) {
+            return 'ZIP GPU backend unavailable: Hashcat could not initialize a local OpenCL GPU.'
+        }
+        return 'ZIP GPU backend is ready for WinZip AES archives. Legacy ZipCrypto remains on the CPU path.'
+    }
+
+    if ([string]::IsNullOrWhiteSpace([string]$backend.HashcatPath)) {
+        return '7z GPU backend unavailable: the bundled local Hashcat executable was not found.'
+    }
+    if ([string]::IsNullOrWhiteSpace([string]$backend.SevenZipExtractorPath)) {
+        return '7z GPU backend unavailable: the bundled local 7z2hashcat extractor was not found.'
+    }
+    if (-not $openClReady) {
+        return '7z GPU backend unavailable: Hashcat could not initialize a local OpenCL GPU.'
+    }
+    return '7z GPU backend is ready for locally extracted 7-Zip AES recovery records.'
+}
+
+function Update-DeviceInfo {
+    param($Probe = $null)
+
+    if ($null -eq $Probe) { $Probe = Invoke-DeviceProbe }
+    $backend = $Probe.Backend
+    $devices = @($Probe.WindowsDevices)
+    $gpuDescriptions = @($devices | Where-Object { $_.Kind -eq 'GPU' } | ForEach-Object { Convert-ComputeDeviceName -Value $_.ChoiceName })
     $backendDescriptions = @($backend.Devices | ForEach-Object {
             ('{0}（Hashcat OpenCL 设备 #{1}，可用）' -f $_.Name, $_.DeviceId)
         })
@@ -1048,16 +1171,21 @@ function Update-DeviceInfo {
     if (-not [string]::IsNullOrWhiteSpace([string]$script:DeviceSelectionWarning)) {
         $controls.DeviceInfoText.Text += ' · ' + [string]$script:DeviceSelectionWarning
     }
-    $controls.AdvancedDeviceInfoText.Text = ('详细设备信息：Windows 设备：{0}。Hashcat 设备：{1}。NanaZip CPU 验证器已就绪。GPU 后端：{2}。' -f $windowsText, $backendText, (Convert-UiMessage -Message $backend.Message))
+    $backendMessage = Get-DeviceBackendMessage -Probe $Probe
+    $controls.AdvancedDeviceInfoText.Text = ('详细设备信息：Windows 设备：{0}。Hashcat 设备：{1}。NanaZip CPU 验证器已就绪。GPU 后端：{2}。' -f $windowsText, $backendText, (Convert-UiMessage -Message $backendMessage))
 }
 
 function Populate-DeviceChoices {
+    param($Probe = $null)
+
+    if ($null -eq $Probe) { $Probe = Invoke-DeviceProbe }
+    $backend = $Probe.Backend
+    $selectedValue = Get-SelectedValue -Control $controls.DeviceBox
     $controls.DeviceBox.Items.Clear()
     [void](Add-LocalizedComboChoice -Control $controls.DeviceBox -DisplayText 'Auto（推荐）' -Value 'Auto')
     [void](Add-LocalizedComboChoice -Control $controls.DeviceBox -DisplayText '仅使用 CPU' -Value 'CPU')
-    $backend = Get-LocalGpuBackendStatus -Format 'Unknown' -ProjectRoot $projectRoot
     $devices = @($backend.Devices | Where-Object { [string]$_.Type -eq 'GPU' } | Sort-Object @{ Expression = {
-                    if ([string]$_.Vendor -eq 'NVIDIA') { 0 }
+            if ([string]$_.Vendor -eq 'NVIDIA') { 0 }
                     elseif ([string]$_.Vendor -eq 'AMD') { 1 }
                     else { 2 }
                 }
@@ -1071,8 +1199,44 @@ function Populate-DeviceChoices {
         }
         [void](Add-LocalizedComboChoice -Control $controls.DeviceBox -DisplayText ('{0} (#{1})' -f $device.Name, $device.DeviceId) -Value ('GPU:{0}' -f $device.DeviceId) -Metadata $metadata)
     }
-    [void](Set-SelectedValue -Control $controls.DeviceBox -Value 'Auto')
-    Update-DeviceInfo
+    $script:DeviceChoicesPopulated = $true
+    if ([string]::IsNullOrWhiteSpace($selectedValue) -or -not (Set-SelectedValue -Control $controls.DeviceBox -Value $selectedValue)) {
+        [void](Set-SelectedValue -Control $controls.DeviceBox -Value 'Auto')
+    }
+    Update-DeviceInfo -Probe $Probe
+}
+
+function Ensure-DeviceChoicesReady {
+    $probe = Invoke-DeviceProbe
+    if (-not $script:DeviceChoicesPopulated) {
+        Populate-DeviceChoices -Probe $probe
+    }
+    return $probe
+}
+
+function Invoke-DeferredStartup {
+    [CmdletBinding()]
+    param()
+
+    if ($script:DeferredStartupStarted) { return }
+    $script:DeferredStartupStarted = $true
+    try { $startupRuntimeCleanup = @(Cleanup-StaleRecoveryRuntime -RuntimeRoot $runtimeRoot) } catch { $startupRuntimeCleanup = @() }
+    try { $startupJobCleanup = @(Cleanup-TerminalRecoveryJobs -JobsRoot $jobsRoot) } catch { $startupJobCleanup = @() }
+    if ($startupRuntimeCleanup.Count -gt 0) {
+        Write-UiLog ('已清理 {0} 个无活动任务的旧 Runtime 临时目录。' -f $startupRuntimeCleanup.Count)
+    }
+    if ($startupJobCleanup.Count -gt 0) {
+        Write-UiLog ('已清理 {0} 个超过保留期限的已完成本地任务。' -f $startupJobCleanup.Count)
+    }
+    try {
+        [void](Ensure-DeviceChoicesReady)
+        if ($script:DeviceProbeState -eq 'Failed') {
+            Write-UiLog '本机 GPU 检测未能完整完成，已保留 Auto 和 CPU 选项；开始任务时仍会使用现有本地后端判断。'
+        }
+    }
+    catch {
+        Write-UiLog ('本机 GPU 检测失败，已保留 Auto 和 CPU 选项：' + (Convert-UiMessage -Message $_.Exception.Message))
+    }
 }
 
 function Restore-SavedDeviceChoice {
@@ -1535,6 +1699,7 @@ function Start-NewJob {
             throw '已有本地恢复任务正在运行。请先暂停或停止该任务，再开始新的任务。'
         }
 
+        [void](Ensure-DeviceChoicesReady)
         $null = Inspect-SelectedArchive
         $controlJob = [pscustomobject](Get-JobFromControls)
         Test-RecoveryJobConfiguration -Job $controlJob
@@ -1829,6 +1994,7 @@ function Open-SavedJob {
         if (-not (Set-SelectedValue -Control $controls.StrategyBox -Value $savedLevel)) {
             throw '保存的任务没有有效的恢复级别。'
         }
+        [void](Ensure-DeviceChoicesReady)
         Restore-SavedDeviceChoice -Job $job
         $controls.QuickCandidatesBox.Text = (@($job.QuickCandidates) -join [Environment]::NewLine)
         $controls.TryEmptyPasswordBox.IsChecked = [bool]$job.TryEmptyPassword
@@ -2083,7 +2249,11 @@ function Update-ProgressFromDisk {
         $controls.OverallEtaValue.Text = Get-OverallEtaPrimaryText -DisplayState $displayState -Readiness $overallEtaReadiness -EtaSeconds $overallEta -EtaLowSeconds $overallEtaLow -EtaHighSeconds $overallEtaHigh -InvariantViolation:$overallInvariantViolation -Activity $activity -HasValidHistory:$overallEtaHasValidHistory
 
         $overallHelperText = ''
-        if ($overallEtaReadiness -eq 'Calibrating') {
+        if ($activity -in @('Pausing', 'Paused', 'Stopping', 'Stopped') -or $displayState -in @('Recovered', 'Exhausted')) {
+            # Keep the coarse primary state message authoritative while the
+            # task is paused/stopped or already terminal.
+        }
+        elseif ($overallEtaReadiness -eq 'Calibrating') {
             $calibrationParts = New-Object 'System.Collections.Generic.List[string]'
             if ($planEtaAdjustmentReason -eq 'StructuralRecalibration') {
                 [void]$calibrationParts.Add('计算设备或恢复计划已变化，正在重新校准预计时间')
@@ -2352,7 +2522,12 @@ function Update-ProgressFromDisk {
 [void](Add-LocalizedComboChoice -Control $controls.CharacterSetBox -DisplayText '自定义字符集' -Value 'custom')
 [void](Set-SelectedValue -Control $controls.CharacterSetBox -Value 'alnum')
 
-        Populate-DeviceChoices
+$controls.DeviceBox.Items.Clear()
+[void](Add-LocalizedComboChoice -Control $controls.DeviceBox -DisplayText 'Auto（推荐）' -Value 'Auto')
+[void](Add-LocalizedComboChoice -Control $controls.DeviceBox -DisplayText '仅使用 CPU' -Value 'CPU')
+[void](Set-SelectedValue -Control $controls.DeviceBox -Value 'Auto')
+$controls.DeviceInfoText.Text = '可用：Auto（推荐） · 仅使用 CPU · 正在检测本机 GPU…'
+$controls.AdvancedDeviceInfoText.Text = '正在检测本机 GPU；窗口已就绪。'
 Update-StrategyHelp
 $controls.ArchiveFileNameText.Text = '尚未选择压缩包'
 $controls.ArchiveInfoText.Text = '支持拖入单个本地 ZIP、7z、RAR 文件。'
@@ -2394,12 +2569,6 @@ $controls.ResultCard.Visibility = [System.Windows.Visibility]::Collapsed
 Set-ArchiveDisplayState -HasValidArchive:$false
 Update-TaskControls
 Write-UiLog '已就绪。所有恢复计算均设计为仅在本机运行。'
-if ($startupRuntimeCleanup.Count -gt 0) {
-    Write-UiLog ('已清理 {0} 个无活动任务的旧 Runtime 临时目录。' -f $startupRuntimeCleanup.Count)
-}
-if ($startupJobCleanup.Count -gt 0) {
-    Write-UiLog ('已清理 {0} 个超过保留期限的已完成本地任务。' -f $startupJobCleanup.Count)
-}
 
 $browseArchiveHandler = {
         $dialog = New-Object Microsoft.Win32.OpenFileDialog
@@ -2464,6 +2633,13 @@ $timer = New-Object System.Windows.Threading.DispatcherTimer
 $timer.Interval = [TimeSpan]::FromMilliseconds(500)
 $timer.Add_Tick({ Update-ProgressFromDisk })
 $timer.Start()
+
+$window.Add_ContentRendered({
+    if ($script:DeferredStartupScheduled) { return }
+    $script:DeferredStartupScheduled = $true
+    $deferredStartupAction = [System.Action]{ Invoke-DeferredStartup }
+    $null = $window.Dispatcher.BeginInvoke([System.Windows.Threading.DispatcherPriority]::Background, $deferredStartupAction)
+})
 
 $window.Add_Closing({
         if (-not [string]::IsNullOrWhiteSpace($script:CurrentJobDirectory) -and (Get-WorkerIsRunning)) {
