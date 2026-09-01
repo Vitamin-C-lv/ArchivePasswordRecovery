@@ -105,7 +105,7 @@ New-Item -ItemType Directory -Path $runtimeRoot -Force | Out-Null
             <Setter Property="Foreground" Value="{StaticResource TextMutedBrush}" />
         </Style>
         <Style x:Key="KpiValueStyle" TargetType="{x:Type TextBlock}">
-            <Setter Property="FontSize" Value="22" />
+            <Setter Property="FontSize" Value="19" />
             <Setter Property="FontWeight" Value="SemiBold" />
             <Setter Property="Foreground" Value="#173B62" />
         </Style>
@@ -301,17 +301,17 @@ New-Item -ItemType Directory -Path $runtimeRoot -Force | Out-Null
                 <RowDefinition Height="Auto" />
             </Grid.RowDefinitions>
 
-            <Border Grid.Row="0" Style="{StaticResource CardStyle}" Padding="18,16">
+            <Border Grid.Row="0" Style="{StaticResource CardStyle}" Padding="18,10">
                 <Grid>
                     <Grid.ColumnDefinitions>
                         <ColumnDefinition Width="Auto" />
                         <ColumnDefinition Width="16" />
                         <ColumnDefinition Width="*" />
                     </Grid.ColumnDefinitions>
-                    <Image x:Name="AppIconImage" Grid.Column="0" Width="54" Height="54" Stretch="Uniform" />
+                    <Image x:Name="AppIconImage" Grid.Column="0" Width="48" Height="48" Stretch="Uniform" />
                     <StackPanel Grid.Column="2" VerticalAlignment="Center">
                         <TextBlock Style="{StaticResource PageTitleStyle}" Text="压缩包密码恢复" />
-                        <TextBlock Style="{StaticResource SubtitleStyle}" Margin="0,5,0,0" Text="完全本地运行 · 文件与密码不会上传" />
+                        <TextBlock Style="{StaticResource SubtitleStyle}" Margin="0,3,0,0" Text="完全本地运行 · 文件与密码不会上传" />
                     </StackPanel>
                 </Grid>
             </Border>
@@ -320,12 +320,18 @@ New-Item -ItemType Directory -Path $runtimeRoot -Force | Out-Null
                 <Grid>
                     <Rectangle Margin="1" RadiusX="9" RadiusY="9" Stroke="{StaticResource DropZoneBorderBrush}" StrokeThickness="1.2" StrokeDashArray="5,3" IsHitTestVisible="False" />
                     <StackPanel x:Name="EmptyArchiveDropContent" HorizontalAlignment="Center" VerticalAlignment="Center">
-                        <Grid Width="54" Height="54" HorizontalAlignment="Center">
-                            <Border Width="50" Height="50" CornerRadius="15" Background="{StaticResource PrimarySoftBrush}" HorizontalAlignment="Left" VerticalAlignment="Top">
-                                <TextBlock HorizontalAlignment="Center" VerticalAlignment="Center" FontFamily="Segoe MDL2 Assets" FontSize="27" Foreground="{StaticResource PrimaryBrush}" Text="&#xE8B7;" />
+                        <Grid Width="60" Height="56" HorizontalAlignment="Center">
+                            <Border Width="50" Height="39" CornerRadius="6" Background="{StaticResource PrimarySoftBrush}" BorderBrush="{StaticResource DropZoneBorderBrush}" BorderThickness="1" HorizontalAlignment="Left" VerticalAlignment="Bottom">
+                                <StackPanel HorizontalAlignment="Center" VerticalAlignment="Center">
+                                    <TextBlock HorizontalAlignment="Center" FontSize="12" FontWeight="Bold" Foreground="{StaticResource PrimaryBrush}" Text="ZIP" />
+                                    <Rectangle Width="31" Height="1" Margin="0,3,0,0" Fill="{StaticResource DropZoneBorderBrush}" />
+                                </StackPanel>
                             </Border>
-                            <Border Width="21" Height="21" CornerRadius="11" Background="{StaticResource PrimaryBrush}" BorderBrush="White" BorderThickness="2" HorizontalAlignment="Right" VerticalAlignment="Bottom">
-                                <TextBlock HorizontalAlignment="Center" VerticalAlignment="Center" FontSize="17" Foreground="White" Text="+" />
+                            <Border Width="24" Height="26" CornerRadius="5" Background="{StaticResource SurfaceBrush}" BorderBrush="{StaticResource PrimaryBrush}" BorderThickness="1.5" HorizontalAlignment="Right" VerticalAlignment="Top">
+                                <TextBlock HorizontalAlignment="Center" VerticalAlignment="Center" FontFamily="Segoe MDL2 Assets" FontSize="14" Foreground="{StaticResource PrimaryBrush}" Text="&#xE72E;" />
+                            </Border>
+                            <Border Width="21" Height="21" CornerRadius="11" Background="{StaticResource PrimaryBrush}" BorderBrush="White" BorderThickness="2" HorizontalAlignment="Left" VerticalAlignment="Bottom" Margin="-3,0,0,-3">
+                                <TextBlock HorizontalAlignment="Center" VerticalAlignment="Center" FontSize="14" FontWeight="Bold" Foreground="White" Text="↓" />
                             </Border>
                         </Grid>
                         <TextBlock Margin="0,9,0,0" HorizontalAlignment="Center" FontSize="23" FontWeight="SemiBold" Foreground="{StaticResource TextStrongBrush}" Text="把压缩包拖到这里" />
@@ -376,11 +382,11 @@ New-Item -ItemType Directory -Path $runtimeRoot -Force | Out-Null
                                     <ColumnDefinition Width="*" />
                                     <ColumnDefinition Width="30" />
                                 </Grid.ColumnDefinitions>
-                                <StackPanel Grid.Column="0" VerticalAlignment="Center">
-                                    <TextBlock FontSize="19" FontWeight="SemiBold" Text="1级" />
+                                <StackPanel Grid.Column="0" HorizontalAlignment="Center" VerticalAlignment="Center">
+                                    <TextBlock FontSize="20" FontWeight="SemiBold" Text="1级" />
                                     <TextBlock Margin="0,4,0,0" Style="{StaticResource SubtitleStyle}" Text="快速尝试" />
                                 </StackPanel>
-                                <TextBlock Grid.Column="1" HorizontalAlignment="Right" VerticalAlignment="Center" FontSize="25" Foreground="{StaticResource TextFaintBrush}" Text="↗" />
+                                <TextBlock Grid.Column="1" HorizontalAlignment="Right" VerticalAlignment="Center" FontSize="18" Opacity="0.8" Foreground="{StaticResource TextFaintBrush}" Text="↗" />
                             </Grid>
                         </ListBoxItem>
                         <ListBoxItem Tag="2" Padding="12" Margin="0,0,8,0">
@@ -389,11 +395,11 @@ New-Item -ItemType Directory -Path $runtimeRoot -Force | Out-Null
                                     <ColumnDefinition Width="*" />
                                     <ColumnDefinition Width="30" />
                                 </Grid.ColumnDefinitions>
-                                <StackPanel Grid.Column="0" VerticalAlignment="Center">
-                                    <TextBlock FontSize="19" FontWeight="SemiBold" Text="2级" />
+                                <StackPanel Grid.Column="0" HorizontalAlignment="Center" VerticalAlignment="Center">
+                                    <TextBlock FontSize="20" FontWeight="SemiBold" Text="2级" />
                                     <TextBlock Margin="0,4,0,0" Style="{StaticResource SubtitleStyle}" Text="常用密码" />
                                 </StackPanel>
-                                <TextBlock Grid.Column="1" HorizontalAlignment="Right" VerticalAlignment="Center" FontSize="23" Foreground="{StaticResource TextFaintBrush}" Text="▣" />
+                                <TextBlock Grid.Column="1" HorizontalAlignment="Right" VerticalAlignment="Center" FontSize="18" Opacity="0.8" Foreground="{StaticResource TextFaintBrush}" Text="▣" />
                             </Grid>
                         </ListBoxItem>
                         <ListBoxItem Tag="3" Padding="12" Margin="0,0,8,0">
@@ -402,11 +408,11 @@ New-Item -ItemType Directory -Path $runtimeRoot -Force | Out-Null
                                     <ColumnDefinition Width="*" />
                                     <ColumnDefinition Width="30" />
                                 </Grid.ColumnDefinitions>
-                                <StackPanel Grid.Column="0" VerticalAlignment="Center">
-                                    <TextBlock FontSize="19" FontWeight="SemiBold" Text="3级" />
+                                <StackPanel Grid.Column="0" HorizontalAlignment="Center" VerticalAlignment="Center">
+                                    <TextBlock FontSize="20" FontWeight="SemiBold" Text="3级" />
                                     <TextBlock Margin="0,4,0,0" Style="{StaticResource SubtitleStyle}" Text="增强恢复" />
                                 </StackPanel>
-                                <TextBlock Grid.Column="1" HorizontalAlignment="Right" VerticalAlignment="Center" FontSize="25" Foreground="{StaticResource TextFaintBrush}" Text="◇" />
+                                <TextBlock Grid.Column="1" HorizontalAlignment="Right" VerticalAlignment="Center" FontSize="18" Opacity="0.8" Foreground="{StaticResource TextFaintBrush}" Text="◇" />
                             </Grid>
                         </ListBoxItem>
                         <ListBoxItem Tag="4" Padding="12" Margin="0,0,8,0">
@@ -415,11 +421,11 @@ New-Item -ItemType Directory -Path $runtimeRoot -Force | Out-Null
                                     <ColumnDefinition Width="*" />
                                     <ColumnDefinition Width="30" />
                                 </Grid.ColumnDefinitions>
-                                <StackPanel Grid.Column="0" VerticalAlignment="Center">
-                                    <TextBlock FontSize="19" FontWeight="SemiBold" Text="4级" />
+                                <StackPanel Grid.Column="0" HorizontalAlignment="Center" VerticalAlignment="Center">
+                                    <TextBlock FontSize="20" FontWeight="SemiBold" Text="4级" />
                                     <TextBlock Margin="0,4,0,0" Style="{StaticResource SubtitleStyle}" Text="深度搜索" />
                                 </StackPanel>
-                                <TextBlock Grid.Column="1" HorizontalAlignment="Right" VerticalAlignment="Center" FontSize="25" Foreground="{StaticResource TextFaintBrush}" Text="⌕" />
+                                <TextBlock Grid.Column="1" HorizontalAlignment="Right" VerticalAlignment="Center" FontSize="18" Opacity="0.8" Foreground="{StaticResource TextFaintBrush}" Text="⌕" />
                             </Grid>
                         </ListBoxItem>
                         <ListBoxItem Tag="5" Padding="12">
@@ -428,11 +434,11 @@ New-Item -ItemType Directory -Path $runtimeRoot -Force | Out-Null
                                     <ColumnDefinition Width="*" />
                                     <ColumnDefinition Width="30" />
                                 </Grid.ColumnDefinitions>
-                                <StackPanel Grid.Column="0" VerticalAlignment="Center">
-                                    <TextBlock FontSize="19" FontWeight="SemiBold" Text="5级" />
+                                <StackPanel Grid.Column="0" HorizontalAlignment="Center" VerticalAlignment="Center">
+                                    <TextBlock FontSize="20" FontWeight="SemiBold" Text="5级" />
                                     <TextBlock Margin="0,4,0,0" Style="{StaticResource SubtitleStyle}" Text="完整搜索" />
                                 </StackPanel>
-                                <TextBlock Grid.Column="1" HorizontalAlignment="Right" VerticalAlignment="Center" FontSize="23" Foreground="{StaticResource TextFaintBrush}" Text="◎" />
+                                <TextBlock Grid.Column="1" HorizontalAlignment="Right" VerticalAlignment="Center" FontSize="18" Opacity="0.8" Foreground="{StaticResource TextFaintBrush}" Text="◎" />
                             </Grid>
                         </ListBoxItem>
                     </ListBox>
@@ -517,88 +523,101 @@ New-Item -ItemType Directory -Path $runtimeRoot -Force | Out-Null
             <Border Grid.Row="8" Style="{StaticResource CardStyle}" Padding="18,15">
                 <Grid>
                     <Grid.ColumnDefinitions>
-                        <ColumnDefinition Width="*" />
+                        <ColumnDefinition Width="Auto" />
+                        <ColumnDefinition Width="14" />
+                        <ColumnDefinition Width="320" />
                         <ColumnDefinition Width="18" />
                         <ColumnDefinition Width="Auto" />
+                        <ColumnDefinition Width="*" />
                     </Grid.ColumnDefinitions>
-                    <StackPanel Grid.Column="0">
-                        <TextBlock Style="{StaticResource SectionTitleStyle}" Text="计算设备" />
-                        <ComboBox x:Name="DeviceBox" Width="320" Margin="0,10,0,0" MinHeight="34" HorizontalAlignment="Left" />
-                        <TextBlock x:Name="DeviceInfoText" Margin="0,8,0,0" TextWrapping="Wrap" Style="{StaticResource HelperTextStyle}" Text="可用：CPU" />
-                    </StackPanel>
-                <StackPanel Grid.Column="2" VerticalAlignment="Center">
-                    <Button x:Name="StartButton" Width="200" Height="52" Style="{StaticResource PrimaryButtonStyle}" Content="开始恢复" />
-                    <StackPanel Orientation="Horizontal" HorizontalAlignment="Center" Margin="0,9,0,0">
+                    <Grid.RowDefinitions>
+                        <RowDefinition Height="Auto" />
+                        <RowDefinition Height="Auto" />
+                    </Grid.RowDefinitions>
+                    <TextBlock Grid.Row="0" Grid.Column="0" Style="{StaticResource SectionTitleStyle}" VerticalAlignment="Center" Text="计算设备" />
+                    <ComboBox x:Name="DeviceBox" Grid.Row="0" Grid.Column="2" Width="320" MinHeight="34" HorizontalAlignment="Left" />
+                    <TextBlock x:Name="DeviceInfoText" Grid.Row="1" Grid.Column="0" Grid.ColumnSpan="3" Margin="0,7,0,0" TextWrapping="Wrap" Style="{StaticResource HelperTextStyle}" Text="可用：CPU" />
+                    <Button x:Name="StartButton" Grid.Row="0" Grid.Column="4" Width="200" Height="48" VerticalAlignment="Center" Style="{StaticResource PrimaryButtonStyle}" Content="开始恢复" />
+                    <StackPanel Grid.Row="1" Grid.Column="4" Orientation="Horizontal" HorizontalAlignment="Center" Margin="0,8,0,0">
                         <Button x:Name="PauseButton" Width="68" Margin="0,0,6,0" Content="暂停" Visibility="Collapsed" />
                         <Button x:Name="ResumeButton" Width="68" Margin="0,0,6,0" Content="继续" Visibility="Collapsed" />
                         <Button x:Name="StopButton" Width="68" Content="停止" Visibility="Collapsed" />
                     </StackPanel>
-                </StackPanel>
                 </Grid>
             </Border>
 
             <Border x:Name="ProgressCard" Grid.Row="10" Style="{StaticResource CardStyle}" Padding="18">
                 <Grid>
-                    <Grid.ColumnDefinitions>
-                        <ColumnDefinition Width="128" />
-                        <ColumnDefinition Width="*" />
-                        <ColumnDefinition Width="128" />
-                        <ColumnDefinition Width="*" />
-                    </Grid.ColumnDefinitions>
                     <Grid.RowDefinitions>
                         <RowDefinition Height="Auto" />
-                        <RowDefinition Height="12" />
-                        <RowDefinition Height="Auto" />
-                        <RowDefinition Height="12" />
-                        <RowDefinition Height="Auto" />
-                        <RowDefinition Height="12" />
-                        <RowDefinition Height="Auto" />
-                        <RowDefinition Height="12" />
-                        <RowDefinition Height="Auto" />
-                        <RowDefinition Height="12" />
-                        <RowDefinition Height="Auto" />
-                        <RowDefinition Height="12" />
-                        <RowDefinition Height="Auto" />
-                        <RowDefinition Height="12" />
                         <RowDefinition Height="Auto" />
                         <RowDefinition Height="12" />
                         <RowDefinition Height="Auto" />
                     </Grid.RowDefinitions>
-                    <TextBlock Grid.Row="0" Grid.Column="0" Style="{StaticResource SectionTitleStyle}" Text="当前范围详情" />
-                    <Border Grid.Row="0" Grid.Column="1" HorizontalAlignment="Left" Style="{StaticResource BadgeStyle}">
-                        <TextBlock x:Name="StateValue" FontSize="13" FontWeight="SemiBold" Foreground="{StaticResource PrimaryBrush}" />
-                    </Border>
-                    <TextBlock Grid.Row="0" Grid.Column="2" Style="{StaticResource DetailLabelStyle}" VerticalAlignment="Center" Text="当前阶段" />
-                    <TextBlock x:Name="StageValue" Grid.Row="0" Grid.Column="3" TextWrapping="Wrap" FontSize="16" FontWeight="SemiBold" Foreground="{StaticResource PrimaryBrush}" />
-                    <TextBlock Grid.Row="2" Grid.Column="0" Style="{StaticResource DetailLabelStyle}" Text="当前范围" />
-                    <TextBlock x:Name="CoverageValue" Grid.Row="2" Grid.Column="1" TextWrapping="Wrap" Style="{StaticResource DetailValueStyle}" />
-                    <TextBlock Grid.Row="2" Grid.Column="2" Style="{StaticResource DetailLabelStyle}" Text="当前设备" />
-                    <TextBlock x:Name="DeviceValue" Grid.Row="2" Grid.Column="3" TextWrapping="Wrap" Style="{StaticResource DetailValueStyle}" />
-                    <TextBlock Grid.Row="4" Grid.Column="0" Style="{StaticResource DetailLabelStyle}" Text="当前 Backend" />
-                    <TextBlock x:Name="EngineValue" Grid.Row="4" Grid.Column="1" TextWrapping="Wrap" Style="{StaticResource DetailValueStyle}" />
-                    <TextBlock x:Name="SpeedLabel" Grid.Row="4" Grid.Column="2" Style="{StaticResource DetailLabelStyle}" Text="速度（平滑）" />
-                    <TextBlock x:Name="SpeedValue" Grid.Row="4" Grid.Column="3" FontSize="15" FontWeight="SemiBold" Foreground="{StaticResource TextBodyBrush}" />
-                    <TextBlock x:Name="ProgressMetricLabel" Grid.Row="6" Grid.Column="0" Style="{StaticResource DetailLabelStyle}" Text="已测试数量" />
-                    <TextBlock x:Name="CandidatesValue" Grid.Row="6" Grid.Column="1" Style="{StaticResource DetailValueStyle}" />
-                    <TextBlock Grid.Row="6" Grid.Column="2" Style="{StaticResource DetailLabelStyle}" Text="当前范围预计剩余" />
-                    <TextBlock x:Name="EstimatedRemainingValue" Grid.Row="6" Grid.Column="3" FontSize="15" FontWeight="SemiBold" Foreground="{StaticResource TextStrongBrush}" />
-                    <TextBlock Grid.Row="8" Grid.Column="0" Style="{StaticResource DetailLabelStyle}" Text="当前范围最坏时间" />
-                    <TextBlock x:Name="WorstCaseValue" Grid.Row="8" Grid.Column="1" Grid.ColumnSpan="3" TextWrapping="Wrap" FontSize="15" FontWeight="SemiBold" Foreground="{StaticResource TextStrongBrush}" />
-                    <TextBlock x:Name="ProgressBarLabel" Grid.Row="10" Grid.Column="0" Style="{StaticResource DetailLabelStyle}" VerticalAlignment="Center" Text="搜索进度" />
-                    <ProgressBar x:Name="SearchProgressBar" Grid.Row="10" Grid.Column="1" Height="10" Minimum="0" Maximum="100" />
-                    <TextBlock x:Name="ProgressPercentValue" Grid.Row="10" Grid.Column="2" Grid.ColumnSpan="2" Margin="10,0,0,0" VerticalAlignment="Center" Foreground="{StaticResource PrimaryBrush}" FontWeight="SemiBold" />
-                    <Border x:Name="ResultCard" Grid.Row="12" Grid.Column="0" Grid.ColumnSpan="4" Background="{StaticResource SuccessSurfaceBrush}" BorderBrush="{StaticResource SuccessBorderBrush}" BorderThickness="1" CornerRadius="7" Padding="12" Visibility="Collapsed">
-                        <Grid>
-                            <Grid.ColumnDefinitions>
-                                <ColumnDefinition Width="Auto" />
-                                <ColumnDefinition Width="16" />
-                                <ColumnDefinition Width="*" />
-                            </Grid.ColumnDefinitions>
-                            <TextBlock x:Name="ResultStatusText" Grid.Column="0" VerticalAlignment="Center" FontWeight="SemiBold" Foreground="{StaticResource SuccessTextBrush}" Text="密码已恢复" />
-                            <TextBox x:Name="ResultValue" Grid.Column="2" IsReadOnly="True" FontSize="16" FontWeight="SemiBold" Background="White" />
-                        </Grid>
-                    </Border>
-                    <Grid Grid.Row="16" Grid.Column="0" Grid.ColumnSpan="4">
+                    <Grid Grid.Row="0">
+                        <Grid.ColumnDefinitions>
+                            <ColumnDefinition Width="128" />
+                            <ColumnDefinition Width="*" />
+                            <ColumnDefinition Width="128" />
+                            <ColumnDefinition Width="*" />
+                        </Grid.ColumnDefinitions>
+                        <TextBlock Grid.Column="0" Style="{StaticResource SectionTitleStyle}" Text="当前范围详情" />
+                        <Border Grid.Column="1" HorizontalAlignment="Left" Style="{StaticResource BadgeStyle}">
+                            <TextBlock x:Name="StateValue" FontSize="13" FontWeight="SemiBold" Foreground="{StaticResource PrimaryBrush}" />
+                        </Border>
+                        <TextBlock Grid.Column="2" Style="{StaticResource DetailLabelStyle}" VerticalAlignment="Center" Text="当前阶段" />
+                        <TextBlock x:Name="StageValue" Grid.Column="3" TextWrapping="Wrap" FontSize="15" FontWeight="SemiBold" Foreground="{StaticResource PrimaryBrush}" />
+                    </Grid>
+                    <Grid x:Name="ProgressDetailBody" Grid.Row="1" Margin="0,14,0,0" Visibility="Collapsed">
+                        <Grid.ColumnDefinitions>
+                            <ColumnDefinition Width="128" />
+                            <ColumnDefinition Width="*" />
+                            <ColumnDefinition Width="128" />
+                            <ColumnDefinition Width="*" />
+                        </Grid.ColumnDefinitions>
+                        <Grid.RowDefinitions>
+                            <RowDefinition Height="Auto" />
+                            <RowDefinition Height="12" />
+                            <RowDefinition Height="Auto" />
+                            <RowDefinition Height="12" />
+                            <RowDefinition Height="Auto" />
+                            <RowDefinition Height="12" />
+                            <RowDefinition Height="Auto" />
+                            <RowDefinition Height="12" />
+                            <RowDefinition Height="Auto" />
+                            <RowDefinition Height="12" />
+                            <RowDefinition Height="Auto" />
+                        </Grid.RowDefinitions>
+                        <TextBlock Grid.Row="0" Grid.Column="0" Style="{StaticResource DetailLabelStyle}" Text="当前范围" />
+                        <TextBlock x:Name="CoverageValue" Grid.Row="0" Grid.Column="1" TextWrapping="Wrap" Style="{StaticResource DetailValueStyle}" />
+                        <TextBlock Grid.Row="0" Grid.Column="2" Style="{StaticResource DetailLabelStyle}" Text="当前设备" />
+                        <TextBlock x:Name="DeviceValue" Grid.Row="0" Grid.Column="3" TextWrapping="Wrap" Style="{StaticResource DetailValueStyle}" />
+                        <TextBlock Grid.Row="2" Grid.Column="0" Style="{StaticResource DetailLabelStyle}" Text="当前 Backend" />
+                        <TextBlock x:Name="EngineValue" Grid.Row="2" Grid.Column="1" TextWrapping="Wrap" Style="{StaticResource DetailValueStyle}" />
+                        <TextBlock x:Name="SpeedLabel" Grid.Row="2" Grid.Column="2" Style="{StaticResource DetailLabelStyle}" Text="速度（平滑）" />
+                        <TextBlock x:Name="SpeedValue" Grid.Row="2" Grid.Column="3" FontSize="15" FontWeight="SemiBold" Foreground="{StaticResource TextBodyBrush}" />
+                        <TextBlock x:Name="ProgressMetricLabel" Grid.Row="4" Grid.Column="0" Style="{StaticResource DetailLabelStyle}" Text="已测试数量" />
+                        <TextBlock x:Name="CandidatesValue" Grid.Row="4" Grid.Column="1" Style="{StaticResource DetailValueStyle}" />
+                        <TextBlock Grid.Row="4" Grid.Column="2" Style="{StaticResource DetailLabelStyle}" Text="当前范围预计剩余" />
+                        <TextBlock x:Name="EstimatedRemainingValue" Grid.Row="4" Grid.Column="3" FontSize="15" FontWeight="SemiBold" Foreground="{StaticResource TextStrongBrush}" />
+                        <TextBlock Grid.Row="6" Grid.Column="0" Style="{StaticResource DetailLabelStyle}" Text="当前范围最坏时间" />
+                        <TextBlock x:Name="WorstCaseValue" Grid.Row="6" Grid.Column="1" Grid.ColumnSpan="3" TextWrapping="Wrap" FontSize="15" FontWeight="SemiBold" Foreground="{StaticResource TextStrongBrush}" />
+                        <TextBlock x:Name="ProgressBarLabel" Grid.Row="8" Grid.Column="0" Style="{StaticResource DetailLabelStyle}" VerticalAlignment="Center" Text="搜索进度" />
+                        <ProgressBar x:Name="SearchProgressBar" Grid.Row="8" Grid.Column="1" Height="10" Minimum="0" Maximum="100" />
+                        <TextBlock x:Name="ProgressPercentValue" Grid.Row="8" Grid.Column="2" Grid.ColumnSpan="2" Margin="10,0,0,0" VerticalAlignment="Center" Foreground="{StaticResource PrimaryBrush}" FontWeight="SemiBold" />
+                        <Border x:Name="ResultCard" Grid.Row="10" Grid.Column="0" Grid.ColumnSpan="4" Background="{StaticResource SuccessSurfaceBrush}" BorderBrush="{StaticResource SuccessBorderBrush}" BorderThickness="1" CornerRadius="7" Padding="12" Visibility="Collapsed">
+                            <Grid>
+                                <Grid.ColumnDefinitions>
+                                    <ColumnDefinition Width="Auto" />
+                                    <ColumnDefinition Width="16" />
+                                    <ColumnDefinition Width="*" />
+                                </Grid.ColumnDefinitions>
+                                <TextBlock x:Name="ResultStatusText" Grid.Column="0" VerticalAlignment="Center" FontWeight="SemiBold" Foreground="{StaticResource SuccessTextBrush}" Text="密码已恢复" />
+                                <TextBox x:Name="ResultValue" Grid.Column="2" IsReadOnly="True" FontSize="16" FontWeight="SemiBold" Background="White" />
+                            </Grid>
+                        </Border>
+                    </Grid>
+                    <Grid Grid.Row="3">
                         <Grid.ColumnDefinitions>
                             <ColumnDefinition Width="*" />
                             <ColumnDefinition Width="120" />
@@ -621,7 +640,7 @@ New-Item -ItemType Directory -Path $runtimeRoot -Force | Out-Null
                                 <ColumnDefinition Width="Auto" />
                             </Grid.ColumnDefinitions>
                             <TextBlock Grid.Column="0" FontFamily="Segoe MDL2 Assets" FontSize="15" Foreground="{StaticResource TextMutedBrush}" Text="&#xE713;" />
-                            <TextBlock Grid.Column="2" FontSize="14" FontWeight="SemiBold" Foreground="{StaticResource TextBodyBrush}" Text="高级设置（可选）" />
+                            <TextBlock Grid.Column="2" FontSize="14" FontWeight="SemiBold" Foreground="{StaticResource TextBodyBrush}" Text="高级设置" />
                         </Grid>
                     </Expander.Header>
                     <StackPanel>
@@ -689,7 +708,7 @@ foreach ($name in @(
 'StateValue', 'StageValue', 'CoverageValue', 'EngineValue', 'DeviceValue', 'ProgressMetricLabel', 'CandidatesValue', 'SpeedLabel', 'SpeedValue', 'ElapsedValue',
 'EstimatedRemainingValue', 'WorstCaseValue', 'SearchProgressBar', 'ProgressPercentValue', 'ResultCard', 'ResultStatusText', 'ResultValue',
 'ProgressBarLabel',
-'ProgressMessageText', 'AdvancedDeviceInfoText', 'ResetCurrentArchiveButton', 'ClearPerformanceProfilesButton', 'LogBox'
+'ProgressMessageText', 'ProgressDetailBody', 'AdvancedDeviceInfoText', 'ResetCurrentArchiveButton', 'ClearPerformanceProfilesButton', 'LogBox'
     )) {
     $controls[$name] = $window.FindName($name)
 }
@@ -757,6 +776,7 @@ function Clear-SelectedArchive {
     $controls.ArchivePathBox.Text = ''
     $controls.ArchiveFileNameText.Text = ''
     $controls.ArchiveInfoText.Text = ''
+    $controls.ProgressDetailBody.Visibility = [System.Windows.Visibility]::Collapsed
     $script:CurrentInspection = $null
     Reset-UiElapsedState
     Set-ArchiveDisplayState -HasValidArchive:$false
@@ -1919,6 +1939,7 @@ function Start-WorkerProcess {
 function Reset-LiveTaskDisplay {
     Reset-UiElapsedState
     $script:LastProgressUpdated = ''
+    $controls.ProgressDetailBody.Visibility = [System.Windows.Visibility]::Visible
     $controls.StateValue.Text = '正在启动'
     $controls.StageValue.Text = '等待阶段信息'
     $controls.CoverageValue.Text = '等待当前范围'
@@ -2184,6 +2205,7 @@ function Reset-CurrentArchiveInitialization {
         $script:CurrentJobId = ''
         $script:CurrentWorker = $null
         Reset-LiveTaskDisplay
+        $controls.ProgressDetailBody.Visibility = [System.Windows.Visibility]::Collapsed
         $controls.StateValue.Text = '空闲'
         $controls.ProgressPercentValue.Text = '当前没有本地任务正在运行。'
         $controls.ProgressMessageText.Text = '当前压缩包的本地恢复状态已清除，可以重新开始。'
@@ -2283,6 +2305,7 @@ function Open-SavedJob {
 
 function Update-ProgressFromDisk {
     if ([string]::IsNullOrWhiteSpace($script:CurrentJobDirectory)) { return }
+    $controls.ProgressDetailBody.Visibility = [System.Windows.Visibility]::Visible
     $progressPath = Join-Path $script:CurrentJobDirectory 'progress.json'
     if (-not (Test-Path -LiteralPath $progressPath -PathType Leaf)) {
         Update-UiElapsedFromProgress
@@ -2799,6 +2822,7 @@ $controls.ArchiveFileNameText.Text = '尚未选择压缩包'
 $controls.ArchiveInfoText.Text = '支持拖入单个本地 ZIP、7z、RAR 文件。'
 $controls.ArchiveInfoText.ToolTip = $null
 $controls.StateValue.Text = '空闲'
+$controls.ProgressDetailBody.Visibility = [System.Windows.Visibility]::Collapsed
 $controls.StageValue.Text = '等待开始'
 $controls.CoverageValue.Text = '等待当前范围'
 $controls.EngineValue.Text = '—'
