@@ -41,38 +41,223 @@ New-Item -ItemType Directory -Path $runtimeRoot -Force | Out-Null
 <Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
         Title="压缩包密码恢复"
-        Width="900" Height="820" MinWidth="760" MinHeight="650"
-        WindowStartupLocation="CenterScreen" Background="#F5F7FA" AllowDrop="True">
+        Width="980" Height="900" MinWidth="820" MinHeight="700"
+        WindowStartupLocation="CenterScreen" Background="#F6F8FB" AllowDrop="True"
+        FontFamily="Segoe UI" UseLayoutRounding="True" SnapsToDevicePixels="True">
     <Window.Resources>
-        <Style TargetType="{x:Type Button}">
-            <Setter Property="Padding" Value="14,8" />
-            <Setter Property="FontSize" Value="14" />
-        </Style>
-        <Style x:Key="PrimaryButtonStyle" TargetType="{x:Type Button}">
-            <Setter Property="Background" Value="#2F75C9" />
-            <Setter Property="Foreground" Value="White" />
-            <Setter Property="FontWeight" Value="SemiBold" />
-            <Setter Property="Padding" Value="24,10" />
-            <Setter Property="BorderThickness" Value="0" />
-        </Style>
-        <Style TargetType="{x:Type TextBox}">
-            <Setter Property="Padding" Value="8,5" />
-            <Setter Property="BorderBrush" Value="#D5DCE5" />
+        <SolidColorBrush x:Key="SurfaceBrush" Color="#FFFFFF" />
+        <SolidColorBrush x:Key="SurfaceSubtleBrush" Color="#FBFCFE" />
+        <SolidColorBrush x:Key="SurfaceHoverBrush" Color="#F8FBFF" />
+        <SolidColorBrush x:Key="SurfacePressedBrush" Color="#EEF5FF" />
+        <SolidColorBrush x:Key="PrimaryBrush" Color="#2F75C9" />
+        <SolidColorBrush x:Key="PrimaryHoverBrush" Color="#2468BA" />
+        <SolidColorBrush x:Key="PrimaryPressedBrush" Color="#1E5DAA" />
+        <SolidColorBrush x:Key="PrimarySoftBrush" Color="#EDF5FF" />
+        <SolidColorBrush x:Key="BorderBrush" Color="#DFE6EE" />
+        <SolidColorBrush x:Key="BorderStrongBrush" Color="#C9D8E8" />
+        <SolidColorBrush x:Key="DropZoneBorderBrush" Color="#78A9E7" />
+        <SolidColorBrush x:Key="DividerBrush" Color="#E7EDF4" />
+        <SolidColorBrush x:Key="TextStrongBrush" Color="#1D2A3A" />
+        <SolidColorBrush x:Key="TextBodyBrush" Color="#33465B" />
+        <SolidColorBrush x:Key="TextMutedBrush" Color="#6D7E92" />
+        <SolidColorBrush x:Key="TextFaintBrush" Color="#8A99AA" />
+        <SolidColorBrush x:Key="SuccessSurfaceBrush" Color="#EFF9F1" />
+        <SolidColorBrush x:Key="SuccessBorderBrush" Color="#A8D5B0" />
+        <SolidColorBrush x:Key="SuccessTextBrush" Color="#237A36" />
+        <CornerRadius x:Key="CardCornerRadius">10</CornerRadius>
+        <CornerRadius x:Key="ControlCornerRadius">7</CornerRadius>
+
+        <Style x:Key="CardStyle" TargetType="{x:Type Border}">
+            <Setter Property="Background" Value="{StaticResource SurfaceBrush}" />
+            <Setter Property="BorderBrush" Value="{StaticResource BorderBrush}" />
             <Setter Property="BorderThickness" Value="1" />
+            <Setter Property="CornerRadius" Value="{StaticResource CardCornerRadius}" />
+            <Setter Property="Padding" Value="18" />
+        </Style>
+        <Style x:Key="SectionTitleStyle" TargetType="{x:Type TextBlock}">
+            <Setter Property="FontSize" Value="17" />
+            <Setter Property="FontWeight" Value="SemiBold" />
+            <Setter Property="Foreground" Value="{StaticResource TextStrongBrush}" />
+        </Style>
+        <Style x:Key="PageTitleStyle" TargetType="{x:Type TextBlock}">
+            <Setter Property="FontSize" Value="27" />
+            <Setter Property="FontWeight" Value="SemiBold" />
+            <Setter Property="Foreground" Value="{StaticResource TextStrongBrush}" />
+        </Style>
+        <Style x:Key="SubtitleStyle" TargetType="{x:Type TextBlock}">
+            <Setter Property="FontSize" Value="13" />
+            <Setter Property="Foreground" Value="{StaticResource TextMutedBrush}" />
+        </Style>
+        <Style x:Key="HelperTextStyle" TargetType="{x:Type TextBlock}">
+            <Setter Property="FontSize" Value="12" />
+            <Setter Property="Foreground" Value="{StaticResource TextMutedBrush}" />
+        </Style>
+        <Style x:Key="DetailLabelStyle" TargetType="{x:Type TextBlock}">
+            <Setter Property="FontSize" Value="12" />
+            <Setter Property="Foreground" Value="{StaticResource TextMutedBrush}" />
+        </Style>
+        <Style x:Key="DetailValueStyle" TargetType="{x:Type TextBlock}">
+            <Setter Property="FontSize" Value="15" />
+            <Setter Property="Foreground" Value="{StaticResource TextBodyBrush}" />
+        </Style>
+        <Style x:Key="KpiLabelStyle" TargetType="{x:Type TextBlock}">
+            <Setter Property="FontSize" Value="12" />
+            <Setter Property="Foreground" Value="{StaticResource TextMutedBrush}" />
+        </Style>
+        <Style x:Key="KpiValueStyle" TargetType="{x:Type TextBlock}">
+            <Setter Property="FontSize" Value="22" />
+            <Setter Property="FontWeight" Value="SemiBold" />
+            <Setter Property="Foreground" Value="#173B62" />
+        </Style>
+        <Style x:Key="BadgeStyle" TargetType="{x:Type Border}">
+            <Setter Property="Background" Value="{StaticResource PrimarySoftBrush}" />
+            <Setter Property="BorderBrush" Value="#C8DDF7" />
+            <Setter Property="BorderThickness" Value="1" />
+            <Setter Property="CornerRadius" Value="5" />
+            <Setter Property="Padding" Value="8,3" />
+        </Style>
+
+        <Style x:Key="ButtonBaseStyle" TargetType="{x:Type Button}">
+            <Setter Property="Padding" Value="14,8" />
+            <Setter Property="MinHeight" Value="34" />
+            <Setter Property="FontSize" Value="13" />
+            <Setter Property="FontWeight" Value="SemiBold" />
+            <Setter Property="Foreground" Value="{StaticResource TextBodyBrush}" />
+            <Setter Property="Background" Value="{StaticResource SurfaceBrush}" />
+            <Setter Property="BorderBrush" Value="{StaticResource BorderStrongBrush}" />
+            <Setter Property="BorderThickness" Value="1" />
+            <Setter Property="HorizontalContentAlignment" Value="Center" />
+            <Setter Property="VerticalContentAlignment" Value="Center" />
+            <Setter Property="FocusVisualStyle" Value="{x:Null}" />
+            <Setter Property="Template">
+                <Setter.Value>
+                    <ControlTemplate TargetType="{x:Type Button}">
+                        <Border Background="{TemplateBinding Background}"
+                                BorderBrush="{TemplateBinding BorderBrush}"
+                                BorderThickness="{TemplateBinding BorderThickness}"
+                                CornerRadius="{StaticResource ControlCornerRadius}"
+                                Padding="{TemplateBinding Padding}">
+                            <ContentPresenter HorizontalAlignment="{TemplateBinding HorizontalContentAlignment}"
+                                              VerticalAlignment="{TemplateBinding VerticalContentAlignment}"
+                                              RecognizesAccessKey="True" />
+                        </Border>
+                    </ControlTemplate>
+                </Setter.Value>
+            </Setter>
+        </Style>
+        <Style TargetType="{x:Type Button}" BasedOn="{StaticResource ButtonBaseStyle}">
+            <Style.Triggers>
+                <Trigger Property="IsMouseOver" Value="True">
+                    <Setter Property="Background" Value="{StaticResource SurfaceHoverBrush}" />
+                    <Setter Property="BorderBrush" Value="{StaticResource DropZoneBorderBrush}" />
+                </Trigger>
+                <Trigger Property="IsPressed" Value="True">
+                    <Setter Property="Background" Value="{StaticResource SurfacePressedBrush}" />
+                    <Setter Property="BorderBrush" Value="{StaticResource PrimaryBrush}" />
+                </Trigger>
+                <Trigger Property="IsEnabled" Value="False">
+                    <Setter Property="Background" Value="#F3F5F8" />
+                    <Setter Property="BorderBrush" Value="#E3E8EE" />
+                    <Setter Property="Foreground" Value="#A4AFBC" />
+                </Trigger>
+            </Style.Triggers>
+        </Style>
+        <Style x:Key="PrimaryButtonStyle" TargetType="{x:Type Button}" BasedOn="{StaticResource ButtonBaseStyle}">
+            <Setter Property="Background" Value="{StaticResource PrimaryBrush}" />
+            <Setter Property="Foreground" Value="White" />
+            <Setter Property="BorderBrush" Value="{StaticResource PrimaryBrush}" />
+            <Setter Property="BorderThickness" Value="1" />
+            <Setter Property="Padding" Value="24,10" />
+            <Style.Triggers>
+                <Trigger Property="IsMouseOver" Value="True">
+                    <Setter Property="Background" Value="{StaticResource PrimaryHoverBrush}" />
+                    <Setter Property="BorderBrush" Value="{StaticResource PrimaryHoverBrush}" />
+                </Trigger>
+                <Trigger Property="IsPressed" Value="True">
+                    <Setter Property="Background" Value="{StaticResource PrimaryPressedBrush}" />
+                    <Setter Property="BorderBrush" Value="{StaticResource PrimaryPressedBrush}" />
+                </Trigger>
+                <Trigger Property="IsEnabled" Value="False">
+                    <Setter Property="Background" Value="#B8CCE5" />
+                    <Setter Property="BorderBrush" Value="#B8CCE5" />
+                    <Setter Property="Foreground" Value="#EDF3FA" />
+                </Trigger>
+            </Style.Triggers>
+        </Style>
+
+        <Style TargetType="{x:Type TextBox}">
+            <Setter Property="Padding" Value="10,7" />
+            <Setter Property="MinHeight" Value="32" />
+            <Setter Property="FontSize" Value="13" />
+            <Setter Property="Foreground" Value="{StaticResource TextBodyBrush}" />
+            <Setter Property="Background" Value="{StaticResource SurfaceBrush}" />
+            <Setter Property="BorderBrush" Value="{StaticResource BorderStrongBrush}" />
+            <Setter Property="BorderThickness" Value="1" />
+            <Setter Property="FocusVisualStyle" Value="{x:Null}" />
+            <Style.Triggers>
+                <Trigger Property="IsKeyboardFocused" Value="True">
+                    <Setter Property="BorderBrush" Value="{StaticResource PrimaryBrush}" />
+                </Trigger>
+                <Trigger Property="IsEnabled" Value="False">
+                    <Setter Property="Background" Value="#F3F5F8" />
+                    <Setter Property="Foreground" Value="#A4AFBC" />
+                </Trigger>
+            </Style.Triggers>
+        </Style>
+        <Style TargetType="{x:Type ComboBox}">
+            <Setter Property="Padding" Value="10,5" />
+            <Setter Property="MinHeight" Value="34" />
+            <Setter Property="FontSize" Value="13" />
+            <Setter Property="Foreground" Value="{StaticResource TextBodyBrush}" />
+            <Setter Property="Background" Value="{StaticResource SurfaceBrush}" />
+            <Setter Property="BorderBrush" Value="{StaticResource BorderStrongBrush}" />
+            <Setter Property="BorderThickness" Value="1" />
+            <Setter Property="FocusVisualStyle" Value="{x:Null}" />
+            <Style.Triggers>
+                <Trigger Property="IsKeyboardFocusWithin" Value="True">
+                    <Setter Property="BorderBrush" Value="{StaticResource PrimaryBrush}" />
+                </Trigger>
+                <Trigger Property="IsEnabled" Value="False">
+                    <Setter Property="Background" Value="#F3F5F8" />
+                    <Setter Property="Foreground" Value="#A4AFBC" />
+                </Trigger>
+            </Style.Triggers>
+        </Style>
+        <Style TargetType="{x:Type ComboBoxItem}">
+            <Setter Property="Padding" Value="10,7" />
+            <Setter Property="Foreground" Value="{StaticResource TextBodyBrush}" />
+            <Setter Property="Background" Value="{StaticResource SurfaceBrush}" />
+            <Style.Triggers>
+                <Trigger Property="IsMouseOver" Value="True">
+                    <Setter Property="Background" Value="{StaticResource SurfaceHoverBrush}" />
+                </Trigger>
+                <Trigger Property="IsSelected" Value="True">
+                    <Setter Property="Background" Value="{StaticResource PrimarySoftBrush}" />
+                    <Setter Property="Foreground" Value="{StaticResource PrimaryBrush}" />
+                </Trigger>
+            </Style.Triggers>
+        </Style>
+        <Style TargetType="{x:Type ProgressBar}">
+            <Setter Property="Foreground" Value="{StaticResource PrimaryBrush}" />
+            <Setter Property="Background" Value="#E7EDF4" />
         </Style>
         <Style x:Key="RecoveryLevelItemStyle" TargetType="{x:Type ListBoxItem}">
-            <Setter Property="Background" Value="White" />
-            <Setter Property="Foreground" Value="#243447" />
-            <Setter Property="BorderBrush" Value="#E1E6ED" />
+            <Setter Property="Background" Value="{StaticResource SurfaceBrush}" />
+            <Setter Property="Foreground" Value="{StaticResource TextStrongBrush}" />
+            <Setter Property="BorderBrush" Value="{StaticResource BorderBrush}" />
             <Setter Property="BorderThickness" Value="1" />
+            <Setter Property="Padding" Value="12" />
+            <Setter Property="MinHeight" Value="82" />
             <Setter Property="HorizontalContentAlignment" Value="Stretch" />
+            <Setter Property="VerticalContentAlignment" Value="Center" />
+            <Setter Property="FocusVisualStyle" Value="{x:Null}" />
             <Setter Property="Template">
                 <Setter.Value>
                     <ControlTemplate TargetType="{x:Type ListBoxItem}">
                         <Border Background="{TemplateBinding Background}"
                                 BorderBrush="{TemplateBinding BorderBrush}"
                                 BorderThickness="{TemplateBinding BorderThickness}"
-                                CornerRadius="6"
+                                CornerRadius="8"
                                 Padding="{TemplateBinding Padding}">
                             <ContentPresenter HorizontalAlignment="{TemplateBinding HorizontalContentAlignment}"
                                               VerticalAlignment="{TemplateBinding VerticalContentAlignment}" />
@@ -82,9 +267,9 @@ New-Item -ItemType Directory -Path $runtimeRoot -Force | Out-Null
             </Setter>
             <Style.Triggers>
                 <Trigger Property="IsSelected" Value="True">
-                    <Setter Property="Background" Value="#F3F8FF" />
-                    <Setter Property="Foreground" Value="#2F75C9" />
-                    <Setter Property="BorderBrush" Value="#2F75C9" />
+                    <Setter Property="Background" Value="{StaticResource PrimarySoftBrush}" />
+                    <Setter Property="Foreground" Value="{StaticResource PrimaryBrush}" />
+                    <Setter Property="BorderBrush" Value="{StaticResource PrimaryBrush}" />
                     <Setter Property="BorderThickness" Value="2" />
                 </Trigger>
                 <MultiTrigger>
@@ -92,256 +277,324 @@ New-Item -ItemType Directory -Path $runtimeRoot -Force | Out-Null
                         <Condition Property="IsMouseOver" Value="True" />
                         <Condition Property="IsSelected" Value="False" />
                     </MultiTrigger.Conditions>
-                    <Setter Property="Background" Value="#FAFCFF" />
-                    <Setter Property="BorderBrush" Value="#BFD8F2" />
+                    <Setter Property="Background" Value="{StaticResource SurfaceHoverBrush}" />
+                    <Setter Property="BorderBrush" Value="{StaticResource DropZoneBorderBrush}" />
                 </MultiTrigger>
             </Style.Triggers>
         </Style>
     </Window.Resources>
-    <ScrollViewer VerticalScrollBarVisibility="Auto">
-        <Grid Margin="24">
+    <ScrollViewer VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Disabled">
+        <Grid Margin="22">
             <Grid.RowDefinitions>
                 <RowDefinition Height="Auto" />
-                <RowDefinition Height="16" />
+                <RowDefinition Height="14" />
                 <RowDefinition Height="Auto" />
-                <RowDefinition Height="16" />
+                <RowDefinition Height="14" />
                 <RowDefinition Height="Auto" />
-                <RowDefinition Height="16" />
+                <RowDefinition Height="14" />
                 <RowDefinition Height="Auto" />
-                <RowDefinition Height="16" />
+                <RowDefinition Height="14" />
                 <RowDefinition Height="Auto" />
-                <RowDefinition Height="16" />
+                <RowDefinition Height="14" />
+                <RowDefinition Height="Auto" />
+                <RowDefinition Height="14" />
                 <RowDefinition Height="Auto" />
             </Grid.RowDefinitions>
 
-            <Border Grid.Row="0" Background="White" BorderBrush="#E1E6ED" BorderThickness="1" CornerRadius="8" Padding="16">
+            <Border Grid.Row="0" Style="{StaticResource CardStyle}" Padding="18,16">
                 <Grid>
                     <Grid.ColumnDefinitions>
                         <ColumnDefinition Width="Auto" />
-                        <ColumnDefinition Width="14" />
+                        <ColumnDefinition Width="16" />
                         <ColumnDefinition Width="*" />
                     </Grid.ColumnDefinitions>
-                    <Image x:Name="AppIconImage" Grid.Column="0" Width="46" Height="46" Stretch="Uniform" />
+                    <Image x:Name="AppIconImage" Grid.Column="0" Width="54" Height="54" Stretch="Uniform" />
                     <StackPanel Grid.Column="2" VerticalAlignment="Center">
-                        <TextBlock FontSize="22" FontWeight="SemiBold" Foreground="#202733" Text="压缩包密码恢复" />
-                        <TextBlock Margin="0,4,0,0" Foreground="#586473" Text="完全本地运行 · 文件与密码不会上传" />
+                        <TextBlock Style="{StaticResource PageTitleStyle}" Text="压缩包密码恢复" />
+                        <TextBlock Style="{StaticResource SubtitleStyle}" Margin="0,5,0,0" Text="完全本地运行 · 文件与密码不会上传" />
                     </StackPanel>
                 </Grid>
             </Border>
 
-            <Border x:Name="ArchiveDropZone" Grid.Row="2" AllowDrop="True" Background="White" BorderBrush="#AFC6E0" BorderThickness="2" CornerRadius="8" Padding="24" MinHeight="170">
+            <Border x:Name="ArchiveDropZone" Grid.Row="2" AllowDrop="True" Background="{StaticResource SurfaceSubtleBrush}" BorderBrush="{StaticResource DropZoneBorderBrush}" BorderThickness="1" CornerRadius="10" Padding="16" MinHeight="176">
                 <Grid>
-                    <StackPanel x:Name="EmptyArchiveDropContent" HorizontalAlignment="Center">
-                        <TextBlock HorizontalAlignment="Center" FontSize="24" FontWeight="SemiBold" Foreground="#243447" Text="把压缩包拖到这里" />
-                        <TextBlock Margin="0,7,0,0" HorizontalAlignment="Center" Foreground="#687789" Text="或点击选择 ZIP / 7z / RAR 文件" />
-                        <Button x:Name="BrowseArchiveButton" Width="150" Margin="0,15,0,0" HorizontalAlignment="Center" Content="选择文件" />
+                    <Rectangle Margin="1" RadiusX="9" RadiusY="9" Stroke="{StaticResource DropZoneBorderBrush}" StrokeThickness="1.2" StrokeDashArray="5,3" IsHitTestVisible="False" />
+                    <StackPanel x:Name="EmptyArchiveDropContent" HorizontalAlignment="Center" VerticalAlignment="Center">
+                        <Grid Width="54" Height="54" HorizontalAlignment="Center">
+                            <Border Width="50" Height="50" CornerRadius="15" Background="{StaticResource PrimarySoftBrush}" HorizontalAlignment="Left" VerticalAlignment="Top">
+                                <TextBlock HorizontalAlignment="Center" VerticalAlignment="Center" FontFamily="Segoe MDL2 Assets" FontSize="27" Foreground="{StaticResource PrimaryBrush}" Text="&#xE8B7;" />
+                            </Border>
+                            <Border Width="21" Height="21" CornerRadius="11" Background="{StaticResource PrimaryBrush}" BorderBrush="White" BorderThickness="2" HorizontalAlignment="Right" VerticalAlignment="Bottom">
+                                <TextBlock HorizontalAlignment="Center" VerticalAlignment="Center" FontSize="17" Foreground="White" Text="+" />
+                            </Border>
+                        </Grid>
+                        <TextBlock Margin="0,9,0,0" HorizontalAlignment="Center" FontSize="23" FontWeight="SemiBold" Foreground="{StaticResource TextStrongBrush}" Text="把压缩包拖到这里" />
+                        <TextBlock Margin="0,5,0,0" HorizontalAlignment="Center" Style="{StaticResource SubtitleStyle}" Text="或点击选择 ZIP / 7z / RAR 文件" />
+                        <Button x:Name="BrowseArchiveButton" Width="154" Height="38" Margin="0,14,0,0" HorizontalAlignment="Center" Style="{StaticResource PrimaryButtonStyle}" Content="选择文件" />
                     </StackPanel>
-                    <Grid x:Name="SelectedArchiveCard" Visibility="Collapsed" VerticalAlignment="Center">
+                    <Grid x:Name="SelectedArchiveCard" Visibility="Collapsed" VerticalAlignment="Center" Margin="12,0">
                         <Grid.ColumnDefinitions>
+                            <ColumnDefinition Width="Auto" />
+                            <ColumnDefinition Width="14" />
                             <ColumnDefinition Width="*" />
+                            <ColumnDefinition Width="16" />
                             <ColumnDefinition Width="Auto" />
                         </Grid.ColumnDefinitions>
-                        <StackPanel Grid.Column="0" VerticalAlignment="Center" Margin="0,0,16,0">
-                            <TextBlock x:Name="ArchiveFileNameText" FontSize="17" FontWeight="SemiBold" Foreground="#202733" TextTrimming="CharacterEllipsis" />
-                            <TextBlock x:Name="ArchiveInfoText" Margin="0,6,0,0" TextTrimming="CharacterEllipsis" Foreground="#526579" />
+                        <Border Grid.Column="0" Width="46" Height="46" CornerRadius="12" Background="{StaticResource PrimarySoftBrush}">
+                            <TextBlock HorizontalAlignment="Center" VerticalAlignment="Center" FontFamily="Segoe MDL2 Assets" FontSize="23" Foreground="{StaticResource PrimaryBrush}" Text="&#xE8B7;" />
+                        </Border>
+                        <StackPanel Grid.Column="2" VerticalAlignment="Center">
+                            <TextBlock x:Name="ArchiveFileNameText" FontSize="17" FontWeight="SemiBold" Foreground="{StaticResource TextStrongBrush}" TextTrimming="CharacterEllipsis" />
+                            <TextBlock x:Name="ArchiveInfoText" Margin="0,5,0,0" Style="{StaticResource SubtitleStyle}" TextTrimming="CharacterEllipsis" />
                         </StackPanel>
-                        <Button x:Name="ReplaceArchiveButton" Grid.Column="1" Width="120" Height="36" VerticalAlignment="Center" Content="更换文件" />
+                        <Button x:Name="ReplaceArchiveButton" Grid.Column="4" Width="120" Height="36" VerticalAlignment="Center" Content="更换文件" />
                     </Grid>
                     <TextBox x:Name="ArchivePathBox" Visibility="Collapsed" />
                     <Button x:Name="InspectButton" Visibility="Collapsed" />
                 </Grid>
             </Border>
 
-            <Border Grid.Row="4" Background="White" BorderBrush="#E1E6ED" BorderThickness="1" CornerRadius="8" Padding="16">
+            <Border Grid.Row="4" Style="{StaticResource CardStyle}">
                 <StackPanel>
-                    <TextBlock FontSize="17" FontWeight="SemiBold" Foreground="#202733" Text="恢复级别" />
-                    <ListBox x:Name="StrategyBox" Margin="0,12,0,0" Background="Transparent" BorderThickness="0" SelectedIndex="0" HorizontalContentAlignment="Stretch" ItemContainerStyle="{StaticResource RecoveryLevelItemStyle}">
+                    <Grid>
+                        <Grid.ColumnDefinitions>
+                            <ColumnDefinition Width="*" />
+                            <ColumnDefinition Width="Auto" />
+                        </Grid.ColumnDefinitions>
+                        <TextBlock Style="{StaticResource SectionTitleStyle}" Text="恢复级别" />
+                        <TextBlock Grid.Column="1" Style="{StaticResource HelperTextStyle}" VerticalAlignment="Center" Text="选择搜索深度" />
+                    </Grid>
+                    <ListBox x:Name="StrategyBox" Margin="0,14,0,0" Background="Transparent" BorderThickness="0" SelectedIndex="0" HorizontalContentAlignment="Stretch" ItemContainerStyle="{StaticResource RecoveryLevelItemStyle}">
                         <ListBox.ItemsPanel>
                             <ItemsPanelTemplate>
                                 <UniformGrid Columns="5" />
                             </ItemsPanelTemplate>
                         </ListBox.ItemsPanel>
-                        <ListBoxItem Tag="1" Padding="8" Margin="0,0,6,0">
-                            <StackPanel HorizontalAlignment="Center">
-                                <TextBlock HorizontalAlignment="Center" FontSize="18" FontWeight="SemiBold" Text="1级" />
-                                <TextBlock Margin="0,4,0,0" HorizontalAlignment="Center" Text="快速尝试" />
-                            </StackPanel>
-                        </ListBoxItem>
-                        <ListBoxItem Tag="2" Padding="8" Margin="0,0,6,0">
-                            <StackPanel HorizontalAlignment="Center">
-                                <TextBlock HorizontalAlignment="Center" FontSize="18" FontWeight="SemiBold" Text="2级" />
-                                <TextBlock Margin="0,4,0,0" HorizontalAlignment="Center" Text="常用密码" />
-                            </StackPanel>
-                        </ListBoxItem>
-                        <ListBoxItem Tag="3" Padding="8" Margin="0,0,6,0">
-                            <StackPanel HorizontalAlignment="Center">
-                                <TextBlock HorizontalAlignment="Center" FontSize="18" FontWeight="SemiBold" Text="3级" />
-                                <TextBlock Margin="0,4,0,0" HorizontalAlignment="Center" Text="增强恢复" />
-                            </StackPanel>
-                        </ListBoxItem>
-                        <ListBoxItem Tag="4" Padding="8" Margin="0,0,6,0">
-                            <StackPanel HorizontalAlignment="Center">
-                                <TextBlock HorizontalAlignment="Center" FontSize="18" FontWeight="SemiBold" Text="4级" />
-                                <TextBlock Margin="0,4,0,0" HorizontalAlignment="Center" Text="深度搜索" />
-                            </StackPanel>
-                        </ListBoxItem>
-                        <ListBoxItem Tag="5" Padding="8">
-                            <StackPanel HorizontalAlignment="Center">
-                                <TextBlock HorizontalAlignment="Center" FontSize="18" FontWeight="SemiBold" Text="5级" />
-                                <TextBlock Margin="0,4,0,0" HorizontalAlignment="Center" Text="完整搜索" />
-                            </StackPanel>
-                        </ListBoxItem>
-                    </ListBox>
-                    <TextBlock x:Name="StrategyHelpText" Margin="0,12,0,0" TextWrapping="Wrap" Foreground="#586473" />
-                    <Border x:Name="OverallProgressPanel" Margin="0,14,0,0" Background="#F7FAFE" BorderBrush="#D6E6F7" BorderThickness="1" CornerRadius="6" Padding="14">
-                        <StackPanel>
+                        <ListBoxItem Tag="1" Padding="12" Margin="0,0,8,0">
                             <Grid>
                                 <Grid.ColumnDefinitions>
                                     <ColumnDefinition Width="*" />
-                                    <ColumnDefinition Width="Auto" />
+                                    <ColumnDefinition Width="30" />
                                 </Grid.ColumnDefinitions>
-                                <StackPanel Grid.Column="0">
-                                    <TextBlock x:Name="OverallProgressTitle" FontSize="21" FontWeight="SemiBold" Foreground="#203A59" Text="整体恢复进度" />
-                                    <TextBlock x:Name="OverallProgressSubtitle" Margin="0,3,0,0" FontSize="12" Foreground="#687789" Text="按已选择恢复级别统计整体搜索进展" />
+                                <StackPanel Grid.Column="0" VerticalAlignment="Center">
+                                    <TextBlock FontSize="19" FontWeight="SemiBold" Text="1级" />
+                                    <TextBlock Margin="0,4,0,0" Style="{StaticResource SubtitleStyle}" Text="快速尝试" />
                                 </StackPanel>
-                                <TextBlock x:Name="OverallProgressPercent" Grid.Column="1" HorizontalAlignment="Right" Margin="16,0,0,0" VerticalAlignment="Center" FontSize="19" FontWeight="SemiBold" Foreground="#2F75C9" Text="—" />
+                                <TextBlock Grid.Column="1" HorizontalAlignment="Right" VerticalAlignment="Center" FontSize="25" Foreground="{StaticResource TextFaintBrush}" Text="↗" />
                             </Grid>
-                            <Grid Margin="0,11,0,0">
-                                <ProgressBar x:Name="OverallProgressBar" Height="10" Minimum="0" Maximum="100" Value="0" IsIndeterminate="False" Background="#E5E9EF" Foreground="#2F75C9" />
-                            </Grid>
-                            <Grid x:Name="OverallProgressStatsGrid" Margin="0,16,0,0">
+                        </ListBoxItem>
+                        <ListBoxItem Tag="2" Padding="12" Margin="0,0,8,0">
+                            <Grid>
                                 <Grid.ColumnDefinitions>
                                     <ColumnDefinition Width="*" />
-                                    <ColumnDefinition Width="*" />
-                                    <ColumnDefinition Width="*" />
-                                    <ColumnDefinition Width="*" />
+                                    <ColumnDefinition Width="30" />
                                 </Grid.ColumnDefinitions>
-                                <StackPanel Grid.Column="0">
-                                    <TextBlock x:Name="OverallEtaLabel" FontSize="12" Foreground="#687789" ToolTip="表示按当前恢复级别耗尽已配置搜索范围所需的预计时间；密码可能更早找到，也可能不在当前搜索范围内。" Text="预计完成" />
-                                    <TextBlock x:Name="OverallEtaValue" Margin="0,3,8,0" TextWrapping="Wrap" FontSize="22" FontWeight="SemiBold" Foreground="#173B62" Text="开始搜索后显示" />
+                                <StackPanel Grid.Column="0" VerticalAlignment="Center">
+                                    <TextBlock FontSize="19" FontWeight="SemiBold" Text="2级" />
+                                    <TextBlock Margin="0,4,0,0" Style="{StaticResource SubtitleStyle}" Text="常用密码" />
                                 </StackPanel>
-                                <StackPanel Grid.Column="1">
-                                    <TextBlock x:Name="OverallCandidatesTestedLabel" FontSize="12" Foreground="#687789" Text="已累计测试" />
-                                    <TextBlock x:Name="OverallCandidatesTestedValue" Margin="0,3,8,0" TextWrapping="Wrap" FontSize="22" FontWeight="SemiBold" Foreground="#173B62" Text="等待开始" />
-                                </StackPanel>
-                                <StackPanel Grid.Column="2">
-                                    <TextBlock x:Name="OverallCandidatesRemainingLabel" FontSize="12" Foreground="#687789" Text="剩余待尝试" />
-                                    <TextBlock x:Name="OverallCandidatesRemainingValue" Margin="0,3,8,0" TextWrapping="Wrap" FontSize="22" FontWeight="SemiBold" Foreground="#173B62" Text="准备后显示" />
-                                </StackPanel>
-                                <StackPanel Grid.Column="3">
-                                    <TextBlock x:Name="OverallSpeedLabel" FontSize="12" Foreground="#687789" Text="当前搜索速度" />
-                                    <TextBlock x:Name="OverallSpeedValue" Margin="0,3,0,0" TextWrapping="Wrap" FontSize="22" FontWeight="SemiBold" Foreground="#173B62" Text="开始搜索后显示" />
-                                </StackPanel>
+                                <TextBlock Grid.Column="1" HorizontalAlignment="Right" VerticalAlignment="Center" FontSize="23" Foreground="{StaticResource TextFaintBrush}" Text="▣" />
                             </Grid>
-                            <Grid x:Name="OverallProgressContextGrid" Margin="0,16,0,0">
+                        </ListBoxItem>
+                        <ListBoxItem Tag="3" Padding="12" Margin="0,0,8,0">
+                            <Grid>
                                 <Grid.ColumnDefinitions>
                                     <ColumnDefinition Width="*" />
-                                    <ColumnDefinition Width="*" />
-                                    <ColumnDefinition Width="*" />
-                                    <ColumnDefinition Width="*" />
+                                    <ColumnDefinition Width="30" />
                                 </Grid.ColumnDefinitions>
-                                <StackPanel Grid.Column="0">
-                                    <TextBlock FontSize="12" Foreground="#7A8795" Text="已处理范围" />
-                                    <TextBlock x:Name="OverallProgressSummary" Margin="0,2,8,0" TextWrapping="Wrap" FontSize="14" Foreground="#526579" Text="准备后显示" />
+                                <StackPanel Grid.Column="0" VerticalAlignment="Center">
+                                    <TextBlock FontSize="19" FontWeight="SemiBold" Text="3级" />
+                                    <TextBlock Margin="0,4,0,0" Style="{StaticResource SubtitleStyle}" Text="增强恢复" />
                                 </StackPanel>
-                                <StackPanel Grid.Column="1">
-                                    <TextBlock FontSize="12" Foreground="#7A8795" Text="当前阶段" />
-                                    <TextBlock x:Name="OverallStageValue" Margin="0,2,8,0" TextWrapping="Wrap" FontSize="14" Foreground="#526579" Text="等待开始" />
-                                </StackPanel>
-                                <StackPanel Grid.Column="2">
-                                    <TextBlock FontSize="12" Foreground="#7A8795" Text="当前范围" />
-                                    <TextBlock x:Name="OverallCoverageValue" Margin="0,2,8,0" TextWrapping="Wrap" FontSize="14" Foreground="#526579" Text="等待开始" />
-                                </StackPanel>
-                                <StackPanel Grid.Column="3">
-                                    <TextBlock FontSize="12" Foreground="#7A8795" Text="当前状态" />
-                                    <TextBlock x:Name="OverallProgressCurrent" Margin="0,2,0,0" TextWrapping="Wrap" FontSize="14" Foreground="#526579" Text="等待开始" />
-                                </StackPanel>
+                                <TextBlock Grid.Column="1" HorizontalAlignment="Right" VerticalAlignment="Center" FontSize="25" Foreground="{StaticResource TextFaintBrush}" Text="◇" />
                             </Grid>
-                            <TextBlock x:Name="OverallProgressHelper" Margin="0,11,0,0" TextWrapping="Wrap" FontSize="12" Foreground="#7A8795" Text="" Visibility="Collapsed" />
-                        </StackPanel>
-                    </Border>
+                        </ListBoxItem>
+                        <ListBoxItem Tag="4" Padding="12" Margin="0,0,8,0">
+                            <Grid>
+                                <Grid.ColumnDefinitions>
+                                    <ColumnDefinition Width="*" />
+                                    <ColumnDefinition Width="30" />
+                                </Grid.ColumnDefinitions>
+                                <StackPanel Grid.Column="0" VerticalAlignment="Center">
+                                    <TextBlock FontSize="19" FontWeight="SemiBold" Text="4级" />
+                                    <TextBlock Margin="0,4,0,0" Style="{StaticResource SubtitleStyle}" Text="深度搜索" />
+                                </StackPanel>
+                                <TextBlock Grid.Column="1" HorizontalAlignment="Right" VerticalAlignment="Center" FontSize="25" Foreground="{StaticResource TextFaintBrush}" Text="⌕" />
+                            </Grid>
+                        </ListBoxItem>
+                        <ListBoxItem Tag="5" Padding="12">
+                            <Grid>
+                                <Grid.ColumnDefinitions>
+                                    <ColumnDefinition Width="*" />
+                                    <ColumnDefinition Width="30" />
+                                </Grid.ColumnDefinitions>
+                                <StackPanel Grid.Column="0" VerticalAlignment="Center">
+                                    <TextBlock FontSize="19" FontWeight="SemiBold" Text="5级" />
+                                    <TextBlock Margin="0,4,0,0" Style="{StaticResource SubtitleStyle}" Text="完整搜索" />
+                                </StackPanel>
+                                <TextBlock Grid.Column="1" HorizontalAlignment="Right" VerticalAlignment="Center" FontSize="23" Foreground="{StaticResource TextFaintBrush}" Text="◎" />
+                            </Grid>
+                        </ListBoxItem>
+                    </ListBox>
+                    <TextBlock x:Name="StrategyHelpText" Margin="0,12,0,0" TextWrapping="Wrap" Style="{StaticResource HelperTextStyle}" />
                 </StackPanel>
             </Border>
 
-            <Grid Grid.Row="6">
-                <Grid.ColumnDefinitions>
-                    <ColumnDefinition Width="*" />
-                    <ColumnDefinition Width="18" />
-                    <ColumnDefinition Width="Auto" />
-                </Grid.ColumnDefinitions>
-                <Border Grid.Column="0" Background="White" BorderBrush="#E1E6ED" BorderThickness="1" CornerRadius="8" Padding="16">
-                    <StackPanel>
-                        <TextBlock FontSize="17" FontWeight="SemiBold" Foreground="#202733" Text="计算设备" />
-                        <ComboBox x:Name="DeviceBox" Width="280" Margin="0,10,0,0" MinHeight="32" HorizontalAlignment="Left" />
-                        <TextBlock x:Name="DeviceInfoText" Margin="0,8,0,0" Foreground="#687789" Text="可用：CPU" />
+            <Border x:Name="OverallProgressPanel" Grid.Row="6" Style="{StaticResource CardStyle}" Padding="18">
+                <StackPanel>
+                    <Grid>
+                        <Grid.ColumnDefinitions>
+                            <ColumnDefinition Width="*" />
+                            <ColumnDefinition Width="Auto" />
+                        </Grid.ColumnDefinitions>
+                        <StackPanel Grid.Column="0">
+                            <TextBlock x:Name="OverallProgressTitle" FontSize="21" FontWeight="SemiBold" Foreground="{StaticResource TextStrongBrush}" Text="整体恢复进度" />
+                            <TextBlock x:Name="OverallProgressSubtitle" Margin="0,3,0,0" Style="{StaticResource HelperTextStyle}" Text="按已选择恢复级别统计整体搜索进展" />
+                        </StackPanel>
+                        <TextBlock x:Name="OverallProgressPercent" Grid.Column="1" HorizontalAlignment="Right" Margin="16,0,0,0" VerticalAlignment="Center" FontSize="19" FontWeight="SemiBold" Foreground="{StaticResource PrimaryBrush}" Text="—" />
+                    </Grid>
+                    <ProgressBar x:Name="OverallProgressBar" Height="10" Margin="0,13,0,0" Minimum="0" Maximum="100" Value="0" IsIndeterminate="False" Background="#E7EDF4" Foreground="{StaticResource PrimaryBrush}" />
+                    <Grid x:Name="OverallProgressStatsGrid" Margin="0,18,0,0">
+                        <Grid.ColumnDefinitions>
+                            <ColumnDefinition Width="*" />
+                            <ColumnDefinition Width="1" />
+                            <ColumnDefinition Width="*" />
+                            <ColumnDefinition Width="1" />
+                            <ColumnDefinition Width="*" />
+                            <ColumnDefinition Width="1" />
+                            <ColumnDefinition Width="*" />
+                        </Grid.ColumnDefinitions>
+                        <StackPanel Grid.Column="0" Margin="0,0,14,0">
+                            <TextBlock x:Name="OverallEtaLabel" Style="{StaticResource KpiLabelStyle}" ToolTip="表示按当前恢复级别耗尽已配置搜索范围所需的预计时间；密码可能更早找到，也可能不在当前搜索范围内。" Text="预计完成" />
+                            <TextBlock x:Name="OverallEtaValue" Margin="0,4,0,0" TextWrapping="Wrap" Style="{StaticResource KpiValueStyle}" Text="开始搜索后显示" />
+                        </StackPanel>
+                        <Border Grid.Column="1" Background="{StaticResource DividerBrush}" />
+                        <StackPanel Grid.Column="2" Margin="14,0,14,0">
+                            <TextBlock x:Name="OverallCandidatesTestedLabel" Style="{StaticResource KpiLabelStyle}" Text="已累计测试" />
+                            <TextBlock x:Name="OverallCandidatesTestedValue" Margin="0,4,0,0" TextWrapping="Wrap" Style="{StaticResource KpiValueStyle}" Text="等待开始" />
+                        </StackPanel>
+                        <Border Grid.Column="3" Background="{StaticResource DividerBrush}" />
+                        <StackPanel Grid.Column="4" Margin="14,0,14,0">
+                            <TextBlock x:Name="OverallCandidatesRemainingLabel" Style="{StaticResource KpiLabelStyle}" Text="剩余待尝试" />
+                            <TextBlock x:Name="OverallCandidatesRemainingValue" Margin="0,4,0,0" TextWrapping="Wrap" Style="{StaticResource KpiValueStyle}" Text="准备后显示" />
+                        </StackPanel>
+                        <Border Grid.Column="5" Background="{StaticResource DividerBrush}" />
+                        <StackPanel Grid.Column="6" Margin="14,0,0,0">
+                            <TextBlock x:Name="OverallSpeedLabel" Style="{StaticResource KpiLabelStyle}" Text="当前搜索速度" />
+                            <TextBlock x:Name="OverallSpeedValue" Margin="0,4,0,0" TextWrapping="Wrap" Style="{StaticResource KpiValueStyle}" Text="开始搜索后显示" />
+                        </StackPanel>
+                    </Grid>
+                    <Border Margin="0,17,0,0" Padding="0,14,0,0" BorderBrush="{StaticResource DividerBrush}" BorderThickness="0,1,0,0">
+                        <Grid x:Name="OverallProgressContextGrid">
+                            <Grid.ColumnDefinitions>
+                                <ColumnDefinition Width="*" />
+                                <ColumnDefinition Width="*" />
+                                <ColumnDefinition Width="*" />
+                                <ColumnDefinition Width="*" />
+                            </Grid.ColumnDefinitions>
+                            <StackPanel Grid.Column="0" Margin="0,0,12,0">
+                                <TextBlock Style="{StaticResource DetailLabelStyle}" Text="已处理范围" />
+                                <TextBlock x:Name="OverallProgressSummary" Margin="0,3,0,0" TextWrapping="Wrap" Style="{StaticResource DetailValueStyle}" Text="准备后显示" />
+                            </StackPanel>
+                            <StackPanel Grid.Column="1" Margin="12,0,12,0">
+                                <TextBlock Style="{StaticResource DetailLabelStyle}" Text="当前阶段" />
+                                <TextBlock x:Name="OverallStageValue" Margin="0,3,0,0" TextWrapping="Wrap" Style="{StaticResource DetailValueStyle}" Text="等待开始" />
+                            </StackPanel>
+                            <StackPanel Grid.Column="2" Margin="12,0,12,0">
+                                <TextBlock Style="{StaticResource DetailLabelStyle}" Text="当前范围" />
+                                <TextBlock x:Name="OverallCoverageValue" Margin="0,3,0,0" TextWrapping="Wrap" Style="{StaticResource DetailValueStyle}" Text="等待开始" />
+                            </StackPanel>
+                            <StackPanel Grid.Column="3" Margin="12,0,0,0">
+                                <TextBlock Style="{StaticResource DetailLabelStyle}" Text="当前状态" />
+                                <TextBlock x:Name="OverallProgressCurrent" Margin="0,3,0,0" TextWrapping="Wrap" Style="{StaticResource DetailValueStyle}" Text="等待开始" />
+                            </StackPanel>
+                        </Grid>
+                    </Border>
+                    <TextBlock x:Name="OverallProgressHelper" Margin="0,11,0,0" TextWrapping="Wrap" Style="{StaticResource HelperTextStyle}" Text="" Visibility="Collapsed" />
+                </StackPanel>
+            </Border>
+
+            <Border Grid.Row="8" Style="{StaticResource CardStyle}" Padding="18,15">
+                <Grid>
+                    <Grid.ColumnDefinitions>
+                        <ColumnDefinition Width="*" />
+                        <ColumnDefinition Width="18" />
+                        <ColumnDefinition Width="Auto" />
+                    </Grid.ColumnDefinitions>
+                    <StackPanel Grid.Column="0">
+                        <TextBlock Style="{StaticResource SectionTitleStyle}" Text="计算设备" />
+                        <ComboBox x:Name="DeviceBox" Width="320" Margin="0,10,0,0" MinHeight="34" HorizontalAlignment="Left" />
+                        <TextBlock x:Name="DeviceInfoText" Margin="0,8,0,0" TextWrapping="Wrap" Style="{StaticResource HelperTextStyle}" Text="可用：CPU" />
                     </StackPanel>
-                </Border>
                 <StackPanel Grid.Column="2" VerticalAlignment="Center">
-                    <Button x:Name="StartButton" Width="190" Height="54" Style="{StaticResource PrimaryButtonStyle}" Content="开始恢复" />
-                    <StackPanel Orientation="Horizontal" HorizontalAlignment="Center" Margin="0,10,0,0">
+                    <Button x:Name="StartButton" Width="200" Height="52" Style="{StaticResource PrimaryButtonStyle}" Content="开始恢复" />
+                    <StackPanel Orientation="Horizontal" HorizontalAlignment="Center" Margin="0,9,0,0">
                         <Button x:Name="PauseButton" Width="68" Margin="0,0,6,0" Content="暂停" Visibility="Collapsed" />
                         <Button x:Name="ResumeButton" Width="68" Margin="0,0,6,0" Content="继续" Visibility="Collapsed" />
                         <Button x:Name="StopButton" Width="68" Content="停止" Visibility="Collapsed" />
                     </StackPanel>
                 </StackPanel>
-            </Grid>
+                </Grid>
+            </Border>
 
-            <Border x:Name="ProgressCard" Grid.Row="8" Background="White" BorderBrush="#E1E6ED" BorderThickness="1" CornerRadius="8" Padding="16">
+            <Border x:Name="ProgressCard" Grid.Row="10" Style="{StaticResource CardStyle}" Padding="18">
                 <Grid>
                     <Grid.ColumnDefinitions>
-                        <ColumnDefinition Width="120" />
+                        <ColumnDefinition Width="128" />
                         <ColumnDefinition Width="*" />
-                        <ColumnDefinition Width="120" />
+                        <ColumnDefinition Width="128" />
                         <ColumnDefinition Width="*" />
                     </Grid.ColumnDefinitions>
                     <Grid.RowDefinitions>
                         <RowDefinition Height="Auto" />
-                        <RowDefinition Height="10" />
+                        <RowDefinition Height="12" />
                         <RowDefinition Height="Auto" />
-                        <RowDefinition Height="10" />
+                        <RowDefinition Height="12" />
                         <RowDefinition Height="Auto" />
-                        <RowDefinition Height="10" />
+                        <RowDefinition Height="12" />
                         <RowDefinition Height="Auto" />
-                        <RowDefinition Height="10" />
+                        <RowDefinition Height="12" />
                         <RowDefinition Height="Auto" />
-                        <RowDefinition Height="10" />
+                        <RowDefinition Height="12" />
                         <RowDefinition Height="Auto" />
-                        <RowDefinition Height="10" />
+                        <RowDefinition Height="12" />
                         <RowDefinition Height="Auto" />
-                        <RowDefinition Height="10" />
+                        <RowDefinition Height="12" />
                         <RowDefinition Height="Auto" />
-                        <RowDefinition Height="10" />
+                        <RowDefinition Height="12" />
                         <RowDefinition Height="Auto" />
                     </Grid.RowDefinitions>
-                    <TextBlock Grid.Row="0" Grid.Column="0" FontSize="18" FontWeight="SemiBold" Foreground="#202733" Text="当前范围详情" />
-                    <TextBlock x:Name="StateValue" Grid.Row="0" Grid.Column="1" FontSize="16" FontWeight="SemiBold" Foreground="#2F75C9" />
-                    <TextBlock Grid.Row="0" Grid.Column="2" FontSize="12" Foreground="#687789" Text="当前阶段" />
-                    <TextBlock x:Name="StageValue" Grid.Row="0" Grid.Column="3" TextWrapping="Wrap" FontSize="17" FontWeight="SemiBold" Foreground="#2F75C9" />
-                    <TextBlock Grid.Row="2" Grid.Column="0" FontSize="12" Foreground="#687789" Text="当前范围" />
-                    <TextBlock x:Name="CoverageValue" Grid.Row="2" Grid.Column="1" TextWrapping="Wrap" FontSize="16" Foreground="#526579" />
-                    <TextBlock Grid.Row="2" Grid.Column="2" FontSize="12" Foreground="#687789" Text="当前设备" />
-                    <TextBlock x:Name="DeviceValue" Grid.Row="2" Grid.Column="3" TextWrapping="Wrap" FontSize="15" Foreground="#526579" />
-                    <TextBlock Grid.Row="4" Grid.Column="0" FontSize="12" Foreground="#687789" Text="当前 Backend" />
-                    <TextBlock x:Name="EngineValue" Grid.Row="4" Grid.Column="1" TextWrapping="Wrap" FontSize="15" Foreground="#526579" />
-                    <TextBlock x:Name="SpeedLabel" Grid.Row="4" Grid.Column="2" FontSize="12" Foreground="#687789" Text="速度（平滑）" />
-                    <TextBlock x:Name="SpeedValue" Grid.Row="4" Grid.Column="3" FontSize="16" FontWeight="SemiBold" Foreground="#526579" />
-                    <TextBlock x:Name="ProgressMetricLabel" Grid.Row="6" Grid.Column="0" FontSize="12" Foreground="#687789" Text="已测试数量" />
-                    <TextBlock x:Name="CandidatesValue" Grid.Row="6" Grid.Column="1" FontSize="15" Foreground="#526579" />
-                    <TextBlock Grid.Row="6" Grid.Column="2" FontSize="12" Foreground="#687789" Text="当前范围预计剩余" />
-                    <TextBlock x:Name="EstimatedRemainingValue" Grid.Row="6" Grid.Column="3" FontSize="16" FontWeight="SemiBold" Foreground="#202733" />
-                    <TextBlock Grid.Row="8" Grid.Column="0" FontSize="12" Foreground="#687789" Text="当前范围最坏时间" />
-                    <TextBlock x:Name="WorstCaseValue" Grid.Row="8" Grid.Column="1" Grid.ColumnSpan="3" TextWrapping="Wrap" FontSize="16" FontWeight="SemiBold" Foreground="#202733" />
-                    <TextBlock x:Name="ProgressBarLabel" Grid.Row="10" Grid.Column="0" VerticalAlignment="Center" FontSize="12" Foreground="#687789" Text="搜索进度" />
-                    <ProgressBar x:Name="SearchProgressBar" Grid.Row="10" Grid.Column="1" Height="17" Minimum="0" Maximum="100" />
-                    <TextBlock x:Name="ProgressPercentValue" Grid.Row="10" Grid.Column="2" Grid.ColumnSpan="2" Margin="10,0,0,0" VerticalAlignment="Center" />
-                    <Border x:Name="ResultCard" Grid.Row="12" Grid.Column="0" Grid.ColumnSpan="4" Background="#EFF9F1" BorderBrush="#A8D5B0" BorderThickness="1" CornerRadius="6" Padding="12" Visibility="Collapsed">
+                    <TextBlock Grid.Row="0" Grid.Column="0" Style="{StaticResource SectionTitleStyle}" Text="当前范围详情" />
+                    <Border Grid.Row="0" Grid.Column="1" HorizontalAlignment="Left" Style="{StaticResource BadgeStyle}">
+                        <TextBlock x:Name="StateValue" FontSize="13" FontWeight="SemiBold" Foreground="{StaticResource PrimaryBrush}" />
+                    </Border>
+                    <TextBlock Grid.Row="0" Grid.Column="2" Style="{StaticResource DetailLabelStyle}" VerticalAlignment="Center" Text="当前阶段" />
+                    <TextBlock x:Name="StageValue" Grid.Row="0" Grid.Column="3" TextWrapping="Wrap" FontSize="16" FontWeight="SemiBold" Foreground="{StaticResource PrimaryBrush}" />
+                    <TextBlock Grid.Row="2" Grid.Column="0" Style="{StaticResource DetailLabelStyle}" Text="当前范围" />
+                    <TextBlock x:Name="CoverageValue" Grid.Row="2" Grid.Column="1" TextWrapping="Wrap" Style="{StaticResource DetailValueStyle}" />
+                    <TextBlock Grid.Row="2" Grid.Column="2" Style="{StaticResource DetailLabelStyle}" Text="当前设备" />
+                    <TextBlock x:Name="DeviceValue" Grid.Row="2" Grid.Column="3" TextWrapping="Wrap" Style="{StaticResource DetailValueStyle}" />
+                    <TextBlock Grid.Row="4" Grid.Column="0" Style="{StaticResource DetailLabelStyle}" Text="当前 Backend" />
+                    <TextBlock x:Name="EngineValue" Grid.Row="4" Grid.Column="1" TextWrapping="Wrap" Style="{StaticResource DetailValueStyle}" />
+                    <TextBlock x:Name="SpeedLabel" Grid.Row="4" Grid.Column="2" Style="{StaticResource DetailLabelStyle}" Text="速度（平滑）" />
+                    <TextBlock x:Name="SpeedValue" Grid.Row="4" Grid.Column="3" FontSize="15" FontWeight="SemiBold" Foreground="{StaticResource TextBodyBrush}" />
+                    <TextBlock x:Name="ProgressMetricLabel" Grid.Row="6" Grid.Column="0" Style="{StaticResource DetailLabelStyle}" Text="已测试数量" />
+                    <TextBlock x:Name="CandidatesValue" Grid.Row="6" Grid.Column="1" Style="{StaticResource DetailValueStyle}" />
+                    <TextBlock Grid.Row="6" Grid.Column="2" Style="{StaticResource DetailLabelStyle}" Text="当前范围预计剩余" />
+                    <TextBlock x:Name="EstimatedRemainingValue" Grid.Row="6" Grid.Column="3" FontSize="15" FontWeight="SemiBold" Foreground="{StaticResource TextStrongBrush}" />
+                    <TextBlock Grid.Row="8" Grid.Column="0" Style="{StaticResource DetailLabelStyle}" Text="当前范围最坏时间" />
+                    <TextBlock x:Name="WorstCaseValue" Grid.Row="8" Grid.Column="1" Grid.ColumnSpan="3" TextWrapping="Wrap" FontSize="15" FontWeight="SemiBold" Foreground="{StaticResource TextStrongBrush}" />
+                    <TextBlock x:Name="ProgressBarLabel" Grid.Row="10" Grid.Column="0" Style="{StaticResource DetailLabelStyle}" VerticalAlignment="Center" Text="搜索进度" />
+                    <ProgressBar x:Name="SearchProgressBar" Grid.Row="10" Grid.Column="1" Height="10" Minimum="0" Maximum="100" />
+                    <TextBlock x:Name="ProgressPercentValue" Grid.Row="10" Grid.Column="2" Grid.ColumnSpan="2" Margin="10,0,0,0" VerticalAlignment="Center" Foreground="{StaticResource PrimaryBrush}" FontWeight="SemiBold" />
+                    <Border x:Name="ResultCard" Grid.Row="12" Grid.Column="0" Grid.ColumnSpan="4" Background="{StaticResource SuccessSurfaceBrush}" BorderBrush="{StaticResource SuccessBorderBrush}" BorderThickness="1" CornerRadius="7" Padding="12" Visibility="Collapsed">
                         <Grid>
                             <Grid.ColumnDefinitions>
                                 <ColumnDefinition Width="Auto" />
                                 <ColumnDefinition Width="16" />
                                 <ColumnDefinition Width="*" />
                             </Grid.ColumnDefinitions>
-                            <TextBlock x:Name="ResultStatusText" Grid.Column="0" VerticalAlignment="Center" FontWeight="SemiBold" Foreground="#237A36" Text="密码已恢复" />
+                            <TextBlock x:Name="ResultStatusText" Grid.Column="0" VerticalAlignment="Center" FontWeight="SemiBold" Foreground="{StaticResource SuccessTextBrush}" Text="密码已恢复" />
                             <TextBox x:Name="ResultValue" Grid.Column="2" IsReadOnly="True" FontSize="16" FontWeight="SemiBold" Background="White" />
                         </Grid>
                     </Border>
@@ -351,16 +604,28 @@ New-Item -ItemType Directory -Path $runtimeRoot -Force | Out-Null
                             <ColumnDefinition Width="120" />
                             <ColumnDefinition Width="Auto" />
                         </Grid.ColumnDefinitions>
-                        <TextBlock x:Name="ProgressMessageText" Grid.Column="0" TextWrapping="Wrap" Foreground="#526579" />
-                        <TextBlock Grid.Column="1" HorizontalAlignment="Right" Text="已运行" />
-                        <TextBlock x:Name="ElapsedValue" Grid.Column="2" Margin="10,0,0,0" />
+                        <TextBlock x:Name="ProgressMessageText" Grid.Column="0" TextWrapping="Wrap" Style="{StaticResource HelperTextStyle}" />
+                        <TextBlock Grid.Column="1" HorizontalAlignment="Right" Style="{StaticResource HelperTextStyle}" Text="已运行" />
+                        <TextBlock x:Name="ElapsedValue" Grid.Column="2" Margin="10,0,0,0" Foreground="{StaticResource TextBodyBrush}" FontWeight="SemiBold" />
                     </Grid>
                 </Grid>
             </Border>
 
-            <Expander x:Name="AdvancedSettingsExpander" Grid.Row="10" Header="高级设置（可选）" IsExpanded="False" Padding="10" Background="White" BorderBrush="#E1E6ED" BorderThickness="1">
-                <StackPanel>
-                    <TextBlock Margin="0,0,0,12" Foreground="#687789" TextWrapping="Wrap" Text="普通用户无需展开。这里保留 Quick 候选、字典、Mask / Hybrid、字符集、长度范围和技术信息。" />
+            <Border Grid.Row="12" Style="{StaticResource CardStyle}" Padding="0">
+                <Expander x:Name="AdvancedSettingsExpander" IsExpanded="False" Padding="16,14" Background="Transparent" BorderThickness="0">
+                    <Expander.Header>
+                        <Grid>
+                            <Grid.ColumnDefinitions>
+                                <ColumnDefinition Width="Auto" />
+                                <ColumnDefinition Width="9" />
+                                <ColumnDefinition Width="Auto" />
+                            </Grid.ColumnDefinitions>
+                            <TextBlock Grid.Column="0" FontFamily="Segoe MDL2 Assets" FontSize="15" Foreground="{StaticResource TextMutedBrush}" Text="&#xE713;" />
+                            <TextBlock Grid.Column="2" FontSize="14" FontWeight="SemiBold" Foreground="{StaticResource TextBodyBrush}" Text="高级设置（可选）" />
+                        </Grid>
+                    </Expander.Header>
+                    <StackPanel>
+                    <TextBlock Margin="0,0,0,14" TextWrapping="Wrap" Style="{StaticResource HelperTextStyle}" Text="普通用户无需展开。这里保留 Quick 候选、字典、Mask / Hybrid、字符集、长度范围和技术信息。" />
                     <Grid>
                         <Grid.ColumnDefinitions>
                             <ColumnDefinition Width="125" />
@@ -379,32 +644,33 @@ New-Item -ItemType Directory -Path $runtimeRoot -Force | Out-Null
                             <RowDefinition Height="8" />
                             <RowDefinition Height="Auto" />
                         </Grid.RowDefinitions>
-                        <TextBlock Grid.Row="0" Grid.Column="0" VerticalAlignment="Top" Text="Quick 候选" />
+                        <TextBlock Grid.Row="0" Grid.Column="0" VerticalAlignment="Top" Style="{StaticResource DetailLabelStyle}" Text="Quick 候选" />
                         <TextBox x:Name="QuickCandidatesBox" Grid.Row="0" Grid.Column="1" Grid.ColumnSpan="5" Height="72" AcceptsReturn="True" VerticalScrollBarVisibility="Auto" TextWrapping="Wrap" ToolTip="每行输入一个准确候选密码" />
-                        <TextBlock Grid.Row="2" Grid.Column="0" VerticalAlignment="Center" Text="本地字典" />
-                        <TextBox x:Name="DictionaryPathBox" Grid.Row="2" Grid.Column="1" MinHeight="28" VerticalContentAlignment="Center" />
-                        <Button x:Name="BrowseDictionaryButton" Grid.Row="2" Grid.Column="2" Grid.ColumnSpan="2" MinHeight="28" Content="选择文件" />
+                        <TextBlock Grid.Row="2" Grid.Column="0" VerticalAlignment="Center" Style="{StaticResource DetailLabelStyle}" Text="本地字典" />
+                        <TextBox x:Name="DictionaryPathBox" Grid.Row="2" Grid.Column="1" MinHeight="32" VerticalContentAlignment="Center" />
+                        <Button x:Name="BrowseDictionaryButton" Grid.Row="2" Grid.Column="2" Grid.ColumnSpan="2" MinHeight="32" Content="选择文件" />
                         <CheckBox x:Name="TryEmptyPasswordBox" Grid.Row="2" Grid.Column="4" Grid.ColumnSpan="2" VerticalAlignment="Center" Content="先尝试空密码" />
-                        <TextBlock Grid.Row="4" Grid.Column="0" VerticalAlignment="Center" Text="Mask / Hybrid" />
-                        <TextBox x:Name="MaskBox" Grid.Row="4" Grid.Column="1" MinHeight="28" VerticalContentAlignment="Center" ToolTip="示例：Summer?d?d、?w?d?d、?u?l?l?d?d" />
-                        <TextBlock Grid.Row="4" Grid.Column="2" Grid.ColumnSpan="4" Margin="10,0,0,0" VerticalAlignment="Center" TextWrapping="Wrap" Text="?l 小写，?u 大写，?d 数字，?s 符号，?a 全部字符，?w 一个字典词，?? 为字面量问号。" />
-                        <TextBlock Grid.Row="6" Grid.Column="0" VerticalAlignment="Center" Text="穷举范围" />
-                        <ComboBox x:Name="CharacterSetBox" Grid.Row="6" Grid.Column="1" MinHeight="28" />
-                        <TextBox x:Name="CustomCharacterSetBox" Grid.Row="6" Grid.Column="2" MinHeight="28" Margin="10,0,0,0" ToolTip="仅在选择自定义字符集时使用" />
-                        <TextBlock Grid.Row="6" Grid.Column="3" VerticalAlignment="Center" Margin="10,0,0,0" Text="最小" />
-                        <TextBox x:Name="MinLengthBox" Grid.Row="6" Grid.Column="4" MinHeight="28" Text="1" VerticalContentAlignment="Center" />
-                        <TextBox x:Name="MaxLengthBox" Grid.Row="6" Grid.Column="5" MinHeight="28" Text="4" VerticalContentAlignment="Center" ToolTip="最大长度" />
+                        <TextBlock Grid.Row="4" Grid.Column="0" VerticalAlignment="Center" Style="{StaticResource DetailLabelStyle}" Text="Mask / Hybrid" />
+                        <TextBox x:Name="MaskBox" Grid.Row="4" Grid.Column="1" MinHeight="32" VerticalContentAlignment="Center" ToolTip="示例：Summer?d?d、?w?d?d、?u?l?l?d?d" />
+                        <TextBlock Grid.Row="4" Grid.Column="2" Grid.ColumnSpan="4" Margin="10,0,0,0" VerticalAlignment="Center" TextWrapping="Wrap" Style="{StaticResource HelperTextStyle}" Text="?l 小写，?u 大写，?d 数字，?s 符号，?a 全部字符，?w 一个字典词，?? 为字面量问号。" />
+                        <TextBlock Grid.Row="6" Grid.Column="0" VerticalAlignment="Center" Style="{StaticResource DetailLabelStyle}" Text="穷举范围" />
+                        <ComboBox x:Name="CharacterSetBox" Grid.Row="6" Grid.Column="1" MinHeight="32" />
+                        <TextBox x:Name="CustomCharacterSetBox" Grid.Row="6" Grid.Column="2" MinHeight="32" Margin="10,0,0,0" ToolTip="仅在选择自定义字符集时使用" />
+                        <TextBlock Grid.Row="6" Grid.Column="3" VerticalAlignment="Center" Margin="10,0,0,0" Style="{StaticResource DetailLabelStyle}" Text="最小" />
+                        <TextBox x:Name="MinLengthBox" Grid.Row="6" Grid.Column="4" MinHeight="32" Text="1" VerticalContentAlignment="Center" />
+                        <TextBox x:Name="MaxLengthBox" Grid.Row="6" Grid.Column="5" MinHeight="32" Text="4" VerticalContentAlignment="Center" ToolTip="最大长度" />
                     </Grid>
-                    <TextBlock x:Name="AdvancedDeviceInfoText" Margin="0,14,0,0" TextWrapping="Wrap" Foreground="#687789" />
+                    <TextBlock x:Name="AdvancedDeviceInfoText" Margin="0,14,0,0" TextWrapping="Wrap" Style="{StaticResource HelperTextStyle}" />
                     <Button x:Name="OpenJobButton" Width="150" Margin="0,12,0,0" HorizontalAlignment="Left" Content="打开已保存任务" />
-                    <TextBlock Margin="0,12,0,0" Foreground="#687789" TextWrapping="Wrap" Text="清除此压缩包由本工具保存的任务进度、断点、临时运行数据和测试状态，不会删除原压缩包或用户字典。" />
+                    <TextBlock Margin="0,12,0,0" TextWrapping="Wrap" Style="{StaticResource HelperTextStyle}" Text="清除此压缩包由本工具保存的任务进度、断点、临时运行数据和测试状态，不会删除原压缩包或用户字典。" />
                     <StackPanel Orientation="Horizontal" Margin="0,8,0,0">
-                        <Button x:Name="ResetCurrentArchiveButton" Width="190" MinHeight="28" HorizontalAlignment="Left" Content="恢复初始化（当前压缩包）" />
-                        <Button x:Name="ClearPerformanceProfilesButton" Width="150" Margin="10,0,0,0" MinHeight="28" HorizontalAlignment="Left" Content="清理性能估算缓存" />
+                        <Button x:Name="ResetCurrentArchiveButton" Width="190" MinHeight="32" HorizontalAlignment="Left" Content="恢复初始化（当前压缩包）" />
+                        <Button x:Name="ClearPerformanceProfilesButton" Width="150" Margin="10,0,0,0" MinHeight="32" HorizontalAlignment="Left" Content="清理性能估算缓存" />
                     </StackPanel>
                     <TextBox x:Name="LogBox" Height="130" Margin="0,14,0,0" IsReadOnly="True" TextWrapping="Wrap" VerticalScrollBarVisibility="Auto" Background="#20242B" Foreground="#E6EDF3" BorderThickness="0" Padding="10" />
-                </StackPanel>
-            </Expander>
+                    </StackPanel>
+                </Expander>
+            </Border>
         </Grid>
     </ScrollViewer>
 </Window>
