@@ -45,6 +45,11 @@ function Apply-TestNativeAppendRule {
 
 $workerPath = Join-Path $srcRoot 'RecoveryWorker.ps1'
 $workerText = [System.IO.File]::ReadAllText($workerPath)
+$workerTokens = $null
+$workerParseErrors = $null
+[System.Management.Automation.Language.Parser]::ParseInput($workerText, [ref]$workerTokens, [ref]$workerParseErrors) | Out-Null
+if ($null -ne $workerParseErrors -and $workerParseErrors.Count -gt 0) { throw 'RecoveryWorker.ps1 contains a PowerShell parse error.' }
+Assert-True ($workerText.Contains("'--encoding-from'") -and $workerText.Contains("'--encoding-to'") -and $workerText.Contains("'--wordlist-autohex-disable'") -and $workerText.Contains("'--outfile-autohex-disable'")) 'Hashcat did not receive the explicit UTF-8 and literal-wordlist encoding flags.'
 $tokens = $null
 $parseErrors = $null
 $workerAst = [System.Management.Automation.Language.Parser]::ParseInput($workerText, [ref]$tokens, [ref]$parseErrors)
@@ -88,6 +93,10 @@ try {
 
     $appendPlan = New-HashcatAttackPlan -Job ([pscustomobject]@{ Strategy = 'Rules'; PlanKind = 'RuleAppendVariants'; RuleFamily = 'Append'; DictionaryPath = 'dictionary.txt' }) -HashPath 'hash.txt' -JobDirectory $testRoot -RecoveryPlanYear 2026 -Strategy 'Rules'
     Assert-True (@($appendPlan.Arguments) -contains '-r' -and -not (@($appendPlan.Arguments) -contains '-j')) 'RuleAppendVariants did not use its native append rule file.'
+    $unicodeDictionary = Join-Path $testRoot 'unicode-dictionary.txt'
+    [System.IO.File]::WriteAllText($unicodeDictionary, ([string]([char]0x4E2D) + [string]([char]0x6587) + [Environment]::NewLine), (New-Object System.Text.UTF8Encoding($false)))
+    $unicodeAppendPlan = New-HashcatAttackPlan -Job ([pscustomobject]@{ Strategy = 'Rules'; PlanKind = 'RuleAppendVariants'; RuleFamily = 'Append'; DictionaryPath = $unicodeDictionary }) -HashPath 'hash.txt' -JobDirectory $testRoot -RecoveryPlanYear 2026 -Strategy 'Rules'
+    Assert-True (-not [bool]$unicodeAppendPlan.Supported -and [string]$unicodeAppendPlan.Message -match '(?i)non-ASCII|Unicode') 'RuleAppendVariants did not fall back for a non-ASCII UTF-8 dictionary.'
 
     $digitItems = @(
         [pscustomobject]@{ CoverageId = 'mask:digits:1to4'; DisplayName = 'digits 1-4'; Kind = 'MaskRange'; EngineStrategy = 'BruteForce'; CharacterSet = 'digits'; MinimumLength = 1; MaximumLength = 4; CandidateCount = 11110L; StageNumber = 4; GpuSupported = $true },

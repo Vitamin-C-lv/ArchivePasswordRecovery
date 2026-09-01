@@ -54,21 +54,23 @@ function Invoke-SevenZipCommand {
         [Parameter(Mandatory = $true)][string[]]$Arguments
     )
 
-    # A wrong password is an expected probe result. Keep native stderr with this
-    # invocation instead of allowing the caller's Stop preference to terminate it.
-    $previousErrorActionPreference = $ErrorActionPreference
-    try {
-        $ErrorActionPreference = 'Continue'
-        $output = @(& $SevenZip @Arguments 2>&1 | ForEach-Object { $_.ToString() })
-        $exitCode = $LASTEXITCODE
-    }
-    finally {
-        $ErrorActionPreference = $previousErrorActionPreference
+    # A wrong password is an expected probe result. Use the same Unicode
+    # ProcessStartInfo argument boundary as the other local tools instead of
+    # PowerShell 5.1's native invocation, which can reinterpret non-ASCII
+    # password arguments through the active console code page.
+    # -sccUTF-8 pins console and list-file text output/input. ProcessStartInfo
+    # still passes the candidate as a Unicode Windows argument; the ZIP ACP
+    # byte contract is handled by the format-aware John profile and the local
+    # verifier rather than by silently re-encoding the candidate here.
+    $native = Invoke-LocalNativeProcess -FilePath $SevenZip -Arguments (@('-sccUTF-8') + $Arguments)
+    $output = New-Object 'System.Collections.Generic.List[string]'
+    foreach ($line in @(([string]$native.StdOut -split '\r?\n') + ([string]$native.StdErr -split '\r?\n'))) {
+        if (-not [string]::IsNullOrEmpty([string]$line)) { [void]$output.Add([string]$line) }
     }
 
     return [pscustomobject]@{
-        ExitCode = $exitCode
-        Output   = $output
+        ExitCode = [int]$native.ExitCode
+        Output   = $output.ToArray()
     }
 }
 
@@ -439,7 +441,10 @@ function Get-CanonicalQuickCandidates {
     foreach ($candidate in @($Candidates)) {
         if ($null -eq $candidate) { continue }
         $text = [string]$candidate
-        if ([string]::IsNullOrWhiteSpace($text)) { continue }
+        # A quick candidate is an exact password. Only an actually empty row
+        # is omitted; spaces, full-width spaces, and other Unicode whitespace
+        # are valid password characters and must not be normalized away.
+        if ([string]::IsNullOrEmpty($text)) { continue }
         if ($seen.Add($text)) { [void]$canonical.Add($text) }
     }
     return $canonical.ToArray()
@@ -952,21 +957,38 @@ function Invoke-LocalNativeProcess {
     $startInfo.CreateNoWindow = $true
     $startInfo.RedirectStandardOutput = $true
     $startInfo.RedirectStandardError = $true
+    # Candidate dictionaries, extractor records, and backend diagnostics are
+    # application-owned UTF-8 streams. Do not let the Windows console code
+    # page reinterpret Unicode passwords when a native process is redirected.
+    try {
+        $startInfo.StandardOutputEncoding = New-Object System.Text.UTF8Encoding($false)
+        $startInfo.StandardErrorEncoding = New-Object System.Text.UTF8Encoding($false)
+    }
+    catch {
+        # Older .NET Framework builds may not expose these setters. The local
+        # file readers remain explicitly UTF-8 and the caller keeps its CPU
+        # fallback if the native tool cannot consume the stream.
+    }
     if (-not [string]::IsNullOrWhiteSpace($WorkingDirectory)) {
         $startInfo.WorkingDirectory = $WorkingDirectory
     }
 
     $process = New-Object System.Diagnostics.Process
-    $process.StartInfo = $startInfo
-    [void]$process.Start()
-    $standardOutputTask = $process.StandardOutput.ReadToEndAsync()
-    $standardErrorTask = $process.StandardError.ReadToEndAsync()
-    $process.WaitForExit()
+    try {
+        $process.StartInfo = $startInfo
+        [void]$process.Start()
+        $standardOutputTask = $process.StandardOutput.ReadToEndAsync()
+        $standardErrorTask = $process.StandardError.ReadToEndAsync()
+        $process.WaitForExit()
 
-    return [pscustomobject]@{
-        ExitCode = $process.ExitCode
-        StdOut   = $standardOutputTask.GetAwaiter().GetResult()
-        StdErr   = $standardErrorTask.GetAwaiter().GetResult()
+        return [pscustomobject]@{
+            ExitCode = $process.ExitCode
+            StdOut   = $standardOutputTask.GetAwaiter().GetResult()
+            StdErr   = $standardErrorTask.GetAwaiter().GetResult()
+        }
+    }
+    finally {
+        $process.Dispose()
     }
 }
 
@@ -2944,7 +2966,8 @@ function ConvertTo-CapitalInitialVariant {
     )
 
     if ($Word.Length -eq 0) { return $null }
-    $variant = $Word.Substring(0, 1).ToUpperInvariant() + $Word.Substring(1)
+    $firstScalar = @(Get-UnicodeScalarSequence -Text $Word)[0]
+    $variant = [string]$firstScalar.ToUpperInvariant() + $Word.Substring(([string]$firstScalar).Length)
     if ([string]::Equals($variant, $Word, [System.StringComparison]::Ordinal)) { return $null }
     return $variant
 }
@@ -4436,10 +4459,11 @@ function Get-RecoveryLevel5PlanItems {
     }
 
     $characters = Get-CharsetCharacters -Kind $characterSet -CustomCharacters ([string]$Job.CustomCharacters)
+    $characterCount = Get-CharsetCharacterCount -Characters $characters
     $addRange = {
         param([int]$RangeMinimum, [int]$RangeMaximum, [string]$CoverageName, [string]$DisplayName)
         if ($RangeMinimum -gt $RangeMaximum) { return }
-        $count = Get-VariableMaskCandidateCount -Base $characters.Length -MinimumLength $RangeMinimum -MaximumLength $RangeMaximum
+        $count = Get-VariableMaskCandidateCount -Base $characterCount -MinimumLength $RangeMinimum -MaximumLength $RangeMaximum
         $items.Add([pscustomobject]@{
                 CoverageId = ('bruteforce:L5-{0}:v2:{1}-{2}' -f $CoverageName, $RangeMinimum, $RangeMaximum); Kind = 'MaskRange'; DisplayName = $DisplayName; EngineStrategy = 'BruteForce';
                 CharacterSet = $characterSet; MinimumLength = $RangeMinimum; MaximumLength = $RangeMaximum; CandidateCount = $count; GpuSupported = $true
@@ -4468,11 +4492,11 @@ function Get-RecoveryLevel5PlanItems {
             return $items.ToArray()
         }
         'custom' {
-            $identity = ('{0}:{1}' -f $characters.Length, $characters)
+            $identity = ('{0}:{1}' -f $characterCount, $characters)
             $items.Add([pscustomobject]@{
                     CoverageId = ('bruteforce:L5-custom:v2:{0}-{1}:{2}' -f $minimum, $maximum, $identity); Kind = 'ConfiguredBruteForce';
                     DisplayName = ('完整搜索 {0}–{1} 位自定义字符集' -f $minimum, $maximum); EngineStrategy = 'BruteForce'; CharacterSet = 'custom';
-                    MinimumLength = $minimum; MaximumLength = $maximum; CandidateCount = (Get-VariableMaskCandidateCount -Base $characters.Length -MinimumLength $minimum -MaximumLength $maximum); GpuSupported = $true
+                    MinimumLength = $minimum; MaximumLength = $maximum; CandidateCount = (Get-VariableMaskCandidateCount -Base $characterCount -MinimumLength $minimum -MaximumLength $maximum); GpuSupported = $true
                 })
             return $items.ToArray()
         }
@@ -4666,6 +4690,10 @@ function Get-HashcatStrategySupport {
             return [pscustomobject]@{ Supported = $true; Message = 'Dictionary rules can use the local Hashcat GPU backend.' }
         }
         'Mask' {
+            if ($Job.PSObject.Properties.Name -contains 'Mask' -and
+                (Test-TextContainsNonAscii -Text ([string]$Job.Mask))) {
+                return [pscustomobject]@{ Supported = $false; Message = 'A mask contains non-ASCII Unicode literals; the exact local CPU path remains available.' }
+            }
             $tokens = @(Get-MaskTokens -Mask ([string]$Job.Mask))
             $wordPositions = @($tokens | ForEach-Object -Begin { $index = 0 } -Process {
                     $current = $index
@@ -4681,6 +4709,10 @@ function Get-HashcatStrategySupport {
             return [pscustomobject]@{ Supported = $true; Message = 'Capital-initial dictionary words with numeric suffixes can use the local Hashcat GPU backend.' }
         }
         'BruteForce' {
+            if ([string]$Job.CharacterSet -eq 'custom' -and
+                (Test-TextContainsNonAscii -Text ([string]$Job.CustomCharacters))) {
+                return [pscustomobject]@{ Supported = $false; Message = 'A custom character set contains non-ASCII Unicode; the exact local CPU path remains available.' }
+            }
             return [pscustomobject]@{ Supported = $true; Message = 'This brute-force range can use the local Hashcat GPU backend.' }
         }
         default {
@@ -4741,6 +4773,92 @@ function New-HashcatRuleFile {
     return $rulePath
 }
 
+function Test-TextFileContainsNonAscii {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][string]$Path
+    )
+
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { return $false }
+    $reader = New-StrictUtf8Reader -Path $Path
+    try {
+        while ($null -ne ($line = $reader.ReadLine())) {
+            foreach ($character in $line.ToCharArray()) {
+                if ([int][char]$character -gt 0x7F) { return $true }
+            }
+        }
+    }
+    finally {
+        $reader.Dispose()
+    }
+    return $false
+}
+
+function Test-TextFileUtf8 {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][string]$Path
+    )
+
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { return $false }
+    $reader = $null
+    try {
+        $reader = New-StrictUtf8Reader -Path $Path
+        while ($null -ne $reader.ReadLine()) { }
+        return $true
+    }
+    catch {
+        return $false
+    }
+    finally {
+        if ($null -ne $reader) { $reader.Dispose() }
+    }
+}
+
+function New-StrictUtf8Reader {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][string]$Path
+    )
+
+    $encoding = New-Object System.Text.UTF8Encoding($false, $true)
+    $stream = [System.IO.File]::Open($Path, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::Read)
+    try {
+        $prefix = New-Object byte[] 4
+        $read = $stream.Read($prefix, 0, $prefix.Length)
+        $offset = 0L
+        if ($read -ge 4 -and (($prefix[0] -eq 0xFF -and $prefix[1] -eq 0xFE -and $prefix[2] -eq 0x00 -and $prefix[3] -eq 0x00) -or
+                ($prefix[0] -eq 0x00 -and $prefix[1] -eq 0x00 -and $prefix[2] -eq 0xFE -and $prefix[3] -eq 0xFF))) {
+            throw 'The text file must be UTF-8; UTF-32 BOM is not supported.'
+        }
+        if ($read -ge 2 -and (($prefix[0] -eq 0xFF -and $prefix[1] -eq 0xFE) -or
+                ($prefix[0] -eq 0xFE -and $prefix[1] -eq 0xFF))) {
+            throw 'The text file must be UTF-8; UTF-16 BOM is not supported.'
+        }
+        if ($read -ge 3 -and $prefix[0] -eq 0xEF -and $prefix[1] -eq 0xBB -and $prefix[2] -eq 0xBF) {
+            $offset = 3L
+        }
+        $stream.Position = $offset
+        return New-Object System.IO.StreamReader($stream, $encoding, $false)
+    }
+    catch {
+        $stream.Dispose()
+        throw
+    }
+}
+
+function Test-TextContainsNonAscii {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][AllowEmptyString()][string]$Text
+    )
+
+    foreach ($character in $Text.ToCharArray()) {
+        if ([int][char]$character -gt 0x7F) { return $true }
+    }
+    return $false
+}
+
 function New-HashcatAttackPlan {
     [CmdletBinding()]
     param(
@@ -4753,6 +4871,24 @@ function New-HashcatAttackPlan {
 
     if ([string]::IsNullOrWhiteSpace($Strategy)) {
         $Strategy = [string]$Job.Strategy
+    }
+
+    $dictionaryPath = [string](Get-ObjectPropertyValue -Object $Job -Name 'DictionaryPath' -Default '')
+    if (-not [string]::IsNullOrWhiteSpace($dictionaryPath) -and
+        (Test-Path -LiteralPath $dictionaryPath -PathType Leaf) -and
+        -not (Test-TextFileUtf8 -Path $dictionaryPath)) {
+        return [pscustomobject]@{
+            Supported = $false
+            Message = 'The selected dictionary is not valid UTF-8; the local CPU path remains available.'
+        }
+    }
+
+    if ($Strategy -eq 'Mask' -and $Job.PSObject.Properties.Name -contains 'Mask' -and
+        (Test-TextContainsNonAscii -Text ([string]$Job.Mask))) {
+        return [pscustomobject]@{
+            Supported = $false
+            Message = 'The mask contains non-ASCII Unicode literals; the exact local CPU path remains available.'
+        }
     }
 
     switch ($Strategy) {
@@ -4773,6 +4909,14 @@ function New-HashcatAttackPlan {
             $ruleFamily = if ($Job.PSObject.Properties.Name -contains 'RuleFamily') { [string]$Job.RuleFamily } else { '' }
             if ([string]::IsNullOrWhiteSpace($ruleFamily)) {
                 $ruleFamily = if ($planKind -eq 'RuleAppendVariants') { 'Append' } else { 'All' }
+            }
+            if ($ruleFamily -in @('Case', 'CapitalInitial', 'Append') -and
+                -not [string]::IsNullOrWhiteSpace([string]$Job.DictionaryPath) -and
+                (Test-TextFileContainsNonAscii -Path ([string]$Job.DictionaryPath))) {
+                return [pscustomobject]@{
+                    Supported = $false
+                    Message = 'The selected native Hashcat rule is unsafe for a non-ASCII UTF-8 dictionary; the CPU Unicode path remains available.'
+                }
             }
             # The legacy RuleCase stream omits no-op variants and performs
             # ordinal deduplication. Hashcat's l/u rule pair cannot preserve
@@ -4835,6 +4979,13 @@ function New-HashcatAttackPlan {
             }
         }
         'CapitalInitialDigits' {
+            if (-not [string]::IsNullOrWhiteSpace([string]$Job.DictionaryPath) -and
+                (Test-TextFileContainsNonAscii -Path ([string]$Job.DictionaryPath))) {
+                return [pscustomobject]@{
+                    Supported = $false
+                    Message = 'Hashcat native capital-initial rules are unsafe for a non-ASCII UTF-8 dictionary; the CPU Unicode path remains available.'
+                }
+            }
             $maskDefinition = Get-HashcatMaskDefinition -Tokens @(Get-MaskTokens -Mask '?d?d?d?d')
             return [pscustomobject]@{
                 Supported = $true
@@ -4847,6 +4998,14 @@ function New-HashcatAttackPlan {
         }
         'BruteForce' {
             $characters = Get-CharsetCharacters -Kind ([string]$Job.CharacterSet) -CustomCharacters ([string]$Job.CustomCharacters)
+            $characterCount = Get-CharsetCharacterCount -Characters $characters
+            if ([string]$Job.CharacterSet -eq 'custom' -and
+                (Test-TextContainsNonAscii -Text ([string]$Job.CustomCharacters))) {
+                return [pscustomobject]@{
+                    Supported = $false
+                    Message = 'The custom character set contains non-ASCII Unicode; the exact local CPU path remains available.'
+                }
+            }
             $mask = ((1..[int]$Job.MaxLength | ForEach-Object { '?1' }) -join '')
             return [pscustomobject]@{
                 Supported = $true
@@ -4895,15 +5054,45 @@ function Get-CharsetCharacters {
             if ([string]::IsNullOrEmpty($CustomCharacters)) {
                 throw 'A custom character set was selected but contains no characters.'
             }
-            $seen = New-Object 'System.Collections.Generic.HashSet[char]'
+            $seen = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::Ordinal)
             $canonical = New-Object System.Text.StringBuilder
-            foreach ($character in $CustomCharacters.ToCharArray()) {
-                if ($seen.Add($character)) { [void]$canonical.Append($character) }
+            foreach ($character in @(Get-UnicodeScalarSequence -Text $CustomCharacters)) {
+                if ($seen.Add([string]$character)) { [void]$canonical.Append([string]$character) }
             }
             return $canonical.ToString()
         }
         default { throw "Unsupported character set: $Kind" }
     }
+}
+
+function Get-UnicodeScalarSequence {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][AllowEmptyString()][string]$Text
+    )
+
+    $scalars = New-Object 'System.Collections.Generic.List[string]'
+    $position = 0
+    while ($position -lt $Text.Length) {
+        $length = 1
+        $current = [char]$Text[$position]
+        if ([char]::IsHighSurrogate($current) -and $position + 1 -lt $Text.Length -and
+            [char]::IsLowSurrogate([char]$Text[$position + 1])) {
+            $length = 2
+        }
+        [void]$scalars.Add($Text.Substring($position, $length))
+        $position += $length
+    }
+    return $scalars.ToArray()
+}
+
+function Get-CharsetCharacterCount {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][AllowEmptyString()][string]$Characters
+    )
+
+    return [int](@(Get-UnicodeScalarSequence -Text $Characters).Count)
 }
 
 function Get-PowerWithinInt64 {
@@ -4929,24 +5118,45 @@ function Convert-IndexToCandidate {
     param(
         [Parameter(Mandatory = $true)][long]$Index,
         [Parameter(Mandatory = $true)][int]$Length,
-        [Parameter(Mandatory = $true)][string]$Characters
+        [Parameter(Mandatory = $true)]$Characters
     )
 
-    if ($Characters.Length -eq 0) {
+    $characterList = if ($Characters -is [string]) {
+        @(Get-UnicodeScalarSequence -Text ([string]$Characters))
+    }
+    else {
+        @($Characters | ForEach-Object { [string]$_ })
+    }
+    if ($characterList.Count -eq 0) {
         throw 'Cannot generate candidates from an empty character set.'
     }
 
-    $output = New-Object char[] $Length
+    $output = New-Object 'System.Collections.Generic.List[string]'
     [long]$remaining = $Index
-    [long]$base = $Characters.Length
+    [long]$base = $characterList.Count
 
     for ($position = $Length - 1; $position -ge 0; $position--) {
         $characterIndex = [int]($remaining % $base)
-        $output[$position] = $Characters[$characterIndex]
+        $output.Insert(0, [string]$characterList[$characterIndex])
         $remaining = [long][math]::Floor($remaining / $base)
     }
 
-    return (-join $output)
+    return $output.ToArray() -join ''
+}
+
+function Get-LastUnicodeScalar {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][AllowEmptyString()][string]$Text
+    )
+
+    if ($Text.Length -eq 0) { return '' }
+    $start = $Text.Length - 1
+    if ($start -gt 0 -and [char]::IsLowSurrogate([char]$Text[$start]) -and
+        [char]::IsHighSurrogate([char]$Text[$start - 1])) {
+        $start--
+    }
+    return $Text.Substring($start, $Text.Length - $start)
 }
 
 function Get-RuleVariants {
@@ -4974,7 +5184,7 @@ function Get-RuleVariants {
         [void]$proposals.Add($Word + '!')
         [void]$proposals.Add($Word + ($year - 1))
         [void]$proposals.Add($Word + $year)
-        [void]$proposals.Add($Word + $Word[$Word.Length - 1])
+        [void]$proposals.Add($Word + (Get-LastUnicodeScalar -Text $Word))
     }
 
     foreach ($proposal in $proposals) {
@@ -5003,8 +5213,13 @@ function Get-MaskTokens {
     while ($position -lt $Mask.Length) {
         $character = $Mask[$position]
         if ($character -ne '?') {
-            $tokens.Add([pscustomobject]@{ Kind = 'Literal'; Text = [string]$character; Characters = '' })
-            $position++
+            $literalLength = 1
+            if ([char]::IsHighSurrogate([char]$character) -and $position + 1 -lt $Mask.Length -and
+                [char]::IsLowSurrogate([char]$Mask[$position + 1])) {
+                $literalLength = 2
+            }
+            $tokens.Add([pscustomobject]@{ Kind = 'Literal'; Text = $Mask.Substring($position, $literalLength); Characters = '' })
+            $position += $literalLength
             continue
         }
 
@@ -5114,9 +5329,10 @@ function Get-StrategyCandidateCount {
         }
         'BruteForce' {
             $characters = Get-CharsetCharacters -Kind ([string]$Job.CharacterSet) -CustomCharacters ([string]$Job.CustomCharacters)
+            $characterCount = Get-CharsetCharacterCount -Characters $characters
             [decimal]$total = 0
             for ($length = [int]$Job.MinLength; $length -le [int]$Job.MaxLength; $length++) {
-                $part = Get-PowerWithinInt64 -Base $characters.Length -Exponent $length
+                $part = Get-PowerWithinInt64 -Base $characterCount -Exponent $length
                 if ($null -eq $part) { return $null }
                 $total += $part
                 if ($total -gt [long]::MaxValue) { return $null }
@@ -5338,8 +5554,13 @@ Export-ModuleMember -Function @(
     'Get-HashcatMaskDefinition',
     'Get-HashcatStrategySupport',
     'New-HashcatRuleFile',
+    'Test-TextFileContainsNonAscii',
+    'Test-TextFileUtf8',
+    'New-StrictUtf8Reader',
+    'Test-TextContainsNonAscii',
     'New-HashcatAttackPlan',
     'Get-CharsetCharacters',
+    'Get-CharsetCharacterCount',
     'Get-PowerWithinInt64',
     'Convert-IndexToCandidate',
     'Get-RuleVariants',

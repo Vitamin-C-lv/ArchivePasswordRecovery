@@ -1603,7 +1603,7 @@ function Restore-SavedDeviceChoice {
 function Get-QuickCandidateList {
     $items = New-Object 'System.Collections.Generic.List[string]'
     foreach ($line in ($controls.QuickCandidatesBox.Text -split "`r?`n")) {
-        if (-not [string]::IsNullOrWhiteSpace($line)) {
+        if (-not [string]::IsNullOrEmpty($line)) {
             $items.Add($line)
         }
     }

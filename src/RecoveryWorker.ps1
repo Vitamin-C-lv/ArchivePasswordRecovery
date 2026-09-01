@@ -79,6 +79,7 @@ $script:JohnLastOutputPath = $null
 $script:JohnLastErrorPath = $null
 $script:JohnLastSpeed = 0.0
 $script:JohnWordlistSourceMode = 'NOT_USED'
+$script:JohnEncodingMode = 'NOT_USED'
 $script:JohnPauseResume = 'NOT_VERIFIED'
 $script:JohnCandidateProgressReliable = $true
 $script:NanaZipVerifierProcessLaunchCount = 0
@@ -2048,6 +2049,7 @@ function Publish-ProgressCore {
         JohnLastMessage = [string]$script:JohnLastMessage
         JohnBinaryUsed = [string]$script:JohnBinaryUsed
         JohnWordlistSourceMode = [string]$script:JohnWordlistSourceMode
+        JohnEncodingMode = [string]$script:JohnEncodingMode
         JohnProcessLaunchCount = [int]$script:JohnProcessLaunchCount
         JohnActiveSearchMs = [long]$script:JohnActiveSearchMs
         JohnLastSpeed = if ($script:JohnLastSpeed -gt 0) { [math]::Round($script:JohnLastSpeed, 2) } else { $null }
@@ -2592,7 +2594,7 @@ function Set-WorkerRecoveredBatchProgress {
 
     [long]$candidateIndex = 0
     [long]$recoveredIndex = -1
-    $reader = New-Object System.IO.StreamReader([string]$script:ActiveGpuBatch.CandidatePath, $true)
+    $reader = New-WorkerUtf8Reader -Path ([string]$script:ActiveGpuBatch.CandidatePath)
     try {
         while ($null -ne ($line = $reader.ReadLine())) {
             if ([string]::Equals([string]$line, $Candidate, [System.StringComparison]::Ordinal)) {
@@ -2740,6 +2742,15 @@ function Invoke-QuickRecovery {
     }
 }
 
+function New-WorkerUtf8Reader {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][string]$Path
+    )
+
+    return New-StrictUtf8Reader -Path $Path
+}
+
 function Invoke-DictionaryRecovery {
     [CmdletBinding()]
     param(
@@ -2748,7 +2759,7 @@ function Invoke-DictionaryRecovery {
         [switch]$UseRules
     )
 
-    $reader = New-Object System.IO.StreamReader(([string]$job.DictionaryPath), $true)
+    $reader = New-WorkerUtf8Reader -Path ([string]$job.DictionaryPath)
     try {
         [long]$position = 0
         while ($null -ne ($word = $reader.ReadLine())) {
@@ -2798,13 +2809,48 @@ function Add-JohnCandidateLine {
     $Position.Value = $current + 1L
 }
 
+function Get-JohnEncodingProfile {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][string]$ArchiveFormat
+    )
+
+    if ([string]$ArchiveFormat -match '(?i)^zip$') {
+        # The local ZIP decoder converts the Unicode candidate through the
+        # Windows active ANSI code page. John accepts ISO-8859-1 as a raw byte
+        # input mode, so write the UTF-16 candidate string to a strict ACP
+        # wordlist and let John pass those bytes unchanged to its ZIP format.
+        $encoderFallback = New-Object System.Text.EncoderExceptionFallback
+        $decoderFallback = New-Object System.Text.DecoderExceptionFallback
+        $acp = [System.Text.Encoding]::GetEncoding([System.Text.Encoding]::Default.CodePage, $encoderFallback, $decoderFallback)
+        return [pscustomobject]@{
+            Name = 'WINDOWS_ACP'
+            JohnOption = 'ISO-8859-1'
+            TextEncoding = $acp
+            Message = ('ZIP candidates use the Windows active ANSI code page (CP{0}) for the local decoder.' -f $acp.CodePage)
+        }
+    }
+
+    $utf8 = New-Object System.Text.UTF8Encoding($false, $true)
+    return [pscustomobject]@{
+        Name = 'UTF-8'
+        JohnOption = 'UTF-8'
+        TextEncoding = $utf8
+        Message = 'Candidates use the application-owned strict UTF-8 wordlist contract.'
+    }
+}
+
 function New-JohnCandidateWordlist {
     [CmdletBinding()]
     param(
         [string]$Strategy = '',
         $Item = $null,
-        [long]$SkipCount = 0L
+        [long]$SkipCount = 0L,
+        $EncodingProfile = $null
     )
+
+    if ($null -eq $EncodingProfile) { $EncodingProfile = Get-JohnEncodingProfile -ArchiveFormat '7Z' }
+    $candidateEncoding = $EncodingProfile.TextEncoding
 
     $isCumulativeItem = $null -ne $Item
     $kind = if ($isCumulativeItem) { [string](Get-ObjectPropertyValue -Object $Item -Name 'Kind' -Default '') } else { '' }
@@ -2837,7 +2883,7 @@ function New-JohnCandidateWordlist {
         [long]$finitePosition = 0L
         try {
             New-Item -ItemType Directory -Path $wordlistDirectory -Force -ErrorAction Stop | Out-Null
-            $finiteWriter = New-Object System.IO.StreamWriter($wordlistPath, $false, (New-Object System.Text.UTF8Encoding($false)))
+            $finiteWriter = New-Object System.IO.StreamWriter($wordlistPath, $false, $candidateEncoding)
             if ($kind -eq 'Quick') {
                 foreach ($candidate in @($Item.Candidates)) {
                     Add-JohnCandidateLine -Writer $finiteWriter -Candidate ([string]$candidate) -SkipCount $SkipCount -Position ([ref]$finitePosition)
@@ -2888,7 +2934,16 @@ function New-JohnCandidateWordlist {
         # materialization so filtering, encoding normalization, and ordering
         # remain unchanged.
         $directKinds = @('BuiltinDictionary', 'DateRange', 'CommonSymbols', 'RuleCaseVariants')
-        if ($isCumulativeItem -and $SkipCount -eq 0L -and $paths.Count -eq 1 -and $directKinds -contains $kind) {
+        $directEncodingSafe = [string]$EncodingProfile.Name -eq 'UTF-8'
+        if (-not $directEncodingSafe -and [string]$EncodingProfile.Name -eq 'WINDOWS_ACP' -and $paths.Count -eq 1) {
+            # ASCII is byte-identical in UTF-8 and the active Windows ACP, so
+            # an ASCII ZIP source can still use the immutable direct stream.
+            # Any non-ASCII source is materialized through the strict ACP
+            # encoder below.
+            $directEncodingSafe = -not (Test-TextFileContainsNonAscii -Path ([string]$paths[0]))
+        }
+        if ($isCumulativeItem -and $SkipCount -eq 0L -and $paths.Count -eq 1 -and $directKinds -contains $kind -and
+            $directEncodingSafe) {
             $directPath = [string]$paths[0]
             if (-not (Test-Path -LiteralPath $directPath -PathType Leaf)) {
                 throw ('The local John dictionary path is missing: ' + $directPath)
@@ -2917,7 +2972,7 @@ function New-JohnCandidateWordlist {
         if ([string]::IsNullOrWhiteSpace($safeIdentity)) { $safeIdentity = 'coverage' }
         if ($safeIdentity.Length -gt 80) { $safeIdentity = $safeIdentity.Substring(0, 80) }
         $wordlistPath = Join-Path $wordlistDirectory ('candidates-{0}.txt' -f $safeIdentity)
-        $writer = New-Object System.IO.StreamWriter($wordlistPath, $false, (New-Object System.Text.UTF8Encoding($false)))
+        $writer = New-Object System.IO.StreamWriter($wordlistPath, $false, $candidateEncoding)
         [long]$position = 0L
         $useRules = if ($isCumulativeItem) {
             $kind -in @('RulesDictionary', 'CustomRules', 'RuleAppendVariants')
@@ -2929,7 +2984,7 @@ function New-JohnCandidateWordlist {
             if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {
                 throw ('The local John dictionary path is missing: ' + [string]$path)
             }
-            $reader = New-Object System.IO.StreamReader(([string]$path), $true)
+            $reader = New-WorkerUtf8Reader -Path ([string]$path)
             try {
                 while ($null -ne ($word = $reader.ReadLine())) {
                     if ([string]$word.Length -eq 0) { continue }
@@ -3002,7 +3057,7 @@ function Invoke-MaskRecovery {
         return
     }
 
-    $reader = New-Object System.IO.StreamReader(([string]$job.DictionaryPath), $true)
+    $reader = New-WorkerUtf8Reader -Path ([string]$job.DictionaryPath)
     try {
         while ($null -ne ($word = $reader.ReadLine())) {
             if ($word.Length -eq 0) { continue }
@@ -3028,9 +3083,10 @@ function Invoke-BruteForceRecovery {
     )
 
     $characters = Get-CharsetCharacters -Kind ([string]$job.CharacterSet) -CustomCharacters ([string]$job.CustomCharacters)
+    $characterCount = Get-CharsetCharacterCount -Characters $characters
     [long]$remainingSkip = $SkipCount
     for ($length = [int]$job.MinLength; $length -le [int]$job.MaxLength; $length++) {
-        $countForLength = Get-PowerWithinInt64 -Base $characters.Length -Exponent $length
+        $countForLength = Get-PowerWithinInt64 -Base $characterCount -Exponent $length
         if ($null -eq $countForLength) {
             throw 'The selected brute-force range exceeds the current local cursor limit. Narrow the character set or length.'
         }
@@ -3081,6 +3137,46 @@ function Set-WorkerEngineSelection {
     if ($identityChanged) { $script:EngineSelectedUtc = [datetime]::UtcNow }
 }
 
+function Test-WorkerItemRequiresUnicodeCpu {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]$Item
+    )
+
+    try {
+        $mask = [string](Get-ObjectPropertyValue -Object $Item -Name 'Mask' -Default '')
+        if (-not [string]::IsNullOrEmpty($mask) -and (Test-TextContainsNonAscii -Text $mask)) {
+            return $true
+        }
+        $characterSet = [string](Get-ObjectPropertyValue -Object $Item -Name 'CharacterSet' -Default '')
+        $customCharacters = [string](Get-ObjectPropertyValue -Object $Item -Name 'CustomCharacters' -Default (Get-ObjectPropertyValue -Object $job -Name 'CustomCharacters' -Default ''))
+        if ($characterSet -eq 'custom' -and (Test-TextContainsNonAscii -Text $customCharacters)) {
+            return $true
+        }
+        foreach ($source in @(Get-PlanItemDictionarySources -PlanItem $Item -Job $job)) {
+            if ([string]$source.SourceType -eq 'Builtin' -and [string]$source.Language -eq 'zh') {
+                return $true
+            }
+            if ([string]$source.SourceType -eq 'Custom' -and
+                (Test-Path -LiteralPath ([string]$source.Path) -PathType Leaf) -and
+                (Test-TextFileContainsNonAscii -Path ([string]$source.Path))) {
+                return $true
+            }
+        }
+        $dictionaryPath = [string](Get-ObjectPropertyValue -Object $Item -Name 'DictionaryPath' -Default '')
+        if (-not [string]::IsNullOrWhiteSpace($dictionaryPath) -and
+            (Test-Path -LiteralPath $dictionaryPath -PathType Leaf) -and
+            (Test-TextFileContainsNonAscii -Path $dictionaryPath)) {
+            return $true
+        }
+    }
+    catch {
+        # Readiness owns invalid/missing-source diagnostics. Keep engine
+        # selection independent of a source probe failure here.
+    }
+    return $false
+}
+
 function Select-LocalEngine {
     [CmdletBinding()]
     param(
@@ -3096,6 +3192,9 @@ function Select-LocalEngine {
     }
 
     $strategyJob = if ($null -ne $PlanningJob) { $PlanningJob } else { $job }
+    if (Test-WorkerItemRequiresUnicodeCpu -Item $strategyJob) {
+        return New-CpuEngine -Label 'CPU / Unicode-safe local path' -Message 'The selected candidate source contains non-ASCII Unicode. The exact local CPU encoding path was selected.'
+    }
     $strategySupport = Get-HashcatStrategySupport -Job $strategyJob -Strategy $Strategy
     if (-not $strategySupport.Supported) {
         return New-CpuEngine -Label 'CPU / NanaZip local verifier' -Message $strategySupport.Message
@@ -3164,9 +3263,10 @@ function Update-HashcatStatusFromLine {
                     $progressMinimumLength = [int]$script:ActivePlanItem.MinimumLength
                 }
                 $characters = Get-CharsetCharacters -Kind $progressCharacterSet -CustomCharacters $progressCustomCharacters
+                $characterCount = Get-CharsetCharacterCount -Characters $characters
                 [decimal]$completedShorterLengths = 0
                 for ($length = $progressMinimumLength; $length -lt $currentLength; $length++) {
-                    $part = Get-PowerWithinInt64 -Base $characters.Length -Exponent $length
+                    $part = Get-PowerWithinInt64 -Base $characterCount -Exponent $length
                     if ($null -eq $part) {
                         throw 'The Hashcat progress range exceeded the local cursor limit.'
                     }
@@ -3281,7 +3381,7 @@ function Get-HashcatRecoveredPassword {
         return $null
     }
 
-    $lines = [System.IO.File]::ReadAllLines($ResultPath)
+    $lines = [System.IO.File]::ReadAllLines($ResultPath, (New-Object System.Text.UTF8Encoding($false)))
     if ($lines.Count -eq 0) {
         return $null
     }
@@ -3429,11 +3529,13 @@ function Get-JohnRecoveredPassword {
     [CmdletBinding()]
     param(
         [Parameter(Mandatory = $true)][string]$PotPath,
-        [Parameter(Mandatory = $true)]$Artifact
+        [Parameter(Mandatory = $true)]$Artifact,
+        $EncodingProfile = $null
     )
 
     if (-not (Test-Path -LiteralPath $PotPath -PathType Leaf)) { return $null }
-    try { $lines = [System.IO.File]::ReadAllLines($PotPath) } catch { return $null }
+    if ($null -eq $EncodingProfile) { $EncodingProfile = Get-JohnEncodingProfile -ArchiveFormat '7Z' }
+    try { $lines = [System.IO.File]::ReadAllLines($PotPath, $EncodingProfile.TextEncoding) } catch { return $null }
     foreach ($record in @($Artifact.HashRecords)) {
         $recordText = [string]$record
         $tokenMatch = [regex]::Match($recordText, '(?i)(\$zip2\$[^\r\n:]+\$/zip2\$|\$pkzip\$[^\r\n:]+\$/pkzip\$|\$7z\$[^\r\n:]+|\$rar5\$[^\r\n:]+|\$rar3\$[^\r\n:]+)')
@@ -3513,16 +3615,21 @@ function Copy-HashcatRestoreCheckpoint {
         # A Hashcat restore file contains the previous command line. The
         # per-run directory changes on every Worker, so rewrite only the
         # equal-length JobId\RunId path segments before --restore is invoked.
+        # Hashcat persists this text as UTF-8; ASCII decoding turns a Chinese
+        # user/profile path into '?' and therefore cannot find the old path.
         if (-not [string]::IsNullOrWhiteSpace($RuntimeDirectory) -and -not [string]::IsNullOrWhiteSpace($JobId)) {
             $bytes = [System.IO.File]::ReadAllBytes($DestinationPath)
-            $ascii = [System.Text.Encoding]::ASCII.GetString($bytes)
+            $encoding = New-Object System.Text.UTF8Encoding($false, $true)
             $runtimePrefix = ([System.IO.Path]::GetFullPath((Get-RecoveryRuntimeRoot))).TrimEnd('\') + '\' + $JobId + '\'
-            $match = [regex]::Match($ascii, ([regex]::Escape($runtimePrefix) + '[0-9A-Fa-f]{32}'))
+            $text = $null
+            try { $text = $encoding.GetString($bytes) } catch { $text = [System.Text.Encoding]::ASCII.GetString($bytes) }
+            $match = [regex]::Match($text, ([regex]::Escape($runtimePrefix) + '[0-9A-Fa-f]{32}'))
             if ($match.Success) {
-                $oldPathBytes = [System.Text.Encoding]::ASCII.GetBytes($match.Value)
+                $oldPathBytes = $encoding.GetBytes($match.Value)
                 $newPath = ([System.IO.Path]::GetFullPath($RuntimeDirectory)).TrimEnd('\')
-                $newPathBytes = [System.Text.Encoding]::ASCII.GetBytes($newPath)
+                $newPathBytes = $encoding.GetBytes($newPath)
                 if ($oldPathBytes.Length -eq $newPathBytes.Length) {
+                    $changed = $false
                     for ($offset = 0; $offset -le ($bytes.Length - $oldPathBytes.Length); $offset++) {
                         $same = $true
                         for ($index = 0; $index -lt $oldPathBytes.Length; $index++) {
@@ -3533,10 +3640,11 @@ function Copy-HashcatRestoreCheckpoint {
                         }
                         if ($same) {
                             [System.Array]::Copy($newPathBytes, 0, $bytes, $offset, $newPathBytes.Length)
+                            $changed = $true
                             $offset += $oldPathBytes.Length - 1
                         }
                     }
-                    [System.IO.File]::WriteAllBytes($DestinationPath, $bytes)
+                    if ($changed) { [System.IO.File]::WriteAllBytes($DestinationPath, $bytes) }
                 }
             }
         }
@@ -3627,7 +3735,9 @@ function Invoke-JohnCpuRecovery {
         return [pscustomobject]@{ Status = 'Unsupported'; Message = [string]$artifact.Message }
     }
 
-    $wordlist = New-JohnCandidateWordlist -Strategy $Strategy -Item $Item -SkipCount $SkipCount
+    $encodingProfile = Get-JohnEncodingProfile -ArchiveFormat $ArchiveFormat
+    $script:JohnEncodingMode = [string]$encodingProfile.Name
+    $wordlist = New-JohnCandidateWordlist -Strategy $Strategy -Item $Item -SkipCount $SkipCount -EncodingProfile $encodingProfile
     if (-not $wordlist.Supported) {
         $script:JohnLastMessage = [string]$wordlist.Message
         return [pscustomobject]@{ Status = 'Unsupported'; Message = [string]$wordlist.Message }
@@ -3690,9 +3800,12 @@ function Invoke-JohnCpuRecovery {
 
         $sessionName = $sessionNameBase
         if ($artifactGroups.Count -gt 1) { $sessionName = $sessionNameBase + '-g' + [string]$groupNumber }
+        $johnEncodingArguments = @('--encoding={0}' -f [string]$encodingProfile.JohnOption)
+        if ([string]$encodingProfile.Name -eq 'UTF-8') { $johnEncodingArguments += '--internal-codepage=UTF-8' }
         $arguments = @(
             ('--config={0}' -f $configPath),
-            ('--format={0}' -f [string]$artifactGroup.Format),
+            ('--format={0}' -f [string]$artifactGroup.Format)
+        ) + @($johnEncodingArguments) + @(
             ('--wordlist={0}' -f [string]$wordlist.Path),
             '--no-log',
             ('--pot={0}' -f $potPath),
@@ -3711,6 +3824,14 @@ function Invoke-JohnCpuRecovery {
         $startInfo.RedirectStandardInput = $true
         $startInfo.RedirectStandardOutput = $true
         $startInfo.RedirectStandardError = $true
+        try {
+            $startInfo.StandardOutputEncoding = New-Object System.Text.UTF8Encoding($false)
+            $startInfo.StandardErrorEncoding = New-Object System.Text.UTF8Encoding($false)
+        }
+        catch {
+            # Keep the existing CPU fallback for older .NET Framework hosts
+            # where ProcessStartInfo does not expose encoding setters.
+        }
 
         $process = New-Object System.Diagnostics.Process
         $process.StartInfo = $startInfo
@@ -3829,7 +3950,7 @@ function Invoke-JohnCpuRecovery {
             return [pscustomobject]@{ Status = 'Paused'; Message = $lastStatusMessage }
         }
 
-        $candidate = Get-JohnRecoveredPassword -PotPath $potPath -Artifact $artifactGroup
+        $candidate = Get-JohnRecoveredPassword -PotPath $potPath -Artifact $artifactGroup -EncodingProfile $encodingProfile
         if ($null -ne $candidate) {
             $script:NanaZipVerifierProcessLaunchCount++
             $attempt = Invoke-WorkerNanaZipVerification -Candidate $candidate -SevenZip $SevenZip
@@ -4044,6 +4165,10 @@ function Invoke-HashcatRecovery {
         '--backend-ignore-hip',
         '--logfile-disable',
         '--potfile-disable',
+        '--encoding-from', 'utf-8',
+        '--encoding-to', 'utf-8',
+        '--wordlist-autohex-disable',
+        '--outfile-autohex-disable',
         '--session', $session,
         '--restore-file-path', $runtimeRestorePath,
         '--status',
@@ -4084,6 +4209,13 @@ function Invoke-HashcatRecovery {
     $startInfo.RedirectStandardInput = $true
     $startInfo.RedirectStandardOutput = $true
     $startInfo.RedirectStandardError = $true
+    try {
+        $startInfo.StandardOutputEncoding = New-Object System.Text.UTF8Encoding($false)
+        $startInfo.StandardErrorEncoding = New-Object System.Text.UTF8Encoding($false)
+    }
+    catch {
+        # Hashcat status and result files are read through explicit UTF-8 paths.
+    }
 
     $statusPath = Join-Path $temporaryDirectory ('hashcat{0}-status.jsonl' -f $stageSuffix)
     $stderrPath = Join-Path $temporaryDirectory ('hashcat{0}-stderr.txt' -f $stageSuffix)
@@ -4533,7 +4665,7 @@ function Get-RuleCandidateCountFromDictionaryPath {
     )
 
     [long]$count = 0
-    $reader = New-Object System.IO.StreamReader($Path, $true)
+    $reader = New-WorkerUtf8Reader -Path $Path
     try {
         while ($null -ne ($word = $reader.ReadLine())) {
             if ($word.Length -eq 0) { continue }
@@ -4650,6 +4782,9 @@ function Test-PlanReadiness {
                 if ([string]$source.SourceType -eq 'Custom') {
                     if (-not (Test-Path -LiteralPath ([string]$source.Path) -PathType Leaf)) {
                         return [pscustomobject]@{ Ready = $false; Message = 'the local dictionary file is missing' }
+                    }
+                    if (-not (Test-TextFileUtf8 -Path ([string]$source.Path))) {
+                        return [pscustomobject]@{ Ready = $false; Message = 'the local dictionary file must be valid UTF-8 (BOM optional)' }
                     }
                 }
                 elseif (-not (Test-Path -LiteralPath ([string]$source.Path) -PathType Leaf)) {
@@ -5238,7 +5373,7 @@ function New-BuiltinGpuExecutionBatch {
                 [long]$segmentCount = 0
                 $paths = @(Get-PlanDictionaryPaths -Item $item -PreparationCoverageName $batchPreparationName)
                 foreach ($sourcePath in $paths) {
-                    $reader = New-Object System.IO.StreamReader($sourcePath, $true)
+                    $reader = New-WorkerUtf8Reader -Path $sourcePath
                     try {
                         while ($null -ne ($word = $reader.ReadLine())) {
                             if ($word.Length -eq 0) { continue }
@@ -5436,7 +5571,7 @@ function Invoke-CumulativeDictionaryFile {
     )
 
     $variantSeen = if ($DeduplicateVariants) { New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::Ordinal) } else { $null }
-    $reader = New-Object System.IO.StreamReader($Path, $true)
+    $reader = New-WorkerUtf8Reader -Path $Path
     try {
         while ($null -ne ($word = $reader.ReadLine())) {
             if ($word.Length -eq 0) { continue }
@@ -5512,7 +5647,7 @@ function Invoke-CumulativeCapitalInitialDigitsPlan {
     $path = Expand-BuiltinDictionary -Language ([string]$sources[0].Language) -Level ([int]$sources[0].Level) -RuntimeDirectory $script:RuntimeDirectory
     $seen = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::Ordinal)
     [long]$position = 0
-    $reader = New-Object System.IO.StreamReader($path, $true)
+    $reader = New-WorkerUtf8Reader -Path $path
     try {
         while ($null -ne ($word = $reader.ReadLine())) {
             if ($word.Length -eq 0) { continue }
@@ -5593,7 +5728,7 @@ function Invoke-CumulativeHybridPlan {
     foreach ($source in @(Get-PlanItemDictionarySources -PlanItem $Item -Job $job)) {
         if ([string]$source.SourceType -ne 'Builtin') { throw 'PLAN_DICTIONARY_SOURCE_INVALID: 计划项的字典来源定义不完整。' }
         $path = Expand-BuiltinDictionary -Language ([string]$source.Language) -Level ([int]$source.Level) -RuntimeDirectory $script:RuntimeDirectory
-        $reader = New-Object System.IO.StreamReader($path, $true)
+        $reader = New-WorkerUtf8Reader -Path $path
         try {
             while ($null -ne ($word = $reader.ReadLine())) {
                 if ($word.Length -eq 0) { continue }
@@ -5637,7 +5772,7 @@ function Invoke-CumulativeMaskPlan {
 
             $sources = @(Get-PlanItemDictionarySources -PlanItem $Item -Job $job)
             if ($sources.Count -ne 1) { throw 'PLAN_DICTIONARY_SOURCE_INVALID: 计划项的字典来源定义不完整。' }
-            $reader = New-Object System.IO.StreamReader(([string]$sources[0].Path), $true)
+            $reader = New-WorkerUtf8Reader -Path ([string]$sources[0].Path)
             try {
                 while ($null -ne ($word = $reader.ReadLine())) {
                     if ($word.Length -eq 0) { continue }
@@ -5661,8 +5796,9 @@ function Invoke-CumulativeMaskPlan {
         }
         'ConfiguredBruteForce' {
             $characters = Get-CharsetCharacters -Kind ([string]$Item.CharacterSet) -CustomCharacters ([string]$job.CustomCharacters)
+            $characterCount = Get-CharsetCharacterCount -Characters $characters
             for ($length = [int]$Item.MinimumLength; $length -le [int]$Item.MaximumLength; $length++) {
-                $total = Get-PowerWithinInt64 -Base $characters.Length -Exponent $length
+                $total = Get-PowerWithinInt64 -Base $characterCount -Exponent $length
                 for ([long]$index = 0; $index -lt $total; $index++) {
                     $candidate = Convert-IndexToCandidate -Index $index -Length $length -Characters $characters
                     if (-not (Test-CumulativeCandidateAtPosition -Candidate $candidate -Position ([ref]$position) -SevenZip $SevenZip)) { return $false }
@@ -5790,11 +5926,17 @@ function Invoke-CumulativeRecovery {
             }
             Set-WorkerActivity -Activity 'PreparingBackend' -Message ('Preparing the local backend for coverage: {0}.' -f $item.DisplayName)
             Publish-Progress -State 'Running' -Message ('Preparing the local backend for coverage: ' + [string]$item.DisplayName) -Result $null
-            if ($canGpu) {
+            $unicodeCpuRequired = Test-WorkerItemRequiresUnicodeCpu -Item $item
+            if ($canGpu -and -not $unicodeCpuRequired) {
                 $engine = Select-WorkerTimedLocalEngine -Inspection $inspection -Strategy ([string]$item.EngineStrategy) -PlanningJob $planningJob
             }
             else {
-                $engine = New-CpuEngine -Message ('Running the dynamic local coverage: ' + [string]$item.DisplayName)
+                $engine = if ($unicodeCpuRequired) {
+                    New-CpuEngine -Label 'CPU / John Unicode' -Message ('The coverage contains non-ASCII Unicode candidates; exact local CPU encoding was selected: ' + [string]$item.DisplayName)
+                }
+                else {
+                    New-CpuEngine -Message ('Running the dynamic local coverage: ' + [string]$item.DisplayName)
+                }
             }
             Set-WorkerEngineSelection -Engine $engine
 
@@ -6157,8 +6299,11 @@ function Get-StageReadiness {
 
     switch ([string]$Stage.Strategy) {
         'Quick' {
-            $quickCandidates = if ($job.PSObject.Properties.Name -contains 'QuickCandidates') { @($job.QuickCandidates) } else { @() }
-            $hasQuickCandidate = @($quickCandidates | Where-Object { $null -ne $_ }).Count -gt 0
+            $quickCandidates = if ($job.PSObject.Properties.Name -contains 'QuickCandidates') {
+                @(Get-CanonicalQuickCandidates -Candidates @($job.QuickCandidates))
+            }
+            else { @() }
+            $hasQuickCandidate = $quickCandidates.Count -gt 0
             if (-not [bool]$job.TryEmptyPassword -and -not $hasQuickCandidate) {
                 return [pscustomobject]@{ Ready = $false; Message = 'no Quick candidates were provided' }
             }
@@ -6167,10 +6312,16 @@ function Get-StageReadiness {
             if (-not (Test-Path -LiteralPath ([string]$job.DictionaryPath) -PathType Leaf)) {
                 return [pscustomobject]@{ Ready = $false; Message = 'the local dictionary file is missing' }
             }
+            if (-not (Test-TextFileUtf8 -Path ([string]$job.DictionaryPath))) {
+                return [pscustomobject]@{ Ready = $false; Message = 'the local dictionary file must be valid UTF-8 (BOM optional)' }
+            }
         }
         'Rules' {
             if (-not (Test-Path -LiteralPath ([string]$job.DictionaryPath) -PathType Leaf)) {
                 return [pscustomobject]@{ Ready = $false; Message = 'the local dictionary file is missing' }
+            }
+            if (-not (Test-TextFileUtf8 -Path ([string]$job.DictionaryPath))) {
+                return [pscustomobject]@{ Ready = $false; Message = 'the local dictionary file must be valid UTF-8 (BOM optional)' }
             }
         }
         'Mask' {
@@ -6179,6 +6330,10 @@ function Get-StageReadiness {
                 if (@($tokens | Where-Object { $_.Kind -eq 'Word' }).Count -gt 0 -and
                     -not (Test-Path -LiteralPath ([string]$job.DictionaryPath) -PathType Leaf)) {
                     return [pscustomobject]@{ Ready = $false; Message = 'the mask uses ?w but the local dictionary file is missing' }
+                }
+                if (@($tokens | Where-Object { $_.Kind -eq 'Word' }).Count -gt 0 -and
+                    -not (Test-TextFileUtf8 -Path ([string]$job.DictionaryPath))) {
+                    return [pscustomobject]@{ Ready = $false; Message = 'the local dictionary file must be valid UTF-8 (BOM optional)' }
                 }
             }
             catch {

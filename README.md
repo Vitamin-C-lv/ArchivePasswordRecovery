@@ -26,9 +26,9 @@ The bundled John Windows runtime uses `tools\extractors\cygwin1.dll`, whose loca
 
 | Archive / encryption type | GPU Hashcat | CPU John bulk | CPU NanaZip verifier | Status |
 | --- | --- | --- | --- | --- |
-| ZIP WinZip AES (`$zip2$`) | Supported | Supported | Supported | Supported |
+| ZIP WinZip AES (`$zip2$`) | ASCII-compatible candidates | Supported; ZIP uses Windows ACP bytes | Supported | Supported; Unicode route is format-aware |
 | ZIP ZipCrypto (`$pkzip$`) | Unsupported | Supported | Supported | Supported |
-| 7z AES (`$7z$`) | Supported | Supported when the bundled build accepts the extracted record | Supported | Supported |
+| 7z AES (`$7z$`) | ASCII-compatible candidates | Supported when the bundled build accepts the extracted record; Unicode uses explicit UTF-8 | Supported | Supported; Unicode route is format-aware |
 | RAR5（`$rar5$`，Hashcat mode 13000） | Supported | Supported（John format `RAR5`） | Supported | Supported |
 | RAR3-hp（`$RAR3$*0*`，Hashcat mode 12500） | Supported | Supported（John format `rar`） | Supported | Supported |
 | RAR3-p compressed（Hashcat mode 23800） | Supported | Bundled John does not accept this record | Supported | GPU verified; CPU/NanaZip fallback |
@@ -57,11 +57,13 @@ Bundled third-party components and their accompanying license texts are listed i
   - `Mask`：支持 `?l ?u ?d ?s ?a` 和 `??`；一个 `?w` 可将本地字典词与 mask 组合成 hybrid 搜索。
   - `BruteForce`：按用户选择的字符集和最小/最大长度逐步枚举；L5 对标准字符集使用互不重复的 mask 分区，不生成巨型候选数据库或密码文件。
 - 内置字符集由应用统一定义：小写 26、大写 26、数字 10、符号 24、总计 86 个字符；GPU mask 会显式传递 Hashcat custom charset，字面量 `?` 会按 Hashcat 规则转义。
+- Unicode 输入约定：用户字典必须是严格 UTF-8（可带 BOM），无效字节会在准备阶段明确拒绝，不做替换解码；Quick 是精确候选，只过滤真正的空行，ASCII 空格、全角空格和其他 Unicode 空白都会保留。CPU 候选生成按 Unicode 标量处理补充字符。
+- 非 ASCII 字典、Unicode mask 字面量和非 ASCII 自定义字符集会选择 Unicode-safe CPU 路径，不把未经真实端到端验证的 GPU Unicode 结果宣称为成功。7z/RAR 的 John 路径使用显式 UTF-8；当前 NanaZip ZIP 解码器使用 Windows 活动 ANSI 代码页，因此 ZIP John 路径用严格 ACP 字节字典与 John 的 raw `ISO-8859-1` 输入模式，无法由当前 ACP 表示的 ZIP 候选会保留本地 fallback 并给出明确结果。
 - L4 的第一个覆盖项是用户自定义 Mask/Hybrid（若填写）；不含 `?w` 时精确计算候选数，含 `?w` 时必须填写本地字典，`?w` 位于首尾可走 GPU，位于中间保持 CPU。其后才是 global/zh 字典覆盖项和首字母大写加 1–4 位数字覆盖项；后者只保留首字母确实发生变化的唯一词，再乘以 1–4 位数字空间。L4/L5 的 ID、数量和累计进度按实际规划计算，重复的年份/混合范围不会重复计数。
 - L4 的日期范围与“字典词 + 常见符号”都使用统一的有限生成集适配器：CPU 流式验证与 GPU 临时字典来自同一个候选顺序。常见符号固定为 `@`、`#`、`$`、`_`、`-`，不再生成 `!`；每个语言的候选总量是 L1 字典条目数的 5 倍。旧版已经完成的 `hybrid:L4-word-symbol-*:v2` 是包含新版 v3 的严格超集，只作显式兼容记账，不会反向把 v3 当成 v2。
 - Stage 3 的 Rules 明确拆成大小写族和追加族，CPU 与 GPU 使用同一组变形语义；Quick 和自定义 Mask 的覆盖修订号会随配置变化递增，避免复用旧断点。
 - GPU 兼容的内置小型、确定性 Coverage 可按原有逻辑顺序组成连续的 MaterializedDictionaryBatch；批次只减少 Hashcat 初始化次数，不改变 CoverageId、候选顺序、候选空间、断点或界面进度。
-- CPU 路径始终可用：Quick/少量精确候选和不支持的归档/策略继续由本机 NanaZip 逐候选验证；受支持的 ZIP/7z bulk 字典、规则和有限生成集先交给一次长生命周期的本地 John Jumbo，再只对其报告的候选执行一次 NanaZip `7z t` 最终验证。
+- CPU 路径始终可用：Quick/少量精确候选和不支持的归档/策略继续由本机 NanaZip 逐候选验证；受支持的 ZIP/7z bulk 字典、规则和有限生成集先交给一次长生命周期的本地 John Jumbo，再只对其报告的候选执行一次 NanaZip `7z t` 最终验证。Unicode bulk 会记录实际使用的 `UTF-8` 或 `WINDOWS_ACP` 编码模式。
 - 已接入真实的本地 GPU 执行链：**ZIP WinZip AES → `zip2john` 本地提取 → Hashcat 7.1.2 OpenCL → 单块本机 GPU → NanaZip 最终验证**、**7z AES → `7z2hashcat` 本地提取 → Hashcat mode 11600 → 单块本机 GPU → NanaZip 最终验证**，以及 **RAR → `rar2john` 本地提取 → RAR5 mode 13000 / RAR3-hp mode 12500 / RAR3-p compressed mode 23800 → 单块本机 GPU → NanaZip 最终验证**。RAR3-p uncompressed 的 mode 23700 适配器已按 Hashcat 记录约束接入，但当前真实夹具集没有有效样本，因此明确保持未验收状态。
 - Hashcat 只在实际初始化成功的本机 OpenCL 设备上运行，不按“RTX 4070”“780M”等型号字符串硬编码。界面逐块显示真实设备 `<Name> (#<DeviceId>)`；任务以 Hashcat OpenCL 的 Vendor + Name 保存精确 GPU 身份，打开任务时重新枚举，设备消失则明确回退 CPU；未被 Backend 初始化的显卡不会被加入选择框。
 - `Auto` 对 `Quick` 保持 CPU；对适合的 ZIP AES 或 7z AES 字典、规则、部分 Mask/Hybrid 和 BruteForce，优先选择实际初始化的 NVIDIA GPU，其次 AMD GPU；格式/加密方式/Backend/策略不支持时会诚实回退 CPU。
@@ -100,9 +102,9 @@ Bundled third-party components and their accompanying license texts are listed i
 
 | 归档/加密类型 | GPU 状态 | 说明 |
 | --- | --- | --- |
-| ZIP WinZip AES（`$zip2$`，Hashcat mode 13600） | 已支持 | Dictionary、Rules、普通 Mask、`?w` 位于首尾的 Hybrid、BruteForce，以及可表达的 L4/L5 mask 分区，可使用单块实际初始化的 GPU。 |
+| ZIP WinZip AES（`$zip2$`，Hashcat mode 13600） | 已支持（ASCII-compatible） | ASCII-compatible Dictionary、Rules、普通 Mask、`?w` 位于首尾的 Hybrid、BruteForce，以及可表达的 L4/L5 mask 分区，可使用单块实际初始化的 GPU；非 ASCII 候选选择 format-aware CPU 路径。 |
 | ZIP 传统 ZipCrypto（`$pkzip$`） | CPU John | 由本地 `zip2john` 提取后交给 John Jumbo；John 报告的候选必须再经 NanaZip `7z t` 验证。 |
-| 7z AES（NanaZip 显示 `7zAES`，`$7z$`，Hashcat mode 11600） | 已支持 | 通过本地 `7z2hashcat` 提取。已实机验收 LZMA2 + 7zAES 且加密文件头的 Dictionary；Rules、普通 Mask、`?w` 位于首尾的 Hybrid、BruteForce 共用同一 Hashcat attack-plan 路径。 |
+| 7z AES（NanaZip 显示 `7zAES`，`$7z$`，Hashcat mode 11600） | 已支持（ASCII-compatible） | 通过本地 `7z2hashcat` 提取。已实机验收 LZMA2 + 7zAES 且加密文件头的 Dictionary；ASCII-compatible Rules、普通 Mask、`?w` 位于首尾的 Hybrid、BruteForce 共用同一 Hashcat attack-plan 路径，Unicode 候选走显式 UTF-8 的 CPU John/fallback。 |
 | 7z 记录无法被本地 extractor / John/Hashcat 接受 | CPU | Worker 显示真实原因并保留现有 NanaZip 五层 CPU fallback；不会伪装为 bulk 支持。 |
 | RAR5（`$rar5$`，mode 13000） | 已支持 | `rar2john` 提取后走 Hashcat；John 也支持 `RAR5` bulk；两条成功候选都必须经 NanaZip `7z t`。 |
 | RAR3-hp（`$RAR3$*0*`，mode 12500） | 已支持 | `rar2john` 提取后走 Hashcat；John 也支持 `rar` bulk；两条成功候选都必须经 NanaZip `7z t`。 |
@@ -113,6 +115,8 @@ Bundled third-party components and their accompanying license texts are listed i
 | `?w` 位于 mask 中间 | CPU | 当前 Hashcat adapter 不伪装支持这类 hybrid。 |
 
 `Auto` 不做基准评分引擎：少量 Quick 选 CPU；可用 GPU backend 且策略支持时只选择一块已实际初始化的 NVIDIA、AMD 或 Other GPU（同级按稳定 DeviceId/Name 排序）；格式/加密/策略不支持时选 CPU。手动 GPU 选择按保存的 Vendor + Name 精确恢复，设备不可用时 UI 会显示原因并使用 CPU fallback，不会把 CPU 工作写成 GPU。
+
+Unicode 端到端回归可用 `JohnUnicodeDictionarySmokeTest.ps1`：测试在本机临时目录生成严格 UTF-8 字典、标准 WinZip AES-256 AE-2 夹具和 NanaZip 7z AES 夹具，验证正确/错误密码、本地 NanaZip 复验、John 的实际编码模式和 Worker 结果；测试不会输出密码、hash 或字典内容。`HashcatRestoreUnicodeRegressionTest.ps1` 另外验证包含 Unicode runtime 路径的 Hashcat restore checkpoint 能在新 Run 中被安全重写。
 
 本机通过 Hashcat OpenCL 实际初始化并验收的设备是：
 
@@ -179,4 +183,4 @@ WPF UI (ArchivePasswordRecovery.ps1)
 
 `SmokeTest.ps1` 会在系统临时目录生成一个小型加密 ZIP，验证格式识别、错误密码拒绝、正确密码确认和 Worker 本地验证链路，随后删除测试目录。`StrategySmokeTest.ps1` 覆盖 Quick、Dictionary、Rules、Mask 和 BruteForce 五种策略；`ControlSmokeTest.ps1` 覆盖 CPU 暂停、停止和从 checkpoint 恢复。`CorrectnessRegressionTest.ps1` 覆盖归档身份、固定年份、canonical charset、CommonSymbols v3、L4/L5 去重计数、增量状态解析和 7 天终态任务清理。`TargetedCorrectnessRegressionTest.ps1` 覆盖自定义 Mask/Hybrid、首字母大写数字、Rules 分族、Job 升级冻结字段以及修订号。`CumulativeRecoveryRegressionTest.ps1` 覆盖跨 L1/L2/L3 连续推进、Coverage A→B→C，以及前一/前两项已完成时保留后续二/三项断点的暂停续跑。`CommonSymbolsGeneratedEquivalenceTest.ps1` 验证 CPU 生成顺序与 GPU 临时字典逐项一致，并确认不生成 `!`；`CommonSymbolsBackendIntegrationTest.ps1` 以正式 L4 计划分别验证 CPU 与真实 GPU。`DateRangeGeneratedDictionaryEquivalenceTest.ps1` 和 `DateRangeStopResumeRegressionTest.ps1` 覆盖日期有限生成集、真实 Hashcat 停止、restore 与新 Run 续跑。`LevelUpgradeResumeRegressionTest.ps1` 覆盖 Paused/Stopped 的当前覆盖续跑、Exhausted 的首个新增覆盖、Recovered/NotEncrypted 升级硬阻断。`RuntimeCacheGitCleanRegressionTest.ps1` 验证应用自有 log/pid 清理、运行时 Hashcat 依赖隔离、单次归档工件缓存，以及 GPU Run 前后 Git 状态与项目 kernel 文件保持不变。`GpuZipBackendSmokeTest.ps1` 在临时目录生成 AES ZIP，以 NVIDIA 和 AMD 各执行一次真实 Hashcat OpenCL Dictionary 恢复，并验证最终 NanaZip 结果。`GpuSevenZipBackendSmokeTest.ps1` 在临时目录创建 LZMA2 + 7zAES（加密文件头）归档，先验证 CPU Quick，再以 NVIDIA、AMD 和 Auto 各执行一次真实 Hashcat mode 11600 Dictionary 恢复并完成 NanaZip 复验。`RarBackendSmokeTest.ps1` 使用 `test-fixtures` 中的官方 RAR5、RAR3-hp 和 RAR3-p compressed 夹具，验证本地 `rar2john` 记录解析、Hashcat mode 13000/12500/23800、John RAR5/rar CPU bulk、NVIDIA/AMD GPU 实际执行和每次 NanaZip `t` 最终复验；mode 23700 若没有真实 uncompressed 夹具会明确报告 `NOT_VERIFIED`。`RarControlSmokeTest.ps1` 使用真实 RAR5 夹具验证 GPU 运行、暂停、恢复、停止、打开保存任务后的新 Worker 继续运行，以及可用时的 Hashcat restore。`GpuControlProgressSmokeTest.ps1 -ArchiveFormat ZIP/7z` 以一个临时、不匹配的受限任务验证 NVIDIA GPU 的实际进度采样、停止后旧 Worker 退出、restore resume 启动新 Worker 与 stop；它会短暂占用 GPU，但不会读取用户归档。`ValidateUi.ps1` 只装载 WPF XAML 与必需控件，不会显示界面或读取任何用户归档。
 
-`JohnIncrementalOutputRegressionTest.ps1` 验证 John stdout/stderr 的字节级增量读取、UTF-8 跨 buffer/append 边界、未完成末行以及 truncate/recreate；`JohnDirectWordlistRegressionTest.ps1` 验证内置最终 plaintext stream 直接交给 John 后候选总数、CoverageId、阶段/整体进度与 NanaZip 结果保持一致；`JohnUnicodeDictionarySmokeTest.ps1` 使用临时 UTF-8 字典实测 ZIP AES（以及可行时的 7z AES）；`JohnMixedZipSmokeTest.ps1` 验证 bundled John 对混合 `$zip2$`/`$pkzip$` 输入按 format 分组处理。混合格式的单一真实 ZIP 若本机工具无法稳定构造，测试会明确标记 `NOT_VERIFIED`，不会把 synthetic extractor-output 结果写成真实集成通过。
+`JohnIncrementalOutputRegressionTest.ps1` 验证 John stdout/stderr 的字节级增量读取、UTF-8 跨 buffer/append 边界、未完成末行以及 truncate/recreate；`JohnDirectWordlistRegressionTest.ps1` 验证内置最终 plaintext stream 直接交给 John 后候选总数、CoverageId、阶段/整体进度与 NanaZip 结果保持一致；`JohnUnicodeDictionarySmokeTest.ps1` 使用标准 WinZip AES 与本地 7z 夹具实测 Unicode 字典路径；`HashcatRestoreUnicodeRegressionTest.ps1` 验证 Unicode runtime 路径的 restore rewrite；`JohnMixedZipSmokeTest.ps1` 验证 bundled John 对混合 `$zip2$`/`$pkzip$` 输入按 format 分组处理。混合格式的单一真实 ZIP 若本机工具无法稳定构造，测试会明确标记 `NOT_VERIFIED`，不会把 synthetic extractor-output 结果写成真实集成通过。

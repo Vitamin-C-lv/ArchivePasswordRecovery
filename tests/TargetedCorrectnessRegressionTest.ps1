@@ -199,10 +199,24 @@ try {
     $identityFile = Join-Path $testRoot 'identity.bin'
     [System.IO.File]::WriteAllText($identityFile, 'archive identity')
     $archiveIdentity = Get-ArchiveIdentity -Path $identityFile
+    $validUtf8Dictionary = Join-Path $testRoot 'valid-utf8.txt'
+    [System.IO.File]::WriteAllText($validUtf8Dictionary, ([string]([char]0x6D4B) + [string]([char]0x8BD5) + [Environment]::NewLine), (New-Object System.Text.UTF8Encoding($false)))
+    Assert-True (Test-TextFileUtf8 -Path $validUtf8Dictionary) 'valid UTF-8 dictionary was rejected by the encoding contract'
+    $utf8BomDictionary = Join-Path $testRoot 'valid-utf8-bom.txt'
+    [System.IO.File]::WriteAllText($utf8BomDictionary, ('bom' + [Environment]::NewLine), (New-Object System.Text.UTF8Encoding($true)))
+    Assert-True (Test-TextFileUtf8 -Path $utf8BomDictionary) 'UTF-8 BOM dictionary was rejected by the encoding contract'
+    $bomReader = New-StrictUtf8Reader -Path $utf8BomDictionary
+    try { Assert-Equal -Actual $bomReader.ReadLine() -Expected 'bom' -Message 'UTF-8 BOM was exposed as a candidate character' } finally { $bomReader.Dispose() }
+    $utf16Dictionary = Join-Path $testRoot 'invalid-utf16.txt'
+    [System.IO.File]::WriteAllText($utf16Dictionary, ('utf16' + [Environment]::NewLine), (New-Object System.Text.UnicodeEncoding($false, $true)))
+    Assert-True (-not (Test-TextFileUtf8 -Path $utf16Dictionary)) 'UTF-16 dictionary was accepted by the UTF-8-only contract'
+    $invalidUtf8Dictionary = Join-Path $testRoot 'invalid-utf8.txt'
+    [System.IO.File]::WriteAllBytes($invalidUtf8Dictionary, [byte[]](0xFF, 0xFE, 0xFD, 0x0A))
+    Assert-True (-not (Test-TextFileUtf8 -Path $invalidUtf8Dictionary)) 'invalid UTF-8 dictionary was accepted by the encoding contract'
     $oldJob = [pscustomobject](New-TestJob -ArchivePath $identityFile -RecoveryLevel 2 -JobId 'frozen-job' -DevicePreference 'CPU' -QuickCandidates @('abc', '123') -DictionaryPath '' -Mask '?u?l?d' -QuickCoverageRevision 0 -CustomMaskCoverageRevision 1 -UiCulture 'zh-CN' -RecoveryPlanYear 2025 -CreatedUtc '2025-01-02T03:04:05.0000000Z' -SchemaVersion 3)
     $oldJob.PSObject.Properties.Remove('QuickCoverageRevision')
     $oldJob.PSObject.Properties.Remove('QuickCoverageLegacy')
-    $newControls = [pscustomobject](New-TestJob -ArchivePath $identityFile -RecoveryLevel 3 -JobId 'new-job-id' -DevicePreference 'Auto' -QuickCandidates @('abc', '123', 'abc', '   ') -DictionaryPath '' -Mask '?u?l?d' -QuickCoverageRevision 1 -CustomMaskCoverageRevision 1 -UiCulture 'en-US' -RecoveryPlanYear 2026 -CreatedUtc '2026-06-07T08:09:10.0000000Z')
+    $newControls = [pscustomobject](New-TestJob -ArchivePath $identityFile -RecoveryLevel 3 -JobId 'new-job-id' -DevicePreference 'Auto' -QuickCandidates @('abc', '123', 'abc', '') -DictionaryPath '' -Mask '?u?l?d' -QuickCoverageRevision 1 -CustomMaskCoverageRevision 1 -UiCulture 'en-US' -RecoveryPlanYear 2026 -CreatedUtc '2026-06-07T08:09:10.0000000Z')
     $merged = Merge-RecoveryJobForLevelUpgrade -ExistingJob $oldJob -NewControlJob $newControls
     Assert-Equal -Actual $merged.JobId -Expected 'frozen-job' -Message 'level upgrade changed JobId'
     Assert-Equal -Actual $merged.ArchivePath -Expected $oldJob.ArchivePath -Message 'level upgrade changed ArchivePath'
@@ -217,6 +231,11 @@ try {
     $mergedQuickItem = @(Get-RecoveryPlanItems -Job $merged -StageNumber 1 | Where-Object { $_.Kind -eq 'Quick' } | Select-Object -First 1)[0]
     Assert-Equal -Actual $mergedQuickItem.CoverageId -Expected 'quick:user:v1' -Message 'legacy same Quick config changed coverage identity'
     Assert-Equal -Actual @($mergedQuickItem.Candidates).Count -Expected 2 -Message 'Quick canonicalization did not remove duplicate/blank rows'
+    $fullWidthSpace = ([char]0x3000).ToString()
+    $whitespaceCandidates = @(Get-CanonicalQuickCandidates -Candidates @('   ', $fullWidthSpace, '   ', ''))
+    Assert-Equal -Actual $whitespaceCandidates.Count -Expected 2 -Message 'Quick canonicalization discarded a whitespace-only Unicode password'
+    Assert-Equal -Actual $whitespaceCandidates[0] -Expected '   ' -Message 'Quick canonicalization changed an ASCII whitespace password'
+    Assert-Equal -Actual $whitespaceCandidates[1] -Expected $fullWidthSpace -Message 'Quick canonicalization changed a full-width whitespace password'
     Assert-Equal -Actual (Get-BuiltinDictionaryLanguages -Job $merged)[1] -Expected 'zh' -Message 'frozen UiCulture did not retain the zh dictionary plan'
     Assert-Equal -Actual (Get-PlanYear -Job $merged) -Expected 2025 -Message 'frozen RecoveryPlanYear was not used by the plan'
 
@@ -313,6 +332,19 @@ function Get-RecoveryPlanCandidateCount {
     Assert-True ($null -eq (ConvertTo-CapitalInitialVariant -Word 'Password')) 'capital transform emitted an unchanged Password variant'
     $chineseWord = [string]([char]0x4E2D) + [string]([char]0x6587)
     Assert-True ($null -eq (ConvertTo-CapitalInitialVariant -Word $chineseWord)) 'case-invariant Chinese word produced a capital variant'
+    $supplementaryScalar = [string]([char]0xD83D) + [string]([char]0xDE00)
+    $supplementaryWord = $chineseWord + $supplementaryScalar
+    $supplementaryAppend = @(Get-RuleVariants -Word $supplementaryWord -RecoveryPlanYear 2026 -Family 'Append')
+    Assert-True ($supplementaryAppend -contains ($supplementaryWord + $supplementaryScalar)) 'rule append split a supplementary Unicode scalar into one surrogate'
+    Assert-True (-not ($supplementaryAppend -contains ($supplementaryWord + [string]([char]0xDE00)))) 'rule append emitted a lone low surrogate for a supplementary Unicode scalar'
+    $unicodeMaskTokens = @(Get-MaskTokens -Mask ($supplementaryScalar + '?d'))
+    Assert-Equal -Actual $unicodeMaskTokens.Count -Expected 2 -Message 'mask parser split a supplementary Unicode literal into surrogate tokens'
+    Assert-Equal -Actual $unicodeMaskTokens[0].Text -Expected $supplementaryScalar -Message 'mask parser changed a supplementary Unicode literal'
+    Assert-Equal -Actual (Convert-MaskIndexToCandidate -Tokens $unicodeMaskTokens -Index 3) -Expected ($supplementaryScalar + '3') -Message 'CPU mask expansion changed a supplementary Unicode literal'
+    $unicodeCustomCharacters = 'a' + $supplementaryScalar + $chineseWord
+    $unicodeCustomCanonical = Get-CharsetCharacters -Kind 'custom' -CustomCharacters $unicodeCustomCharacters
+    Assert-Equal -Actual (Get-CharsetCharacterCount -Characters $unicodeCustomCanonical) -Expected 4 -Message 'custom Unicode charset scalar count is incorrect'
+    Assert-Equal -Actual (Convert-IndexToCandidate -Index 1 -Length 1 -Characters $unicodeCustomCanonical) -Expected $supplementaryScalar -Message 'CPU custom Unicode charset expansion split a supplementary scalar'
     $planJob = [pscustomobject](New-TestJob -ArchivePath $identityFile -RecoveryLevel 4 -UiCulture 'zh-CN' -RecoveryPlanYear 2026)
     $capitalItems = @(Get-RecoveryPlanItems -Job $planJob -StageNumber 4 | Where-Object { $_.Kind -eq 'CapitalInitialDigits' })
     Assert-True ($capitalItems.Count -gt 0) 'CapitalInitialDigits coverage was not planned'
@@ -326,8 +358,12 @@ function Get-RecoveryPlanCandidateCount {
     $capitalDictionary = Join-Path $testRoot 'capital-dictionary.txt'
     [System.IO.File]::WriteAllLines($capitalDictionary, [string[]]@('password', 'Password', $chineseWord), (New-Object System.Text.UTF8Encoding($false)))
     $capitalPlan = New-HashcatAttackPlan -Job ([pscustomobject]@{ Strategy = 'CapitalInitialDigits'; DictionaryPath = $capitalDictionary }) -HashPath 'hash' -JobDirectory $testRoot -RecoveryPlanYear 2026 -Strategy 'CapitalInitialDigits'
-    Assert-True (@($capitalPlan.Arguments) -contains '-a' -and @($capitalPlan.Arguments) -contains '6') 'CapitalInitialDigits GPU plan did not use Hashcat hybrid attack'
-    Assert-True (@($capitalPlan.Arguments) -contains $capitalDictionary) 'CapitalInitialDigits GPU plan did not use the transformed dictionary path'
+    Assert-True (-not [bool]$capitalPlan.Supported -and [string]$capitalPlan.Message -match '(?i)non-ASCII|Unicode') 'CapitalInitialDigits did not fall back for a non-ASCII UTF-8 dictionary'
+    $asciiCapitalDictionary = Join-Path $testRoot 'capital-dictionary-ascii.txt'
+    [System.IO.File]::WriteAllLines($asciiCapitalDictionary, [string[]]@('password', 'Password'), (New-Object System.Text.UTF8Encoding($false)))
+    $asciiCapitalPlan = New-HashcatAttackPlan -Job ([pscustomobject]@{ Strategy = 'CapitalInitialDigits'; DictionaryPath = $asciiCapitalDictionary }) -HashPath 'hash' -JobDirectory $testRoot -RecoveryPlanYear 2026 -Strategy 'CapitalInitialDigits'
+    Assert-True (@($asciiCapitalPlan.Arguments) -contains '-a' -and @($asciiCapitalPlan.Arguments) -contains '6') 'CapitalInitialDigits ASCII GPU plan did not use Hashcat hybrid attack'
+    Assert-True (@($asciiCapitalPlan.Arguments) -contains $asciiCapitalDictionary) 'CapitalInitialDigits ASCII GPU plan did not use the transformed dictionary path'
 
     $capitalWorkerPath = Join-Path $testRoot 'RecoveryWorker-Capital.ps1'
     $capitalOverride = @"
@@ -445,6 +481,7 @@ function Get-RecoveryPlanCandidateCount {
         CapitalInitialSchema = 'PASS'
         CapitalInitialCpuExecution = 'PASS'
         CapitalInitialGpuPlan = 'PASS'
+        UnicodeScalarSemantics = 'PASS'
         RulesCpuGpuEquivalence = 'PASS'
         HashcatStdout = $hashcatStdoutStatus
     } | Format-List

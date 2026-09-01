@@ -50,40 +50,179 @@ function New-LegacyJob {
     }
 }
 
-function New-WslUnicodeArchive {
+function New-LocalUnicodeArchive {
     param(
         [Parameter(Mandatory = $true)][string]$Root,
         [Parameter(Mandatory = $true)][string]$Name,
         [Parameter(Mandatory = $true)][string]$Format,
-        [Parameter(Mandatory = $true)][string]$ContentPath
+        [Parameter(Mandatory = $true)][string]$ContentPath,
+        [Parameter(Mandatory = $true)][string]$Password
     )
 
     $archivePath = Join-Path $Root ($Name + '.' + $Format.ToLowerInvariant())
-    $wsl = Get-Command wsl.exe -ErrorAction SilentlyContinue
-    if ($null -eq $wsl) { throw 'WSL is not available for the temporary Unicode archive fixture.' }
-    $linuxRoot = '/mnt/c/' + ($Root.Substring(3) -replace '\\', '/')
-    $linuxArchive = $linuxRoot + '/' + ($Name + '.' + $Format.ToLowerInvariant())
-    $linuxContent = $linuxRoot + '/' + [System.IO.Path]::GetFileName($ContentPath)
-    $passwordExpression = '$(printf "\346\265\213\350\257\225\345\257\206\347\240\20142")'
-    $scriptText = if ($Format -eq '7z') {
-        'password=' + $passwordExpression + '; /usr/bin/7z a -t7z -p"$password" -mhe=on -mx=1 -bd -y "' + $linuxArchive + '" "' + $linuxContent + '"'
-    }
-    else {
-        'password=' + $passwordExpression + '; /usr/bin/7z a -tzip -p"$password" -mem=AES256 -bd -y "' + $linuxArchive + '" "' + $linuxContent + '"'
-    }
-    $previousErrorActionPreference = $ErrorActionPreference
-    try {
-        $ErrorActionPreference = 'Continue'
-        & $wsl.Source -e bash -lc $scriptText | Out-Null
-        $createdExitCode = $LASTEXITCODE
-    }
-    finally {
-        $ErrorActionPreference = $previousErrorActionPreference
-    }
-    if ($createdExitCode -ne 0 -or -not (Test-Path -LiteralPath $archivePath -PathType Leaf)) {
-        throw ('WSL could not create the temporary Unicode {0} fixture.' -f $Format)
+    if ($Format -ne '7z') { throw 'New-LocalUnicodeArchive only creates the local 7z fixture.' }
+    $created = Invoke-LocalNativeProcess -FilePath (Resolve-SevenZip) -Arguments @(
+        '-sccUTF-8', 'a', '-t7z', '-mhe=on', '-mx=1', '-bd', '-y', ('-p' + $Password), $archivePath, $ContentPath
+    )
+    if ($created.ExitCode -ne 0 -or -not (Test-Path -LiteralPath $archivePath -PathType Leaf)) {
+        throw ('NanaZip could not create the temporary Unicode {0} fixture.' -f $Format)
     }
     return $archivePath
+}
+
+function Add-U16 {
+    param(
+        [Parameter(Mandatory = $true)][AllowEmptyCollection()][System.Collections.Generic.List[byte]]$Bytes,
+        [Parameter(Mandatory = $true)][int]$Value
+    )
+    [void]$Bytes.Add([byte]($Value -band 0xFF))
+    [void]$Bytes.Add([byte](($Value -shr 8) -band 0xFF))
+}
+
+function Add-U32 {
+    param(
+        [Parameter(Mandatory = $true)][AllowEmptyCollection()][System.Collections.Generic.List[byte]]$Bytes,
+        [Parameter(Mandatory = $true)][long]$Value
+    )
+    [void]$Bytes.Add([byte]($Value -band 0xFF))
+    [void]$Bytes.Add([byte](($Value -shr 8) -band 0xFF))
+    [void]$Bytes.Add([byte](($Value -shr 16) -band 0xFF))
+    [void]$Bytes.Add([byte](($Value -shr 24) -band 0xFF))
+}
+
+function Get-WinZipAesPayload {
+    param(
+        [Parameter(Mandatory = $true)][byte[]]$Plaintext,
+        [Parameter(Mandatory = $true)][byte[]]$PasswordBytes
+    )
+
+    # WinZip AES-256 derives 66 bytes with PBKDF2-HMAC-SHA1 (1000 rounds):
+    # 32-byte encryption key, 32-byte authentication key, 2-byte verifier.
+    [byte[]]$salt = @(0x10, 0x20, 0x30, 0x40, 0x50, 0x60, 0x70, 0x80, 0x90, 0xA0, 0xB0, 0xC0, 0xD0, 0xE0, 0xF0, 0x01)
+    $kdf = New-Object System.Security.Cryptography.Rfc2898DeriveBytes($PasswordBytes, $salt, 1000)
+    try { [byte[]]$derived = $kdf.GetBytes(66) } finally { $kdf.Dispose() }
+    [byte[]]$aesKey = $derived[0..31]
+    [byte[]]$macKey = $derived[32..63]
+    [byte[]]$verifier = $derived[64..65]
+
+    $aes = New-Object System.Security.Cryptography.AesManaged
+    $aes.Mode = [System.Security.Cryptography.CipherMode]::ECB
+    $aes.Padding = [System.Security.Cryptography.PaddingMode]::None
+    $aes.KeySize = 256
+    $aes.BlockSize = 128
+    $aes.Key = $aesKey
+    $aes.IV = New-Object byte[] 16
+    $encryptor = $aes.CreateEncryptor()
+    [byte[]]$ciphertext = New-Object byte[] $Plaintext.Length
+    [byte[]]$counter = New-Object byte[] 16
+    $counter[0] = 1
+    try {
+        for ($offset = 0; $offset -lt $Plaintext.Length; $offset += 16) {
+            [byte[]]$keystream = New-Object byte[] 16
+            [void]$encryptor.TransformBlock($counter, 0, 16, $keystream, 0)
+            $blockLength = [math]::Min(16, $Plaintext.Length - $offset)
+            for ($index = 0; $index -lt $blockLength; $index++) {
+                $ciphertext[$offset + $index] = [byte]($Plaintext[$offset + $index] -bxor $keystream[$index])
+            }
+            for ($index = 0; $index -lt 16; $index++) {
+                $counter[$index] = [byte]($counter[$index] + 1)
+                if ($counter[$index] -ne 0) { break }
+            }
+        }
+        [void]$encryptor.TransformFinalBlock((New-Object byte[] 0), 0, 0)
+    }
+    finally {
+        $encryptor.Dispose()
+        $aes.Dispose()
+    }
+
+    $hmac = New-Object System.Security.Cryptography.HMACSHA1 -ArgumentList (,$macKey)
+    try { [byte[]]$tag = $hmac.ComputeHash($ciphertext)[0..9] } finally { $hmac.Dispose() }
+    $payload = New-Object 'System.Collections.Generic.List[byte]'
+    foreach ($value in $salt) { [void]$payload.Add($value) }
+    foreach ($value in $verifier) { [void]$payload.Add($value) }
+    foreach ($value in $ciphertext) { [void]$payload.Add($value) }
+    foreach ($value in $tag) { [void]$payload.Add($value) }
+    return $payload.ToArray()
+}
+
+function New-WinZipAesUnicodeArchive {
+    param(
+        [Parameter(Mandatory = $true)][string]$Path,
+        [Parameter(Mandatory = $true)][string]$Password
+    )
+
+    $filenameEncoding = New-Object System.Text.ASCIIEncoding
+    $filename = $filenameEncoding.GetBytes('unicode-fixture.txt')
+    $plaintext = $filenameEncoding.GetBytes('Unicode ZIP AES fixture')
+    # The local NanaZip/7-Zip ZIP decoder maps the candidate through the
+    # Windows active ANSI code page (CP_ACP). Use that same byte contract for
+    # a standards-valid WinZip AES fixture; reject an ACP that cannot round-trip
+    # this Chinese password instead of silently creating a different password.
+    $passwordEncoding = [System.Text.Encoding]::Default
+    $passwordBytes = $passwordEncoding.GetBytes($Password)
+    if (-not [string]::Equals($passwordEncoding.GetString($passwordBytes), $Password, [System.StringComparison]::Ordinal)) {
+        throw ('The active Windows code page ({0}) cannot represent the Unicode fixture password.' -f $passwordEncoding.CodePage)
+    }
+    [byte[]]$payload = Get-WinZipAesPayload -Plaintext $plaintext -PasswordBytes $passwordBytes
+
+    $extra = New-Object 'System.Collections.Generic.List[byte]'
+    Add-U16 -Bytes $extra -Value 0x9901
+    Add-U16 -Bytes $extra -Value 7
+    Add-U16 -Bytes $extra -Value 2
+    foreach ($value in $filenameEncoding.GetBytes('AE')) { [void]$extra.Add($value) }
+    [void]$extra.Add([byte]3)
+    Add-U16 -Bytes $extra -Value 0
+
+    $archive = New-Object 'System.Collections.Generic.List[byte]'
+    Add-U32 -Bytes $archive -Value 0x04034B50
+    Add-U16 -Bytes $archive -Value 20
+    Add-U16 -Bytes $archive -Value 1
+    Add-U16 -Bytes $archive -Value 99
+    Add-U16 -Bytes $archive -Value 0
+    Add-U16 -Bytes $archive -Value 0
+    Add-U32 -Bytes $archive -Value 0
+    Add-U32 -Bytes $archive -Value $payload.Length
+    Add-U32 -Bytes $archive -Value $plaintext.Length
+    Add-U16 -Bytes $archive -Value $filename.Length
+    Add-U16 -Bytes $archive -Value $extra.Count
+    foreach ($value in $filename) { [void]$archive.Add($value) }
+    foreach ($value in $extra) { [void]$archive.Add($value) }
+    foreach ($value in $payload) { [void]$archive.Add($value) }
+
+    $centralOffset = $archive.Count
+    Add-U32 -Bytes $archive -Value 0x02014B50
+    Add-U16 -Bytes $archive -Value 20
+    Add-U16 -Bytes $archive -Value 20
+    Add-U16 -Bytes $archive -Value 1
+    Add-U16 -Bytes $archive -Value 99
+    Add-U16 -Bytes $archive -Value 0
+    Add-U16 -Bytes $archive -Value 0
+    Add-U32 -Bytes $archive -Value 0
+    Add-U32 -Bytes $archive -Value $payload.Length
+    Add-U32 -Bytes $archive -Value $plaintext.Length
+    Add-U16 -Bytes $archive -Value $filename.Length
+    Add-U16 -Bytes $archive -Value $extra.Count
+    Add-U16 -Bytes $archive -Value 0
+    Add-U16 -Bytes $archive -Value 0
+    Add-U16 -Bytes $archive -Value 0
+    Add-U32 -Bytes $archive -Value 0
+    Add-U32 -Bytes $archive -Value 0
+    foreach ($value in $filename) { [void]$archive.Add($value) }
+    foreach ($value in $extra) { [void]$archive.Add($value) }
+    $centralSize = $archive.Count - $centralOffset
+
+    Add-U32 -Bytes $archive -Value 0x06054B50
+    Add-U16 -Bytes $archive -Value 0
+    Add-U16 -Bytes $archive -Value 0
+    Add-U16 -Bytes $archive -Value 1
+    Add-U16 -Bytes $archive -Value 1
+    Add-U32 -Bytes $archive -Value $centralSize
+    Add-U32 -Bytes $archive -Value $centralOffset
+    Add-U16 -Bytes $archive -Value 0
+
+    [System.IO.File]::WriteAllBytes($Path, $archive.ToArray())
+    return $Path
 }
 
 function Invoke-Worker {
@@ -121,7 +260,7 @@ try {
     $utf8 = New-Object System.Text.UTF8Encoding($false)
     $workerPath = Join-Path $srcRoot 'RecoveryWorker.ps1'
     $workerText = [System.IO.File]::ReadAllText($workerPath)
-    Assert-True (-not $workerText.Contains('--encoding=UTF-8') -and -not $workerText.Contains('--input-encoding=UTF-8')) 'the Worker added an encoding switch without a verified need'
+    Assert-True ($workerText.Contains("JohnOption = 'UTF-8'") -and $workerText.Contains('--internal-codepage=UTF-8') -and $workerText.Contains("JohnOption = 'ISO-8859-1'")) 'the Worker did not declare the verified UTF-8 and ZIP ACP John encoding routes'
 
     $dictionaryPath = Join-Path $testRoot 'unicode-dictionary.txt'
     [System.IO.File]::WriteAllText($dictionaryPath, ('wrong-unicode' + [Environment]::NewLine + $password + [Environment]::NewLine), $utf8)
@@ -130,8 +269,13 @@ try {
     $zipStatus = 'NOT_VERIFIED'
     $zipReason = ''
     $zipProgress = $null
+    $zipFixtureProbeStatus = 'NOT_VERIFIED'
     try {
-        $zipPath = New-WslUnicodeArchive -Root $testRoot -Name 'unicode-zip-aes' -Format 'ZIP' -ContentPath $contentPath
+        $zipPath = New-WinZipAesUnicodeArchive -Path (Join-Path $testRoot 'unicode-zip-aes.zip') -Password $password
+        $zipProbe = Test-ArchivePassword -ArchivePath $zipPath -Password $password -SevenZip $sevenZip
+        $zipWrongProbe = Test-ArchivePassword -ArchivePath $zipPath -Password 'wrong' -SevenZip $sevenZip
+        Assert-True ([bool]$zipProbe.IsValid -and -not [bool]$zipWrongProbe.IsValid) 'the standards-built Unicode ZIP AES fixture did not pass the local NanaZip password probe'
+        $zipFixtureProbeStatus = 'PASS'
         $zipJobDirectory = Join-Path $testRoot 'zip-job'
         New-Item -ItemType Directory -Path $zipJobDirectory | Out-Null
         Write-LocalJsonAtomic -Path (Join-Path $zipJobDirectory 'job.json') -Value ([pscustomobject](New-LegacyJob -JobId ('john-unicode-zip-' + [guid]::NewGuid().ToString('N')) -ArchivePath $zipPath -DictionaryPath $dictionaryPath))
@@ -149,14 +293,14 @@ try {
         }
     }
     catch {
-        $zipReason = 'the local temporary Unicode ZIP fixture could not be created or executed.'
+        $zipReason = 'the local temporary Unicode ZIP fixture could not be created or executed: ' + $_.Exception.Message
     }
 
     $sevenZipStatus = 'NOT_VERIFIED'
     $sevenZipReason = ''
     $sevenZipProgress = $null
     try {
-        $sevenZipPath = New-WslUnicodeArchive -Root $testRoot -Name 'unicode-sevenzip-aes' -Format '7z' -ContentPath $contentPath
+        $sevenZipPath = New-LocalUnicodeArchive -Root $testRoot -Name 'unicode-sevenzip-aes' -Format '7z' -ContentPath $contentPath -Password $password
         $sevenZipJobDirectory = Join-Path $testRoot 'sevenzip-job'
         New-Item -ItemType Directory -Path $sevenZipJobDirectory | Out-Null
         Write-LocalJsonAtomic -Path (Join-Path $sevenZipJobDirectory 'job.json') -Value ([pscustomobject](New-LegacyJob -JobId ('john-unicode-7z-' + [guid]::NewGuid().ToString('N')) -ArchivePath $sevenZipPath -DictionaryPath $dictionaryPath))
@@ -174,26 +318,32 @@ try {
         }
     }
     catch {
-        $sevenZipReason = 'the local temporary Unicode 7-Zip fixture could not be created or executed.'
+        $sevenZipReason = 'the local temporary Unicode 7-Zip fixture could not be created or executed: ' + $_.Exception.Message
     }
 
     [pscustomobject]@{
         JohnEncodingCapability = $encodingCapability
-        WorkerEncodingMode = 'DEFAULT'
-        ZipAesUtf8 = $zipStatus
+        WorkerEncodingMode = 'EXPLICIT_SOURCE_UTF8_FORMAT_AWARE'
+        ZipAesUnicode = $zipStatus
         SevenZipUtf8 = $sevenZipStatus
         ZipReason = $zipReason
         SevenZipReason = $sevenZipReason
+        ZipFixtureNanaZipProbe = $zipFixtureProbeStatus
+        ZipState = if ($null -ne $zipProgress) { [string]$zipProgress.State } else { '' }
+        ZipMessage = if ($null -ne $zipProgress) { [string]$zipProgress.Message } else { '' }
+        ZipErrorCode = if ($null -ne $zipProgress) { [string]$zipProgress.ErrorCode } else { '' }
+        ZipJohnEncodingMode = if ($null -ne $zipProgress) { [string]$zipProgress.JohnEncodingMode } else { '' }
         ZipBackend = if ($null -ne $zipProgress) { [string]$zipProgress.Backend } else { '' }
         ZipJohnLaunches = if ($null -ne $zipProgress) { [int]$zipProgress.JohnProcessLaunchCount } else { 0 }
+        SevenZipJohnEncodingMode = if ($null -ne $sevenZipProgress) { [string]$sevenZipProgress.JohnEncodingMode } else { '' }
     } | Format-List
     if ($zipStatus -eq 'PASS') {
         'JOHN_UTF8: PASS'
-        'ZIP_AES_UTF8: PASS'
+        'ZIP_AES_UNICODE: PASS'
     }
     else {
         'JOHN_UTF8: UNSUPPORTED'
-        'ZIP_AES_UTF8: ' + $zipStatus
+        'ZIP_AES_UNICODE: ' + $zipStatus
     }
     if ($sevenZipStatus -eq 'PASS') {
         'SEVENZIP_UTF8: PASS'
