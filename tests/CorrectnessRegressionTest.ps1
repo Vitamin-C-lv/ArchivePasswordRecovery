@@ -125,7 +125,7 @@ try {
     Assert-Equal -Actual $commonSymbolItems.Count -Expected 2 -Message 'zh L4 CommonSymbols coverages were not split per language'
     Assert-Equal -Actual @($commonSymbolItems | Where-Object { [long]$_.CandidateCount -ne 5000 }).Count -Expected 0 -Message 'CommonSymbols candidate total is not the five-symbol L1 total'
     Assert-Equal -Actual @($commonSymbolItems | Where-Object { $_.Symbols -contains '!' }).Count -Expected 0 -Message 'CommonSymbols still includes the removed exclamation-mark suffix'
-    Assert-Equal -Actual @($commonSymbolItems | Where-Object { -not $_.GpuSupported -or [string]$_.EngineStrategy -ne 'GeneratedDictionary' }).Count -Expected 0 -Message 'CommonSymbols GPU generated-set adapter is not enabled'
+    Assert-Equal -Actual @($commonSymbolItems | Where-Object { -not $_.GpuSupported -or [string]$_.EngineStrategy -ne 'Rules' }).Count -Expected 0 -Message 'CommonSymbols GPU native rule backend is not enabled'
     Assert-Equal -Actual @($commonSymbolItems | Where-Object { [string]$_.CoverageId -notmatch ':v3$' }).Count -Expected 0 -Message 'CommonSymbols v3 CoverageId is missing'
     Assert-Equal -Actual @($l4Items | Where-Object { $_.Kind -eq 'YearRange' }).Count -Expected 0 -Message 'redundant L4 year range still exists'
     Assert-Equal -Actual @($l4Items | Where-Object { [string]$_.CoverageId -match 'word-year' }).Count -Expected 0 -Message 'redundant word-year coverage still exists'
