@@ -12,6 +12,7 @@ Windows 本地离线压缩包密码恢复工具。
 - NanaZip final verification
 - Five recovery levels
 - Pause / Stop / saved jobs
+- Multi-volume recognition, first-volume normalization, and per-volume resume identity checks
 - No cloud cracking, telemetry, or archive/password upload
 
 This tool is intended for recovering passwords for archives you own or are authorized to access.
@@ -35,6 +36,8 @@ The bundled John Windows runtime uses `tools\extractors\cygwin1.dll`, whose loca
 | RAR3-p uncompressed（Hashcat mode 23700） | Adapter ready; real fixture not verified | Bundled John does not accept this record | Supported | Not verified; CPU/NanaZip fallback |
 | Other RAR records | Unsupported | Unsupported | Supported | CPU fallback only |
 | Other NanaZip-recognized formats | Unsupported | Unsupported | Supported | CPU fallback only |
+| 7z split (`name.7z.001`, `.002`, ...), ZIP split (`name.zip.001`, `.002`, ...) | Current split extractors not accepted | Current split extractors not accepted | Supported when the complete set is present | Supported through first-volume CPU verification; GPU/John extractor fallback is explicit |
+| RAR modern/old split naming (`name.part1.rar` / `name.rar`, `name.r00`, ...) | Not verified | Not verified | Not verified without a real RAR set | Naming recognition and missing-volume diagnostics only; no local RAR creator |
 | Quick exact candidates | Not used | Not used | Supported | CPU only by design |
 | Hybrid with `?w` in the middle | Unsupported | Unsupported | Supported | CPU fallback only |
 
@@ -48,8 +51,9 @@ Bundled third-party components and their accompanying license texts are listed i
 
 ## 当前已经实现
 
-- 选择本地 ZIP、7z、RAR 及 NanaZip 可识别的其他压缩文件。
+- 选择本地 ZIP、7z、RAR 及 NanaZip 可识别的其他压缩文件；也可选择 `.7z.001`、`.zip.001`、`.part1.rar` 或旧式 `.r00` 等分卷文件。
 - 通过文件签名和本地 NanaZip 元数据识别格式、加密状态与可见加密方法信息。
+- 分卷文件按同目录、同归档基名和同命名方案识别；选择中间卷时自动归一化到首卷，缺少 `.003` 等明显序号会在检查和恢复前阻断。当前真实 7z/ZIP 分卷已验证首卷 NanaZip CPU 检查与加密密码验证；本地 `7z2hashcat`/`zip2john` 对分卷首卷未产生可用记录，因此不会把分卷宣称为 GPU 或 John bulk 支持。RAR modern/old 目前只有命名识别夹具，未宣称真实 RAR 分卷恢复。
 - 五级累计式本地恢复等级：1 级快速尝试、2 级常用密码、3 级增强恢复、4 级深度搜索、5 级完整搜索；选择 N 级会按顺序执行前 N 个既有底层策略，找到并经本机验证后立即停止。每个覆盖项有稳定的 CoverageId；已完成项只作完成记账，不会被写进 `SkippedStages`，也不会清除后续覆盖项的断点。
   - `Quick`：用户给出的精确候选密码，可先测试空密码。
   - `Dictionary`：逐行测试本地字典。
@@ -69,7 +73,7 @@ Bundled third-party components and their accompanying license texts are listed i
 - `Auto` 对 `Quick` 保持 CPU；对适合的 ZIP AES 或 7z AES 字典、规则、部分 Mask/Hybrid 和 BruteForce，优先选择实际初始化的 NVIDIA GPU，其次 AMD GPU；格式/加密方式/Backend/策略不支持时会诚实回退 CPU。
 - 界面以拖入压缩包、选择 1–5 级、保持 Auto、开始恢复为首屏主线；高级候选参数和设备技术细节默认折叠。运行中显示当前阶段（X/N）、Backend、实际计算设备、已测试/总候选、平滑速度、运行时间、预计剩余、当前范围最坏时间、真实进度条和本地验证结果。
 - WPF 主窗口使用 `assets\ArchivePasswordRecovery_Primary.ico` 作为应用图标。
-- Worker 的 `pause.flag` / `stop.flag` 控制保留。CPU 在进程内暂停；GPU 使用重定向 stdin 向 Hashcat 发送 `q`，等待它退出并在本地 restore 文件实际存在时保存断点；如果本次退出没有产生 restore，继续操作会重新开始当前 GPU 覆盖项，而不会宣称已保存最新断点。停止同样只在可用时保留本地 Hashcat restore 数据。通过“Open saved job...”可以重新打开保存的任务目录；继续前会校验归档路径、大小和 UTC 修改时间。升级恢复等级时保留 JobId、归档身份、创建时间、任务年份和 UI 文化，暂停/停止且有当前覆盖断点时续跑该覆盖项，Exhausted 时从新增覆盖项开始；Recovered 和 NotEncrypted 会阻止升级。
+- Worker 的 `pause.flag` / `stop.flag` 控制保留。CPU 在进程内暂停；GPU 使用重定向 stdin 向 Hashcat 发送 `q`，等待它退出并在本地 restore 文件实际存在时保存断点；如果本次退出没有产生 restore，继续操作会重新开始当前 GPU 覆盖项，而不会宣称已保存最新断点。停止同样只在可用时保留本地 Hashcat restore 数据。通过“Open saved job...”可以重新打开保存的任务目录；继续前会校验归档首卷和每个分卷的规范化路径、大小及 UTC 修改时间，缺卷、大小变化或修改时间变化都会明确阻断。升级恢复等级时保留 JobId、归档身份、完整分卷身份、创建时间、任务年份和 UI 文化，暂停/停止且有当前覆盖断点时续跑该覆盖项，Exhausted 时从新增覆盖项开始；Recovered 和 NotEncrypted 会阻止升级。
 - 成功候选直接用本机 `7z t` 验证。只有本地验证返回成功时，Worker 才写入 `Recovered` 状态。
 - 当前实机已验证到 NVIDIA GeForce RTX 4070 与 AMD Radeon 780M Graphics；两者均由 Hashcat OpenCL 实际执行 ZIP AES、RAR5、RAR3-hp 以及已具备真实夹具的 RAR3-p compressed 候选计算，之后由 NanaZip 本地复验。RAR5 与 RAR3-hp 另有 John Jumbo CPU bulk 实测；RAR3-p 记录不被当前 bundled John 接受时会回退到 NanaZip CPU 路径。
 
@@ -154,12 +158,15 @@ WPF UI (ArchivePasswordRecovery.ps1)
 
 没有插件市场、数据库服务、账户系统、AI 模块、云端服务或分布式调度。
 
+`ArchiveVolumeSetRegressionTest.ps1` 会在系统临时目录生成真实 7z/ZIP 普通与加密分卷，验证中间卷归一化、首卷 NanaZip 检查、正确/错误密码、Worker CPU 恢复、缺卷阻断、分卷身份 JSON 往返及尺寸变化/缺卷恢复阻断；同时只对 modern/old RAR 做命名识别验证，不伪造 RAR 真实夹具。
+
 ## 本地验证
 
 在 Windows PowerShell 中运行：
 
 ```powershell
 & "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe" -NoProfile -ExecutionPolicy Bypass -File .\tests\SmokeTest.ps1
+& "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe" -NoProfile -ExecutionPolicy Bypass -File .\tests\ArchiveVolumeSetRegressionTest.ps1
 & "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe" -NoProfile -ExecutionPolicy Bypass -File .\tests\StrategySmokeTest.ps1
 & "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe" -NoProfile -ExecutionPolicy Bypass -File .\tests\ControlSmokeTest.ps1
 & "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe" -NoProfile -ExecutionPolicy Bypass -File .\tests\GpuZipBackendSmokeTest.ps1

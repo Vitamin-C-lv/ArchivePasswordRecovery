@@ -1002,6 +1002,16 @@ function Convert-UiMessage {
         return $exact[$Message]
     }
 
+    if ($Message -match '^ARCHIVE_VOLUME_SET_INCOMPLETE: (.+)$') {
+        return ('压缩包分卷不完整：{0}' -f $Matches[1])
+    }
+    if ($Message -match '^ARCHIVE_VOLUME_IDENTITY_MISSING: (.+)$') {
+        return ('保存的分卷任务缺少完整身份信息：{0}' -f $Matches[1])
+    }
+    if ($Message -match '^ARCHIVE_VOLUME_CHANGED: (.+)$') {
+        return ('压缩包分卷自任务创建后已发生变化，无法继续使用原有恢复进度：{0}' -f $Matches[1])
+    }
+
     if ($Message -match '^Preparing the local backend for coverage: (.+)\.$') {
         return ('正在准备当前覆盖范围的本地后端：{0}。' -f $Matches[1])
     }
@@ -1611,6 +1621,20 @@ function Get-QuickCandidateList {
 }
 
 function Get-JobFromControls {
+    $archivePath = $controls.ArchivePathBox.Text.Trim()
+    if ([string]::IsNullOrWhiteSpace($archivePath)) {
+        throw '请先选择本地压缩包。'
+    }
+    $volumeSet = Resolve-ArchiveVolumeSet -Path $archivePath
+    if (-not [bool]$volumeSet.IsComplete) {
+        throw ('ARCHIVE_VOLUME_SET_INCOMPLETE: ' + [string]$volumeSet.Reason)
+    }
+    $entryPath = [string]$volumeSet.EntryPath
+    if (-not [string]::Equals($archivePath, $entryPath, [System.StringComparison]::OrdinalIgnoreCase)) {
+        $controls.ArchivePathBox.Text = $entryPath
+        $archivePath = $entryPath
+    }
+
     $characterSet = Get-SelectedValue -Control $controls.CharacterSetBox
     [int]$recoveryLevel = 0
     try { $recoveryLevel = [int](Get-SelectedValue -Control $controls.StrategyBox) } catch { $recoveryLevel = 0 }
@@ -1631,7 +1655,8 @@ function Get-JobFromControls {
     $deviceSelection = Get-SelectedDeviceJobSelection
     return [ordered]@{
         SchemaVersion     = 5
-        ArchivePath       = $controls.ArchivePathBox.Text.Trim()
+        ArchivePath       = $entryPath
+        ArchiveVolumeSetIdentity = (Get-ArchiveVolumeSetIdentity -VolumeSet $volumeSet)
         RecoveryLevel     = $recoveryLevel
         DevicePreference  = [string]$deviceSelection.Preference
         SelectedGpu       = $deviceSelection.SelectedGpu
@@ -1649,7 +1674,7 @@ function Get-JobFromControls {
         MaxLength         = $controls.MaxLengthBox.Text.Trim()
         UiCulture         = [System.Globalization.CultureInfo]::CurrentUICulture.Name
         RecoveryPlanYear  = (Get-Date).Year
-        ArchiveIdentity   = (Get-ArchiveIdentity -Path $controls.ArchivePathBox.Text.Trim())
+        ArchiveIdentity   = (Get-ArchiveIdentity -Path $entryPath)
         CreatedUtc        = [datetime]::UtcNow.ToString('o')
     }
 }
@@ -1661,6 +1686,17 @@ function Inspect-SelectedArchive {
     Update-TaskControls
     if ([string]::IsNullOrWhiteSpace($archivePath)) {
         throw '请先选择本地压缩包。'
+    }
+
+    $volumeSet = Resolve-ArchiveVolumeSet -Path $archivePath
+    if (-not [bool]$volumeSet.IsComplete) {
+        throw ('ARCHIVE_VOLUME_SET_INCOMPLETE: ' + [string]$volumeSet.Reason)
+    }
+    $entryPath = [string]$volumeSet.EntryPath
+    if (-not [string]::Equals($archivePath, $entryPath, [System.StringComparison]::OrdinalIgnoreCase)) {
+        $controls.ArchivePathBox.Text = $entryPath
+        $archivePath = $entryPath
+        Write-UiLog ('已将选中的分卷归一化为首卷：' + [System.IO.Path]::GetFileName($entryPath))
     }
 
     $sevenZip = Resolve-SevenZip
@@ -1680,9 +1716,10 @@ function Inspect-SelectedArchive {
         default { '加密状态未能识别' }
     }
     $metadataStatus = if ($inspection.ListingExitCode -eq 0) { '已在本机检查' } else { '仅能在本机部分检查' }
+    $volumeNote = if ([bool]$volumeSet.IsMultiVolume) { ' · 分卷 {0} 个' -f @($volumeSet.VolumePaths).Count } else { '' }
     $controls.ArchiveFileNameText.Text = [System.IO.Path]::GetFileName($archivePath)
-    $controls.ArchiveInfoText.Text = ('{0} · {1} · {2}' -f $inspection.Format, $methods, $encryption)
-    $controls.ArchiveInfoText.ToolTip = ('格式：{0}；加密状态：{1}；方法：{2}；元数据状态：{3}' -f $inspection.Format, $encryption, $methods, $metadataStatus)
+    $controls.ArchiveInfoText.Text = ('{0} · {1} · {2}{3}' -f $inspection.Format, $methods, $encryption, $volumeNote)
+    $controls.ArchiveInfoText.ToolTip = ('格式：{0}；加密状态：{1}；方法：{2}；元数据状态：{3}{4}' -f $inspection.Format, $encryption, $methods, $metadataStatus, $volumeNote)
     Update-DeviceInfo
     Write-UiLog ('已在本机检查压缩包：格式={0}，已加密={1}。' -f $inspection.Format, $encryption)
     Set-ArchiveDisplayState -HasValidArchive:$true
@@ -1879,8 +1916,13 @@ function Get-DroppedArchivePath {
 
     $extensions = @('.zip', '.7z', '.rar', '.tar', '.gz', '.tgz', '.bz2', '.xz')
     $validPaths = @($Paths | Where-Object {
-            (Test-Path -LiteralPath $_ -PathType Leaf) -and
-            $extensions -contains ([System.IO.Path]::GetExtension([string]$_).ToLowerInvariant())
+            $pathText = [string]$_
+            $name = [System.IO.Path]::GetFileName($pathText)
+            (Test-Path -LiteralPath $pathText -PathType Leaf) -and
+            ($extensions -contains ([System.IO.Path]::GetExtension($pathText).ToLowerInvariant()) -or
+                $name -match '(?i)\.part\d+\.rar$' -or
+                $name -match '(?i)\.(7z|zip)\.\d{3,}$' -or
+                $name -match '(?i)\.r\d{2,}$')
         })
     if ($validPaths.Count -eq 0) {
         throw '请拖入一个 ZIP、7z、RAR 或其他受支持的本地压缩包。'
@@ -2269,10 +2311,35 @@ function Open-SavedJob {
         if ($job.PSObject.Properties.Name -notcontains 'ArchiveIdentity' -or $null -eq $job.ArchiveIdentity) {
             throw '保存的任务缺少归档身份，无法安全继续。请创建新任务。'
         }
-        $savedIdentity = Get-ArchiveIdentity -Path ([string]$job.ArchivePath)
+        $savedVolumeSet = Resolve-ArchiveVolumeSet -Path ([string]$job.ArchivePath)
+        if (-not [bool]$savedVolumeSet.IsComplete) {
+            throw ('ARCHIVE_VOLUME_SET_INCOMPLETE: ' + [string]$savedVolumeSet.Reason)
+        }
+        $savedEntryPath = [string]$savedVolumeSet.EntryPath
+        $savedIdentity = Get-ArchiveIdentity -Path $savedEntryPath
         if (-not (Test-ArchiveIdentityMatch -Expected $job.ArchiveIdentity -Actual $savedIdentity)) {
+            if ([bool]$savedVolumeSet.IsMultiVolume) {
+                throw 'ARCHIVE_VOLUME_CHANGED: 一个或多个压缩包分卷已发生变化，无法继续使用原有恢复进度。请创建新任务。'
+            }
             throw '压缩包自任务创建后已发生变化，无法继续使用原有恢复进度。请创建新任务。'
         }
+        $hasSavedVolumeIdentity = $job.PSObject.Properties.Name -contains 'ArchiveVolumeSetIdentity' -and $null -ne $job.ArchiveVolumeSetIdentity
+        if ([bool]$savedVolumeSet.IsMultiVolume) {
+            if (-not $hasSavedVolumeIdentity) {
+                throw 'ARCHIVE_VOLUME_IDENTITY_MISSING: 保存的分卷任务缺少每个分卷的身份，无法安全继续。请创建新任务。'
+            }
+            $actualSavedVolumeIdentity = Get-ArchiveVolumeSetIdentity -VolumeSet $savedVolumeSet
+            if (-not (Test-ArchiveVolumeSetIdentityMatch -Expected $job.ArchiveVolumeSetIdentity -Actual $actualSavedVolumeIdentity)) {
+                throw 'ARCHIVE_VOLUME_CHANGED: 一个或多个压缩包分卷已缺失、大小变化或修改时间变化，无法继续使用原有恢复进度。请创建新任务。'
+            }
+        }
+        elseif ($hasSavedVolumeIdentity) {
+            $actualSavedVolumeIdentity = Get-ArchiveVolumeSetIdentity -VolumeSet $savedVolumeSet
+            if (-not (Test-ArchiveVolumeSetIdentityMatch -Expected $job.ArchiveVolumeSetIdentity -Actual $actualSavedVolumeIdentity)) {
+                throw '压缩包自任务创建后已发生变化，无法继续使用原有恢复进度。请创建新任务。'
+            }
+        }
+        $job.ArchivePath = $savedEntryPath
         $script:CurrentJobDirectory = $dialog.SelectedPath
         $script:CurrentJobId = if ($job.PSObject.Properties.Name -contains 'JobId' -and -not [string]::IsNullOrWhiteSpace([string]$job.JobId)) {
             [string]$job.JobId
@@ -2281,7 +2348,7 @@ function Open-SavedJob {
             [System.IO.Path]::GetFileName(([System.IO.Path]::GetFullPath($script:CurrentJobDirectory)).TrimEnd('\'))
         }
         Reset-UiElapsedState
-        $controls.ArchivePathBox.Text = [string]$job.ArchivePath
+        $controls.ArchivePathBox.Text = $savedEntryPath
         $script:CurrentInspection = $null
         Set-ArchiveDisplayState -HasValidArchive:$false
         Update-TaskControls
@@ -2311,7 +2378,7 @@ function Open-SavedJob {
         $controls.CustomCharacterSetBox.Text = [string]$job.CustomCharacters
         $controls.MinLengthBox.Text = [string]$job.MinLength
         $controls.MaxLengthBox.Text = [string]$job.MaxLength
-        $controls.ArchiveFileNameText.Text = [System.IO.Path]::GetFileName([string]$job.ArchivePath)
+        $controls.ArchiveFileNameText.Text = [System.IO.Path]::GetFileName($savedEntryPath)
         Update-StrategyHelp
         try { $null = Inspect-SelectedArchive } catch { Clear-SelectedArchive; Write-UiLog ('已打开保存的任务；检查将稍后进行：' + (Convert-UiMessage -Message $_.Exception.Message)) }
         Update-TaskControls
@@ -2881,7 +2948,7 @@ Write-UiLog '已就绪。所有恢复计算均设计为仅在本机运行。'
 
 $browseArchiveHandler = {
         $dialog = New-Object Microsoft.Win32.OpenFileDialog
-        $dialog.Filter = '压缩包|*.zip;*.7z;*.rar;*.tar;*.gz;*.tgz;*.bz2;*.xz|所有文件|*.*'
+        $dialog.Filter = '压缩包|*.zip;*.7z;*.rar;*.zip.???;*.7z.???;*.part*.rar;*.r??;*.r???;*.tar;*.gz;*.tgz;*.bz2;*.xz|所有文件|*.*'
         if ($dialog.ShowDialog()) {
             try { Select-ArchivePath -Path $dialog.FileName } catch { Show-UiError $_.Exception.Message }
         }

@@ -113,6 +113,242 @@ function Get-ArchiveFormat {
     return $extension
 }
 
+function Get-ArchiveVolumeNameDescriptor {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][string]$FileName
+    )
+
+    $name = [System.IO.Path]::GetFileName($FileName)
+    if ([string]::IsNullOrWhiteSpace($name)) { return $null }
+
+    # RAR modern volumes use archive.part1.rar, archive.part2.rar, ... .
+    # Check this before the old-style .rar rule because the first modern
+    # volume also ends in .rar.
+    if ($name -match '^(?<base>.+)\.part(?<number>\d+)\.rar$') {
+        [int]$number = 0
+        try { $number = [int]$Matches['number'] } catch { return $null }
+        if ($number -lt 1) { return $null }
+        return [pscustomobject]@{
+            BaseName    = [string]$Matches['base']
+            Family      = 'RAR'
+            Scheme      = 'RarPart'
+            Number      = $number
+            NumberText  = [string]$Matches['number']
+            NumberWidth = [int]([string]$Matches['number']).Length
+            FileName    = $name
+        }
+    }
+
+    # RAR old-style sets use archive.rar, archive.r00, archive.r01, ... .
+    if ($name -match '^(?<base>.+)\.r(?<number>\d{2,})$') {
+        [int]$continuationNumber = 0
+        try { $continuationNumber = [int]$Matches['number'] } catch { return $null }
+        return [pscustomobject]@{
+            BaseName    = [string]$Matches['base']
+            Family      = 'RAR'
+            Scheme      = 'RarOld'
+            Number      = $continuationNumber + 1
+            NumberText  = [string]$Matches['number']
+            NumberWidth = [int]([string]$Matches['number']).Length
+            FileName    = $name
+        }
+    }
+    if ($name -match '^(?<base>.+)\.rar$') {
+        return [pscustomobject]@{
+            BaseName    = [string]$Matches['base']
+            Family      = 'RAR'
+            Scheme      = 'RarOld'
+            Number      = 0
+            NumberText  = ''
+            NumberWidth = 2
+            FileName    = $name
+        }
+    }
+
+    # NanaZip/7-Zip split sets use archive.7z.001 or archive.zip.001.
+    if ($name -match '^(?<base>.+)\.(?<family>7z|zip)\.(?<number>\d{3,})$') {
+        [int]$number = 0
+        try { $number = [int]$Matches['number'] } catch { return $null }
+        if ($number -lt 1) { return $null }
+        return [pscustomobject]@{
+            BaseName    = [string]$Matches['base']
+            Family      = ([string]$Matches['family']).ToUpperInvariant()
+            Scheme      = 'Numbered'
+            Number      = $number
+            NumberText  = [string]$Matches['number']
+            NumberWidth = [int]([string]$Matches['number']).Length
+            FileName    = $name
+        }
+    }
+
+    return $null
+}
+
+function New-ArchiveVolumeFileName {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]$Descriptor,
+        [Parameter(Mandatory = $true)][int]$Number,
+        [int]$NumberWidthOverride = 0
+    )
+
+    [int]$width = [int]$Descriptor.NumberWidth
+    if ($NumberWidthOverride -gt $width) { $width = $NumberWidthOverride }
+    if ($width -lt 1) { $width = 1 }
+    $format = 'D{0}' -f $width
+
+    switch ([string]$Descriptor.Scheme) {
+        'RarPart' {
+            return '{0}.part{1}.rar' -f [string]$Descriptor.BaseName, $Number.ToString($format)
+        }
+        'RarOld' {
+            if ($Number -eq 0) { return '{0}.rar' -f [string]$Descriptor.BaseName }
+            if ($width -lt 2) { $width = 2; $format = 'D2' }
+            return '{0}.r{1}' -f [string]$Descriptor.BaseName, ($Number - 1).ToString($format)
+        }
+        'Numbered' {
+            return '{0}.{1}.{2}' -f [string]$Descriptor.BaseName, ([string]$Descriptor.Family).ToLowerInvariant(), $Number.ToString($format)
+        }
+        default {
+            throw 'ARCHIVE_VOLUME_SCHEME_INVALID: The archive volume naming scheme is not supported.'
+        }
+    }
+}
+
+function Resolve-ArchiveVolumeSet {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][string]$Path
+    )
+
+    if ([string]::IsNullOrWhiteSpace($Path)) {
+        throw 'ARCHIVE_VOLUME_PATH_INVALID: The archive path is empty.'
+    }
+
+    $normalizedPath = [System.IO.Path]::GetFullPath($Path)
+    $directory = [System.IO.Path]::GetDirectoryName($normalizedPath)
+    $selectedName = [System.IO.Path]::GetFileName($normalizedPath)
+    $selectedDescriptor = Get-ArchiveVolumeNameDescriptor -FileName $selectedName
+
+    if ($null -eq $selectedDescriptor) {
+        $exists = Test-Path -LiteralPath $normalizedPath -PathType Leaf
+        $family = 'UNKNOWN'
+        if ($exists) {
+            $family = ([string](Get-ArchiveFormat -ArchivePath $normalizedPath)).ToUpperInvariant()
+        }
+        else {
+            $extension = [System.IO.Path]::GetExtension($normalizedPath).TrimStart('.')
+            if (-not [string]::IsNullOrWhiteSpace($extension)) { $family = $extension.ToUpperInvariant() }
+        }
+        return [pscustomobject]@{
+            IsMultiVolume = $false
+            ArchiveFamily = $family
+            SelectedPath  = $normalizedPath
+            EntryPath     = $normalizedPath
+            VolumePaths   = if ($exists) { @($normalizedPath) } else { @() }
+            MissingVolumes = if ($exists) { @() } else { @($normalizedPath) }
+            IsComplete    = $exists
+            DisplayName   = $selectedName
+            Reason        = if ($exists) { 'A single archive file was detected.' } else { 'The selected archive file is missing.' }
+            Scheme        = ''
+            VolumeNumbers = @()
+            DuplicateVolumes = @()
+        }
+    }
+
+    $directoryItems = @()
+    if (Test-Path -LiteralPath $directory -PathType Container) {
+        $directoryItems = @(Get-ChildItem -LiteralPath $directory -File -Force -ErrorAction Stop)
+    }
+
+    $records = New-Object 'System.Collections.Generic.List[object]'
+    foreach ($item in $directoryItems) {
+        $descriptor = Get-ArchiveVolumeNameDescriptor -FileName ([string]$item.Name)
+        if ($null -eq $descriptor) { continue }
+        if ([string]$descriptor.Family -ne [string]$selectedDescriptor.Family -or
+            [string]$descriptor.Scheme -ne [string]$selectedDescriptor.Scheme -or
+            -not [string]::Equals([string]$descriptor.BaseName, [string]$selectedDescriptor.BaseName, [System.StringComparison]::OrdinalIgnoreCase)) {
+            continue
+        }
+        [void]$records.Add([pscustomobject]@{
+                Descriptor = $descriptor
+                FullPath   = [System.IO.Path]::GetFullPath([string]$item.FullName)
+            })
+    }
+
+    [int]$startNumber = if ([string]$selectedDescriptor.Scheme -eq 'RarOld') { 0 } else { 1 }
+    [int]$maxNumber = [math]::Max($startNumber, [int]$selectedDescriptor.Number)
+    [int]$numberWidth = [int]$selectedDescriptor.NumberWidth
+    foreach ($record in @($records.ToArray())) {
+        if ([int]$record.Descriptor.Number -gt $maxNumber) { $maxNumber = [int]$record.Descriptor.Number }
+        if ([int]$record.Descriptor.NumberWidth -gt $numberWidth) { $numberWidth = [int]$record.Descriptor.NumberWidth }
+    }
+
+    $recordByNumber = @{}
+    $duplicates = New-Object 'System.Collections.Generic.List[string]'
+    foreach ($record in @($records.ToArray())) {
+        [int]$number = [int]$record.Descriptor.Number
+        if ($recordByNumber.ContainsKey($number)) {
+            [void]$duplicates.Add([System.IO.Path]::GetFileName([string]$record.FullPath))
+        }
+        else {
+            $recordByNumber[$number] = $record
+        }
+    }
+
+    $missing = New-Object 'System.Collections.Generic.List[string]'
+    for ($number = $startNumber; $number -le $maxNumber; $number++) {
+        if (-not $recordByNumber.ContainsKey($number)) {
+            $missingName = New-ArchiveVolumeFileName -Descriptor $selectedDescriptor -Number $number -NumberWidthOverride $numberWidth
+            [void]$missing.Add((Join-Path -Path $directory -ChildPath $missingName))
+        }
+    }
+
+    $sortedRecords = @($records.ToArray() | Sort-Object @{ Expression = { [int]$_.Descriptor.Number }; Ascending = $true }, @{ Expression = { [string]$_.FullPath }; Ascending = $true })
+    $volumePaths = @($sortedRecords | ForEach-Object { [string]$_.FullPath })
+    $isMultiVolume = [string]$selectedDescriptor.Scheme -ne 'RarOld' -or
+        @($sortedRecords | Where-Object { [int]$_.Descriptor.Number -gt $startNumber }).Count -gt 0
+    $entryPath = if ($recordByNumber.ContainsKey($startNumber)) {
+        [string]$recordByNumber[$startNumber].FullPath
+    }
+    else {
+        Join-Path -Path $directory -ChildPath (New-ArchiveVolumeFileName -Descriptor $selectedDescriptor -Number $startNumber -NumberWidthOverride $numberWidth)
+    }
+
+    $missingArray = @($missing.ToArray())
+    $duplicateArray = @($duplicates.ToArray())
+    $isComplete = $missingArray.Count -eq 0 -and $duplicateArray.Count -eq 0
+    $reason = if ($isComplete) {
+        if ($isMultiVolume) { 'A complete {0} archive volume set was detected.' -f [string]$selectedDescriptor.Family } else { 'A single RAR archive file was detected.' }
+    }
+    else {
+        $reasonParts = New-Object 'System.Collections.Generic.List[string]'
+        if ($missingArray.Count -gt 0) {
+            [void]$reasonParts.Add(('missing: ' + (($missingArray | ForEach-Object { [System.IO.Path]::GetFileName([string]$_) }) -join ', ')))
+        }
+        if ($duplicateArray.Count -gt 0) {
+            [void]$reasonParts.Add(('duplicate volume numbers: ' + ($duplicateArray -join ', ')))
+        }
+        'The archive volume set is incomplete; {0}.' -f ($reasonParts -join '; ')
+    }
+
+    return [pscustomobject]@{
+        IsMultiVolume = [bool]$isMultiVolume
+        ArchiveFamily = [string]$selectedDescriptor.Family
+        SelectedPath  = $normalizedPath
+        EntryPath     = [string]$entryPath
+        VolumePaths   = $volumePaths
+        MissingVolumes = $missingArray
+        IsComplete    = [bool]$isComplete
+        DisplayName   = [System.IO.Path]::GetFileName([string]$entryPath)
+        Reason        = $reason
+        Scheme        = [string]$selectedDescriptor.Scheme
+        VolumeNumbers = @($sortedRecords | ForEach-Object { [int]$_.Descriptor.Number })
+        DuplicateVolumes = $duplicateArray
+    }
+}
+
 function Get-ArchiveInspection {
     [CmdletBinding()]
     param(
@@ -120,6 +356,11 @@ function Get-ArchiveInspection {
         [string]$SevenZip = (Resolve-SevenZip)
     )
 
+    $volumeSet = Resolve-ArchiveVolumeSet -Path $ArchivePath
+    if (-not [bool]$volumeSet.IsComplete) {
+        throw ('ARCHIVE_VOLUME_SET_INCOMPLETE: ' + [string]$volumeSet.Reason)
+    }
+    $ArchivePath = [string]$volumeSet.EntryPath
     $format = Get-ArchiveFormat -ArchivePath $ArchivePath
     # A non-empty local probe prevents NanaZip from requesting interactive
     # input when an encrypted 7z header is inspected by a hidden Worker.
@@ -176,6 +417,9 @@ function Get-ArchiveInspection {
         Methods         = @($methods.ToArray())
         ListingExitCode = $listing.ExitCode
         ListingMessage  = if ($listing.ExitCode -eq 0) { 'Archive metadata inspected locally.' } else { 'Archive metadata could only be partially inspected locally.' }
+        VolumeSet       = $volumeSet
+        IsMultiVolume   = [bool]$volumeSet.IsMultiVolume
+        VolumeCount     = @($volumeSet.VolumePaths).Count
     }
 }
 
@@ -186,6 +430,12 @@ function Test-ArchivePassword {
         [Parameter(Mandatory = $true)][AllowEmptyString()][string]$Password,
         [string]$SevenZip = (Resolve-SevenZip)
     )
+
+    $volumeSet = Resolve-ArchiveVolumeSet -Path $ArchivePath
+    if (-not [bool]$volumeSet.IsComplete) {
+        throw ('ARCHIVE_VOLUME_SET_INCOMPLETE: ' + [string]$volumeSet.Reason)
+    }
+    $ArchivePath = [string]$volumeSet.EntryPath
 
     # The candidate remains local. It is deliberately never written to a log or progress file.
     $passwordSwitch = '-p' + $Password
@@ -430,6 +680,113 @@ function Test-ArchiveIdentityMatch {
     )
 }
 
+function Get-ArchiveVolumeSetIdentity {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]$VolumeSet
+    )
+
+    if ($null -eq $VolumeSet -or
+        $VolumeSet.PSObject.Properties.Name -notcontains 'IsComplete' -or
+        -not [bool]$VolumeSet.IsComplete) {
+        $reason = if ($null -ne $VolumeSet -and $VolumeSet.PSObject.Properties.Name -contains 'Reason') { [string]$VolumeSet.Reason } else { 'The archive volume set is not complete.' }
+        throw ('ARCHIVE_VOLUME_SET_INCOMPLETE: ' + $reason)
+    }
+
+    $volumePaths = @($VolumeSet.VolumePaths)
+    if ($volumePaths.Count -eq 0) {
+        throw 'ARCHIVE_VOLUME_SET_INCOMPLETE: The archive volume set contains no files.'
+    }
+
+    $volumeIdentities = New-Object 'System.Collections.Generic.List[object]'
+    foreach ($volumePath in $volumePaths) {
+        $identity = Get-ArchiveIdentity -Path ([string]$volumePath)
+        if (-not [bool]$identity.Exists) {
+            throw ('ARCHIVE_VOLUME_SET_INCOMPLETE: Archive volume is missing: ' + [System.IO.Path]::GetFileName([string]$volumePath))
+        }
+        [void]$volumeIdentities.Add([pscustomobject]@{
+                NormalizedPath   = [string]$identity.NormalizedFullPath
+                Size             = [long]$identity.FileSize
+                LastWriteTimeUtc = [string]$identity.LastWriteTimeUtc
+            })
+    }
+
+    return [pscustomobject]@{
+        SchemaVersion   = 1
+        IsMultiVolume   = [bool]$VolumeSet.IsMultiVolume
+        ArchiveFamily   = [string]$VolumeSet.ArchiveFamily
+        EntryPath       = [string]$VolumeSet.EntryPath
+        VolumeIdentities = @($volumeIdentities.ToArray())
+    }
+}
+
+function Test-ArchiveVolumeSetIdentityMatch {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]$Expected,
+        [Parameter(Mandatory = $true)]$Actual
+    )
+
+    if ($null -eq $Expected -or $null -eq $Actual) { return $false }
+    $expectedProperties = @($Expected.PSObject.Properties.Name)
+    $actualProperties = @($Actual.PSObject.Properties.Name)
+    foreach ($requiredProperty in @('IsMultiVolume', 'ArchiveFamily', 'EntryPath', 'VolumeIdentities')) {
+        if ($expectedProperties -notcontains $requiredProperty -or $actualProperties -notcontains $requiredProperty) { return $false }
+    }
+    if ([bool]$Expected.IsMultiVolume -ne [bool]$Actual.IsMultiVolume) { return $false }
+    if (-not [string]::Equals([string]$Expected.ArchiveFamily, [string]$Actual.ArchiveFamily, [System.StringComparison]::OrdinalIgnoreCase)) { return $false }
+    if (-not [string]::Equals([string]$Expected.EntryPath, [string]$Actual.EntryPath, [System.StringComparison]::OrdinalIgnoreCase)) { return $false }
+
+    $expectedVolumes = @($Expected.VolumeIdentities)
+    $actualVolumes = @($Actual.VolumeIdentities)
+    if ($expectedVolumes.Count -ne $actualVolumes.Count) { return $false }
+    for ($index = 0; $index -lt $expectedVolumes.Count; $index++) {
+        $expectedVolume = $expectedVolumes[$index]
+        $actualVolume = $actualVolumes[$index]
+        if ($null -eq $expectedVolume -or $null -eq $actualVolume) { return $false }
+        $expectedVolumeProperties = @($expectedVolume.PSObject.Properties.Name)
+        $actualVolumeProperties = @($actualVolume.PSObject.Properties.Name)
+        foreach ($requiredProperty in @('NormalizedPath', 'Size', 'LastWriteTimeUtc')) {
+            if ($expectedVolumeProperties -notcontains $requiredProperty -or $actualVolumeProperties -notcontains $requiredProperty) { return $false }
+        }
+        if (-not [string]::Equals([string]$expectedVolume.NormalizedPath, [string]$actualVolume.NormalizedPath, [System.StringComparison]::OrdinalIgnoreCase)) { return $false }
+        try {
+            if ([long]$expectedVolume.Size -ne [long]$actualVolume.Size) { return $false }
+        }
+        catch {
+            return $false
+        }
+        if (-not [string]::Equals([string]$expectedVolume.LastWriteTimeUtc, [string]$actualVolume.LastWriteTimeUtc, [System.StringComparison]::Ordinal)) { return $false }
+    }
+    return $true
+}
+
+function Assert-RecoveryArchiveIdentityMatch {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]$ExistingJob,
+        [Parameter(Mandatory = $true)]$NewControlJob
+    )
+
+    if ($ExistingJob.PSObject.Properties.Name -notcontains 'ArchiveIdentity' -or
+        $NewControlJob.PSObject.Properties.Name -notcontains 'ArchiveIdentity' -or
+        -not (Test-ArchiveIdentityMatch -Expected $ExistingJob.ArchiveIdentity -Actual $NewControlJob.ArchiveIdentity)) {
+        throw 'ARCHIVE_CHANGED: The selected archive does not match the existing local job.'
+    }
+
+    $existingHasVolumeIdentity = $ExistingJob.PSObject.Properties.Name -contains 'ArchiveVolumeSetIdentity' -and
+        $null -ne $ExistingJob.ArchiveVolumeSetIdentity
+    $newHasVolumeIdentity = $NewControlJob.PSObject.Properties.Name -contains 'ArchiveVolumeSetIdentity' -and
+        $null -ne $NewControlJob.ArchiveVolumeSetIdentity
+    if ($existingHasVolumeIdentity -and -not $newHasVolumeIdentity) {
+        throw 'ARCHIVE_VOLUME_IDENTITY_MISSING: The current controls did not provide identities for every archive volume.'
+    }
+    if ($existingHasVolumeIdentity -and $newHasVolumeIdentity -and
+        -not (Test-ArchiveVolumeSetIdentityMatch -Expected $ExistingJob.ArchiveVolumeSetIdentity -Actual $NewControlJob.ArchiveVolumeSetIdentity)) {
+        throw 'ARCHIVE_VOLUME_CHANGED: One or more archive volumes changed after this local job was created.'
+    }
+}
+
 function Get-CanonicalQuickCandidates {
     [CmdletBinding()]
     param(
@@ -522,13 +879,9 @@ function Merge-RecoveryJobForLevelUpgrade {
         [Parameter(Mandatory = $true)]$NewControlJob
     )
 
-    if ($ExistingJob.PSObject.Properties.Name -notcontains 'ArchiveIdentity' -or
-        $NewControlJob.PSObject.Properties.Name -notcontains 'ArchiveIdentity' -or
-        -not (Test-ArchiveIdentityMatch -Expected $ExistingJob.ArchiveIdentity -Actual $NewControlJob.ArchiveIdentity)) {
-        throw 'ARCHIVE_CHANGED: The selected archive does not match the existing local job.'
-    }
+    Assert-RecoveryArchiveIdentityMatch -ExistingJob $ExistingJob -NewControlJob $NewControlJob
 
-    $immutable = @('JobId', 'ArchivePath', 'ArchiveIdentity', 'CreatedUtc', 'RecoveryPlanYear', 'UiCulture')
+    $immutable = @('JobId', 'ArchivePath', 'ArchiveIdentity', 'ArchiveVolumeSetIdentity', 'CreatedUtc', 'RecoveryPlanYear', 'UiCulture')
     $merged = [ordered]@{}
     foreach ($property in $ExistingJob.PSObject.Properties) {
         $merged[$property.Name] = $property.Value
@@ -542,6 +895,14 @@ function Merge-RecoveryJobForLevelUpgrade {
         if ($ExistingJob.PSObject.Properties.Name -contains $propertyName) {
             $merged[$propertyName] = $ExistingJob.$propertyName
         }
+    }
+    if ($ExistingJob.PSObject.Properties.Name -notcontains 'ArchiveVolumeSetIdentity' -and
+        $NewControlJob.PSObject.Properties.Name -contains 'ArchiveVolumeSetIdentity') {
+        # A legacy single-file job may be upgraded after P2. The first-file
+        # identity has already matched above; retain the newly captured volume
+        # identity for future resumes without replacing any existing immutable
+        # state.
+        $merged['ArchiveVolumeSetIdentity'] = $NewControlJob.ArchiveVolumeSetIdentity
     }
 
     $oldQuick = @(Get-CanonicalQuickCandidates -Candidates $(if ($ExistingJob.PSObject.Properties.Name -contains 'QuickCandidates') { @($ExistingJob.QuickCandidates) } else { @() }))
@@ -635,11 +996,7 @@ function Get-RecoveryLevelUpgradeIntent {
         [string[]]$AvailableCoverageIds = @()
     )
 
-    if ($ExistingJob.PSObject.Properties.Name -notcontains 'ArchiveIdentity' -or
-        $NewControlJob.PSObject.Properties.Name -notcontains 'ArchiveIdentity' -or
-        -not (Test-ArchiveIdentityMatch -Expected $ExistingJob.ArchiveIdentity -Actual $NewControlJob.ArchiveIdentity)) {
-        throw 'ARCHIVE_CHANGED: The selected archive does not match the existing local job.'
-    }
+    Assert-RecoveryArchiveIdentityMatch -ExistingJob $ExistingJob -NewControlJob $NewControlJob
 
     [int]$existingLevel = Get-RecoveryLevel -Job $ExistingJob
     [int]$newLevel = Get-RecoveryLevel -Job $NewControlJob
@@ -5432,14 +5789,42 @@ function Test-RecoveryJobConfiguration {
         [switch]$RequireArchiveIdentity
     )
 
-    if (-not (Test-Path -LiteralPath ([string]$Job.ArchivePath) -PathType Leaf)) {
-        throw 'The selected archive no longer exists.'
+    $volumeSet = Resolve-ArchiveVolumeSet -Path ([string]$Job.ArchivePath)
+    if (-not [bool]$volumeSet.IsComplete) {
+        throw ('ARCHIVE_VOLUME_SET_INCOMPLETE: ' + [string]$volumeSet.Reason)
+    }
+    # Worker extraction and final verification use ArchivePath directly. Keep
+    # an old/manual middle-volume job safe by normalizing it in memory before
+    # any stage can start; newly created UI jobs are already stored this way.
+    if ($Job.PSObject.Properties.Name -contains 'ArchivePath' -and
+        -not [string]::Equals([string]$Job.ArchivePath, [string]$volumeSet.EntryPath, [System.StringComparison]::OrdinalIgnoreCase)) {
+        $Job.ArchivePath = [string]$volumeSet.EntryPath
     }
 
-    $actualIdentity = Get-ArchiveIdentity -Path ([string]$Job.ArchivePath)
+    $actualIdentity = Get-ArchiveIdentity -Path ([string]$volumeSet.EntryPath)
     $hasIdentity = $Job.PSObject.Properties.Name -contains 'ArchiveIdentity' -and $null -ne $Job.ArchiveIdentity
+    $hasVolumeIdentity = $Job.PSObject.Properties.Name -contains 'ArchiveVolumeSetIdentity' -and $null -ne $Job.ArchiveVolumeSetIdentity
+    if ([bool]$volumeSet.IsMultiVolume) {
+        if (-not $hasVolumeIdentity) {
+            throw 'ARCHIVE_VOLUME_IDENTITY_MISSING: This multi-volume saved job has no identity for every archive volume and cannot be resumed safely. Create a new task.'
+        }
+        $actualVolumeIdentity = Get-ArchiveVolumeSetIdentity -VolumeSet $volumeSet
+        if (-not (Test-ArchiveVolumeSetIdentityMatch -Expected $Job.ArchiveVolumeSetIdentity -Actual $actualVolumeIdentity)) {
+            throw 'ARCHIVE_VOLUME_CHANGED: One or more archive volumes are missing, resized, or have a changed modification time; the saved recovery progress cannot be reused. Create a new task.'
+        }
+    }
+    elseif ($hasVolumeIdentity) {
+        $actualVolumeIdentity = Get-ArchiveVolumeSetIdentity -VolumeSet $volumeSet
+        if (-not (Test-ArchiveVolumeSetIdentityMatch -Expected $Job.ArchiveVolumeSetIdentity -Actual $actualVolumeIdentity)) {
+            throw 'ARCHIVE_CHANGED: The archive changed after this local job was created; the saved recovery progress cannot be reused. Create a new task.'
+        }
+    }
+
     if ($hasIdentity) {
         if (-not (Test-ArchiveIdentityMatch -Expected $Job.ArchiveIdentity -Actual $actualIdentity)) {
+            if ([bool]$volumeSet.IsMultiVolume) {
+                throw 'ARCHIVE_VOLUME_CHANGED: One or more archive volumes are missing, resized, or have a changed modification time; the saved recovery progress cannot be reused. Create a new task.'
+            }
             throw 'ARCHIVE_CHANGED: The archive changed after this local job was created; the saved recovery progress cannot be reused. Create a new task.'
         }
     }
@@ -5468,6 +5853,7 @@ Export-ModuleMember -Function @(
     'Resolve-WindowsPowerShell',
     'Invoke-SevenZipCommand',
     'Get-ArchiveFormat',
+    'Resolve-ArchiveVolumeSet',
     'Get-ArchiveInspection',
     'Test-ArchivePassword',
     'Write-LocalJsonAtomic',
@@ -5478,6 +5864,8 @@ Export-ModuleMember -Function @(
     'Read-HashcatStatusIncremental',
     'Get-ArchiveIdentity',
     'Test-ArchiveIdentityMatch',
+    'Get-ArchiveVolumeSetIdentity',
+    'Test-ArchiveVolumeSetIdentityMatch',
     'Get-CanonicalQuickCandidates',
     'Get-CustomMaskCoverageIdentity',
     'Test-CustomMaskCoverageIdentityMatch',
