@@ -1375,7 +1375,10 @@ function Invoke-DeviceProbe {
         $backend = [pscustomobject]@{
             HashcatPath           = $null
             Zip2JohnPath          = $null
+            Rar2JohnPath          = $null
             SevenZipExtractorPath = $null
+            RarHashcatModesReady  = $false
+            RarHashcatMissingModes = @()
             Devices               = @()
             AdapterAvailable      = $false
             Ready                 = $false
@@ -1398,7 +1401,7 @@ function Get-DeviceBackendMessage {
     $backend = $Probe.Backend
     $format = if ($null -ne $script:CurrentInspection) { [string]$script:CurrentInspection.Format } else { 'Unknown' }
     $formatKey = $format.ToUpperInvariant()
-    if ($formatKey -notin @('ZIP', '7Z')) {
+    if ($formatKey -notin @('ZIP', '7Z', 'RAR')) {
         return [string]$backend.Message
     }
 
@@ -1417,6 +1420,22 @@ function Get-DeviceBackendMessage {
             return 'ZIP GPU backend unavailable: Hashcat could not initialize a local OpenCL GPU.'
         }
         return 'ZIP GPU backend is ready for WinZip AES archives. Legacy ZipCrypto remains on the CPU path.'
+    }
+
+    if ($formatKey -eq 'RAR') {
+        if ([string]::IsNullOrWhiteSpace([string]$backend.HashcatPath)) {
+            return 'RAR GPU backend unavailable: the bundled local Hashcat executable was not found.'
+        }
+        if ([string]::IsNullOrWhiteSpace([string]$backend.Rar2JohnPath)) {
+            return 'RAR GPU backend unavailable: the bundled local rar2john extractor was not found.'
+        }
+        if (-not [bool]$backend.RarHashcatModesReady) {
+            return 'RAR GPU backend unavailable: the required local Hashcat RAR mode modules are incomplete.'
+        }
+        if (-not $openClReady) {
+            return 'RAR GPU backend unavailable: Hashcat could not initialize a local OpenCL GPU.'
+        }
+        return 'RAR GPU backend is ready for supported RAR5, RAR3-hp, and RAR3-p records; unsupported records use the CPU fallback.'
     }
 
     if ([string]::IsNullOrWhiteSpace([string]$backend.HashcatPath)) {
@@ -1673,14 +1692,14 @@ function Inspect-SelectedArchive {
 
 function Get-CurrentJobRuntimeActivity {
     if ([string]::IsNullOrWhiteSpace($script:CurrentJobDirectory)) {
-        return [pscustomobject]@{ Known = $true; Active = $false; Reason = ''; WorkerProcessIds = @(); HashcatProcessIds = @() }
+        return [pscustomobject]@{ Known = $true; Active = $false; Reason = ''; WorkerProcessIds = @(); HashcatProcessIds = @(); JohnProcessIds = @() }
     }
 
     $jobId = [string]$script:CurrentJobId
     if ([string]::IsNullOrWhiteSpace($jobId)) {
         $jobPath = Join-Path $script:CurrentJobDirectory 'job.json'
         if (-not (Test-Path -LiteralPath $jobPath -PathType Leaf)) {
-            return [pscustomobject]@{ Known = $false; Active = $false; Reason = '当前任务缺少 job.json，无法确认 Worker 状态。'; WorkerProcessIds = @(); HashcatProcessIds = @() }
+            return [pscustomobject]@{ Known = $false; Active = $false; Reason = '当前任务缺少 job.json，无法确认 Worker 状态。'; WorkerProcessIds = @(); HashcatProcessIds = @(); JohnProcessIds = @() }
         }
         try {
             $job = Read-LocalJson -Path $jobPath
@@ -1691,14 +1710,14 @@ function Get-CurrentJobRuntimeActivity {
             $script:CurrentJobId = $jobId
         }
         catch {
-            return [pscustomobject]@{ Known = $false; Active = $false; Reason = $_.Exception.Message; WorkerProcessIds = @(); HashcatProcessIds = @() }
+            return [pscustomobject]@{ Known = $false; Active = $false; Reason = $_.Exception.Message; WorkerProcessIds = @(); HashcatProcessIds = @(); JohnProcessIds = @() }
         }
     }
     try {
         return Get-RecoveryRuntimeActivity -JobId $jobId -JobDirectory $script:CurrentJobDirectory -RuntimeRoot $runtimeRoot
     }
     catch {
-        return [pscustomobject]@{ Known = $false; Active = $false; Reason = $_.Exception.Message; WorkerProcessIds = @(); HashcatProcessIds = @() }
+        return [pscustomobject]@{ Known = $false; Active = $false; Reason = $_.Exception.Message; WorkerProcessIds = @(); HashcatProcessIds = @(); JohnProcessIds = @() }
     }
 }
 

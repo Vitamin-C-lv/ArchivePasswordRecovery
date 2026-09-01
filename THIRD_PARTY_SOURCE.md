@@ -8,6 +8,7 @@ This repository intentionally does not add large upstream source archives to Git
 - Binary origin: the Cygwin 64-bit Openwall/John Jumbo build represented by `tools/extractors/john.exe` and its sibling CPU variants; the version, build mode, and revision are reported by `john.exe --list=build-info`.
 - Upstream repository: <https://github.com/openwall/john>
 - Release baseline: `1.9.0-jumbo-1`; bundled build revision: `126b2a4814`.
+- The bundled `tools/extractors/rar2john.exe` comes from the official Openwall Windows CE package represented by release tag `v1.9.1-ce`; its observed John build information is aligned with the bundled `john.exe` build above. The package source record is <https://github.com/openwall/john-packages/releases/tag/v1.9.1-ce>.
 - License: GPL-2.0-or-later with the OpenSSL/unRAR linking exception; the formal texts remain in `tools/licenses/JtR/LICENSE` and `tools/licenses/JtR/COPYING.txt`.
 - Future release policy: a GitHub Release that distributes these John binaries must also provide an exact corresponding source archive for revision `126b2a4814` and must not substitute the latest John source.
 
@@ -23,6 +24,7 @@ This repository intentionally does not add large upstream source archives to Git
 
 - Bundled version: `7.1.2` (`tools/hashcat/hashcat.exe` and the required OpenCL/modules tree).
 - Upstream source project: <https://github.com/hashcat/hashcat>
+- The RAR module DLLs retained under `tools/hashcat/modules/` are the four Windows modules required by the local RAR adapter: mode 12500 (RAR3-hp), 13000 (RAR5), 23700 (RAR3-p uncompressed), and 23800 (RAR3-p compressed).
 - License: MIT, with the bundled accompanying notices under `tools/licenses/hashcat/`.
 - Future release policy: attach or otherwise make available the source corresponding to the exact Hashcat `7.1.2` binary tree used by the release; do not replace it with a newer version while retaining this version label.
 

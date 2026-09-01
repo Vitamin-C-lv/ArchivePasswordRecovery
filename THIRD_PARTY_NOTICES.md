@@ -4,8 +4,8 @@ This repository bundles the components listed below because they are required by
 
 | Component | Bundled version | License / status | Repository location | Purpose |
 | --- | --- | --- | --- | --- |
-| Hashcat | 7.1.2 | MIT; see `tools/licenses/hashcat/license.txt` | `tools/hashcat/` | Local OpenCL GPU backend for supported ZIP AES and 7z AES routes. |
-| John the Ripper Jumbo | 1.9.0-jumbo-1+bleeding-126b2a4814 (build dated 2025-01-28) | GPL-2.0-or-later with the stated OpenSSL / unRAR linking exception; see `tools/licenses/JtR/LICENSE` and `COPYING.txt` | `tools/extractors/john*.exe`, `tools/extractors/zip2john.exe` | Local CPU bulk backend and ZIP record extraction. |
+| Hashcat | 7.1.2 | MIT; see `tools/licenses/hashcat/license.txt` | `tools/hashcat/` | Local OpenCL GPU backend for supported ZIP AES, 7z AES, RAR3-hp, RAR5, and RAR3-p routes. |
+| John the Ripper Jumbo | 1.9.0-jumbo-1+bleeding-126b2a4814 (build dated 2025-01-28) | GPL-2.0-or-later with the stated OpenSSL / unRAR linking exception; see `tools/licenses/JtR/LICENSE` and `COPYING.txt` | `tools/extractors/john*.exe`, `tools/extractors/zip2john.exe`, `tools/extractors/rar2john.exe` | Local CPU bulk backend plus ZIP/RAR record extraction. |
 | Cygwin API library and runtime libraries | `cygwin1.dll` 3.5.6 (John build reports package `3.5.6-1.x86_64`) | LGPL-3.0-or-later with Cygwin Linking Exception; see `third_party/licenses/cygwin/` | `tools/extractors/cyg*.dll` | Windows runtime dependency for the bundled John / `zip2john` executables. |
 | 7z2hashcat | 2.0 (Windows 64-bit release) | Public Domain; attribution and disclaimer retained in `tools/licenses/7z2hashcat/` | `tools/extractors/7z2hashcat.exe` | Local extraction of supported 7z AES records for Hashcat. |
 | SecLists dictionary material | Version not separately recorded | MIT; see `resources/licenses/SecLists-LICENSE.txt` | `resources/dictionaries/*.txt.gz` | Bundled wordlists used by the built-in recovery levels. |

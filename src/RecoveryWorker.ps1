@@ -3397,6 +3397,34 @@ function Import-JohnOutputFile {
     catch { }
 }
 
+function Test-JohnPotRecordMatch {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][string]$ArtifactToken,
+        [Parameter(Mandatory = $true)][string]$PotToken
+    )
+
+    if ([string]::Equals($ArtifactToken, $PotToken, [System.StringComparison]::Ordinal)) { return $true }
+
+    # John Jumbo stores the RAR5 data digest in its own canonical form in the
+    # pot file.  The salt/metadata fields still identify the extracted record;
+    # the canonicalized data field is intentionally ignored for correlation.
+    if ($ArtifactToken -match '(?i)^\$rar5\$' -and $PotToken -match '(?i)^\$rar5\$') {
+        $artifactParts = @($ArtifactToken -split '\$')
+        $potParts = @($PotToken -split '\$')
+        if ($artifactParts.Count -eq 8 -and $potParts.Count -eq 8) {
+            for ($index = 0; $index -lt $artifactParts.Count; $index++) {
+                if ($index -eq 5) { continue }
+                if (-not [string]::Equals([string]$artifactParts[$index], [string]$potParts[$index], [System.StringComparison]::OrdinalIgnoreCase)) {
+                    return $false
+                }
+            }
+            return $true
+        }
+    }
+    return $false
+}
+
 function Get-JohnRecoveredPassword {
     [CmdletBinding()]
     param(
@@ -3408,13 +3436,16 @@ function Get-JohnRecoveredPassword {
     try { $lines = [System.IO.File]::ReadAllLines($PotPath) } catch { return $null }
     foreach ($record in @($Artifact.HashRecords)) {
         $recordText = [string]$record
-        $tokenMatch = [regex]::Match($recordText, '(\$zip2\$[^\r\n:]+\$/zip2\$|\$pkzip\$[^\r\n:]+\$/pkzip\$|\$7z\$[^\r\n]+)')
+        $tokenMatch = [regex]::Match($recordText, '(?i)(\$zip2\$[^\r\n:]+\$/zip2\$|\$pkzip\$[^\r\n:]+\$/pkzip\$|\$7z\$[^\r\n:]+|\$rar5\$[^\r\n:]+|\$rar3\$[^\r\n:]+)')
         if (-not $tokenMatch.Success) { continue }
-        $prefix = $tokenMatch.Groups[1].Value + ':'
+        $artifactToken = $tokenMatch.Groups[1].Value
         foreach ($line in $lines) {
             $lineText = [string]$line
-            if ($lineText.StartsWith($prefix, [System.StringComparison]::Ordinal)) {
-                return [string]$lineText.Substring($prefix.Length)
+            $separator = $lineText.IndexOf(':')
+            if ($separator -le 0) { continue }
+            $potToken = $lineText.Substring(0, $separator)
+            if (Test-JohnPotRecordMatch -ArtifactToken $artifactToken -PotToken $potToken) {
+                return [string]$lineText.Substring($separator + 1)
             }
         }
     }
@@ -3872,8 +3903,22 @@ function Prepare-HashcatRuntimeExecutable {
     # source tree is intentionally read-only: a versioned immutable copy is
     # created once, then all Workers reuse it without overwriting a live GPU
     # process' OpenCL tree.
-    $markerFiles = @('hashcat.exe', 'modules\module_00000.dll', 'modules\module_11600.dll', 'modules\module_13600.dll')
-    $marker = [ordered]@{ CacheSchemaVersion = 1; HashcatVersion = '7.1.2'; Files = @() }
+    $markerFiles = @(
+        'hashcat.exe',
+        'modules\module_00000.dll',
+        'modules\module_11600.dll',
+        'modules\module_12500.dll',
+        'modules\module_13000.dll',
+        'modules\module_13600.dll',
+        'modules\module_23700.dll',
+        'modules\module_23800.dll'
+    )
+    # The marker carries exact file metadata; the directory key is deliberately
+    # short because Windows MAX_PATH also applies to the deepest OpenCL paths.
+    # Bump the schema when the bundled runtime set changes (RAR modules were
+    # added in schema 2), while keeping the full marker as the compatibility
+    # check inside that directory.
+    $marker = [ordered]@{ CacheSchemaVersion = 2; HashcatVersion = '7.1.2'; Files = @() }
     foreach ($relativePath in $markerFiles) {
         $path = Join-Path $sourceDirectory $relativePath
         if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { throw ('The local Hashcat runtime marker file is missing: ' + $relativePath) }
@@ -3881,10 +3926,7 @@ function Prepare-HashcatRuntimeExecutable {
         $marker.Files += [ordered]@{ Path = $relativePath; Size = [long]$info.Length; LastWriteTimeUtc = $info.LastWriteTimeUtc.ToString('o') }
     }
     $markerText = ($marker | ConvertTo-Json -Depth 5 -Compress)
-    # Keep this key short enough for the deepest OpenCL source paths on
-    # Windows. It is cache invalidation metadata, not a content hash.
-    $keyParts = @('h712', 's1') + @($marker.Files | ForEach-Object { ('{0}-{1}-{2}' -f $_.Size, ([datetime]$_.LastWriteTimeUtc).Ticks, ([string]$_.Path).Length) })
-    $runtimeKey = (($keyParts -join '_') -replace '[^A-Za-z0-9_.-]', '_')
+    $runtimeKey = 'h712_s2'
     $cacheRoot = Join-Path (Get-RecoveryDataRoot) 'Cache\HashcatRuntime'
     $workingDirectory = Join-Path $cacheRoot $runtimeKey
     $markerPath = Join-Path $workingDirectory 'runtime-cache.json'
@@ -4674,6 +4716,18 @@ function Test-BuiltinGpuBatchItem {
     if ([string]$Item.Kind -eq 'BuiltinDictionary') { return $true }
     if ([string]$Item.Kind -eq 'DateRange') { return $true }
     return $Item.PSObject.Properties.Name -contains 'DictionarySource' -and [string]$Item.DictionarySource -eq 'Builtin'
+}
+
+function Test-WorkerArchiveGpuBatchEligible {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]$Inspection
+    )
+
+    # RAR records are archive-specific Hashcat inputs. Keep them on the
+    # per-coverage attack path so the existing built-in dictionary/mask batch
+    # admission cannot combine them with ZIP/7z or materialized candidates.
+    return ([string]$Inspection.Format -notmatch '(?i)^RAR')
 }
 
 function Get-BuiltinBatchItemStageNumber {
@@ -5748,8 +5802,9 @@ function Invoke-CumulativeRecovery {
             $attackPlan = $null
             $planJob = $null
             $gpuBatch = $null
-            $batchEligible = [bool]($engine.UseGpu -and (Test-BuiltinGpuBatchItem -Item $item))
-            $maskBatchEligible = [bool]($engine.UseGpu -and (Test-BuiltinGpuMaskBatchItem -Item $item))
+            $archiveGpuBatchEligible = Test-WorkerArchiveGpuBatchEligible -Inspection $inspection
+            $batchEligible = [bool]($engine.UseGpu -and $archiveGpuBatchEligible -and (Test-BuiltinGpuBatchItem -Item $item))
+            $maskBatchEligible = [bool]($engine.UseGpu -and $archiveGpuBatchEligible -and (Test-BuiltinGpuMaskBatchItem -Item $item))
             $nativeRuleEligible = [bool]($engine.UseGpu -and (
                     [string]$item.Kind -in @('CommonSymbols', 'CapitalInitialDigits') -or
                     ([string]$item.Kind -eq 'RuleAppendVariants' -and [string](Get-ObjectPropertyValue -Object $item -Name 'DictionarySource' -Default '') -eq 'Builtin')

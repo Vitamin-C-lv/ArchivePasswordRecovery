@@ -159,7 +159,11 @@ function Get-ArchiveInspection {
     }
 
     if (-not [string]::IsNullOrWhiteSpace($toolType)) {
-        $format = $toolType
+        # NanaZip reports RAR3/RAR5 with several type spellings (for
+        # example, Rar and Rar5).  Keep Format as the archive family so all
+        # downstream adapters share one route; the record classifier chooses
+        # the concrete RAR subtype later.
+        $format = if ($toolType -match '(?i)^RAR') { 'RAR' } else { $toolType }
     }
 
     return [pscustomobject]@{
@@ -809,6 +813,34 @@ function Resolve-LocalZip2John {
     return @($candidates | Where-Object {
             -not [string]::IsNullOrWhiteSpace($_) -and
             (Test-Path -LiteralPath $_ -PathType Leaf)
+    } | Select-Object -First 1)[0]
+}
+
+function Resolve-LocalRar2John {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][string]$ProjectRoot
+    )
+
+    $candidates = New-Object 'System.Collections.Generic.List[string]'
+    $candidates.Add((Join-Path $ProjectRoot 'tools\extractors\rar2john.exe'))
+    $johnRoot = Join-Path $ProjectRoot 'tools\vendor\JtR'
+    if (Test-Path -LiteralPath $johnRoot -PathType Container) {
+        $found = Get-ChildItem -LiteralPath $johnRoot -Filter 'rar2john.exe' -File -Recurse -ErrorAction SilentlyContinue |
+            Select-Object -First 1
+        if ($null -ne $found) {
+            $candidates.Add([string]$found.FullName)
+        }
+    }
+
+    $pathCommand = Get-Command rar2john.exe -ErrorAction SilentlyContinue
+    if ($null -ne $pathCommand) {
+        $candidates.Add([string]$pathCommand.Source)
+    }
+
+    return @($candidates | Where-Object {
+            -not [string]::IsNullOrWhiteSpace($_) -and
+            (Test-Path -LiteralPath $_ -PathType Leaf)
         } | Select-Object -First 1)[0]
 }
 
@@ -1168,6 +1200,34 @@ function Read-HashcatStatusIncremental {
     return Read-LocalTextFileIncremental -Path $StatusPath -Offset $Offset -Remainder $Remainder -Decoder $Decoder
 }
 
+function Get-LocalRarHashcatModeState {
+    [CmdletBinding()]
+    param(
+        [AllowEmptyString()][string]$HashcatPath = ''
+    )
+
+    $requiredModes = @(12500, 13000, 23700, 23800)
+    $missingModes = New-Object 'System.Collections.Generic.List[int]'
+    if ([string]::IsNullOrWhiteSpace($HashcatPath)) {
+        foreach ($mode in $requiredModes) { [void]$missingModes.Add([int]$mode) }
+    }
+    else {
+        $hashcatDirectory = Split-Path $HashcatPath -Parent
+        foreach ($mode in $requiredModes) {
+            $modulePath = Join-Path $hashcatDirectory ('modules\module_{0}.dll' -f $mode)
+            if (-not (Test-Path -LiteralPath $modulePath -PathType Leaf)) {
+                [void]$missingModes.Add([int]$mode)
+            }
+        }
+    }
+
+    return [pscustomobject]@{
+        RequiredModes = $requiredModes
+        MissingModes  = $missingModes.ToArray()
+        Ready         = $missingModes.Count -eq 0
+    }
+}
+
 function Get-LocalGpuBackendStatus {
     [CmdletBinding()]
     param(
@@ -1178,11 +1238,15 @@ function Get-LocalGpuBackendStatus {
     $openCl = Get-HashcatOpenClDevices -ProjectRoot $ProjectRoot
     $zip2JohnPath = Resolve-LocalZip2John -ProjectRoot $ProjectRoot
     $sevenZipExtractorPath = Resolve-Local7z2Hashcat -ProjectRoot $ProjectRoot
+    $rar2JohnPath = Resolve-LocalRar2John -ProjectRoot $ProjectRoot
+    $rarModeState = Get-LocalRarHashcatModeState -HashcatPath ([string]$openCl.HashcatPath)
     $formatKey = ([string]$Format).ToUpperInvariant()
     $isZip = ($formatKey -eq 'ZIP')
     $isSevenZip = ($formatKey -eq '7Z')
+    $isRar = ($formatKey -eq 'RAR')
     $zipReady = ($isZip -and $openCl.Ready -and -not [string]::IsNullOrWhiteSpace($zip2JohnPath))
     $sevenZipReady = ($isSevenZip -and $openCl.Ready -and -not [string]::IsNullOrWhiteSpace($sevenZipExtractorPath))
+    $rarReady = ($isRar -and $openCl.Ready -and -not [string]::IsNullOrWhiteSpace($rar2JohnPath) -and [bool]$rarModeState.Ready)
 
     $message = if ($isZip) {
         if ([string]::IsNullOrWhiteSpace($openCl.HashcatPath)) {
@@ -1212,9 +1276,28 @@ function Get-LocalGpuBackendStatus {
             '7z GPU backend is ready for locally extracted 7-Zip AES recovery records.'
         }
     }
+    elseif ($isRar) {
+        if ([string]::IsNullOrWhiteSpace($openCl.HashcatPath)) {
+            'RAR GPU backend unavailable: the bundled local Hashcat executable was not found.'
+        }
+        elseif ([string]::IsNullOrWhiteSpace($rar2JohnPath)) {
+            'RAR GPU backend unavailable: the bundled local rar2john extractor was not found.'
+        }
+        elseif (-not [bool]$rarModeState.Ready) {
+            'RAR GPU backend unavailable: the required local Hashcat RAR mode modules are incomplete.'
+        }
+        elseif (-not $openCl.Ready) {
+            'RAR GPU backend unavailable: Hashcat could not initialize a local OpenCL GPU.'
+        }
+        else {
+            'RAR GPU backend is ready for supported RAR5, RAR3-hp, and RAR3-p records; unsupported records use the CPU fallback.'
+        }
+    }
     elseif ([string]::IsNullOrWhiteSpace($Format) -or $Format -eq 'Unknown') {
-        if ($openCl.Ready -and (-not [string]::IsNullOrWhiteSpace($zip2JohnPath) -or -not [string]::IsNullOrWhiteSpace($sevenZipExtractorPath))) {
-            'Local Hashcat OpenCL devices are ready; implemented GPU routes include ZIP WinZip AES and 7-Zip AES when their local extractors are available.'
+        if ($openCl.Ready -and (-not [string]::IsNullOrWhiteSpace($zip2JohnPath) -or
+                -not [string]::IsNullOrWhiteSpace($sevenZipExtractorPath) -or
+                ($rarModeState.Ready -and -not [string]::IsNullOrWhiteSpace($rar2JohnPath)))) {
+            'Local Hashcat OpenCL devices are ready; implemented GPU routes include ZIP WinZip AES, 7-Zip AES, and supported RAR records when their local extractors are available.'
         }
         else {
             $openCl.Message
@@ -1228,6 +1311,9 @@ function Get-LocalGpuBackendStatus {
         HashcatPath          = $openCl.HashcatPath
         Zip2JohnPath         = $zip2JohnPath
         SevenZipExtractorPath = $sevenZipExtractorPath
+        Rar2JohnPath         = $rar2JohnPath
+        RarHashcatModesReady = [bool]$rarModeState.Ready
+        RarHashcatMissingModes = @($rarModeState.MissingModes)
         Devices              = @($openCl.Devices)
         AdapterAvailable     = if ($isZip) {
             (-not [string]::IsNullOrWhiteSpace($zip2JohnPath))
@@ -1235,10 +1321,15 @@ function Get-LocalGpuBackendStatus {
         elseif ($isSevenZip) {
             (-not [string]::IsNullOrWhiteSpace($sevenZipExtractorPath))
         }
-        else {
-            (-not [string]::IsNullOrWhiteSpace($zip2JohnPath) -or -not [string]::IsNullOrWhiteSpace($sevenZipExtractorPath))
+        elseif ($isRar) {
+            (-not [string]::IsNullOrWhiteSpace($rar2JohnPath))
         }
-        Ready                = ($zipReady -or $sevenZipReady)
+        else {
+            (-not [string]::IsNullOrWhiteSpace($zip2JohnPath) -or
+                -not [string]::IsNullOrWhiteSpace($sevenZipExtractorPath) -or
+                -not [string]::IsNullOrWhiteSpace($rar2JohnPath))
+        }
+        Ready                = ($zipReady -or $sevenZipReady -or $rarReady)
         Message              = $message
     }
 }
@@ -1324,6 +1415,225 @@ function New-SevenZipHashcatArtifact {
     }
 }
 
+function Get-RarRecordDetails {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][string]$Token
+    )
+
+    $tokenText = $Token.Trim()
+    if ($tokenText -match '(?i)^\$rar5\$') {
+        return [pscustomobject]@{
+            Token             = $tokenText
+            Subtype           = 'RAR5'
+            HashMode          = 13000
+            JohnFormat        = 'RAR5'
+            HashcatSupported  = $true
+            JohnSupported     = $true
+            EncryptionType    = 'RAR5'
+            Method            = ''
+        }
+    }
+
+    if ($tokenText -notmatch '(?i)^\$RAR3\$') {
+        return [pscustomobject]@{
+            Token = $tokenText; Subtype = 'UnsupportedRAR'; HashMode = 0
+            JohnFormat = ''; HashcatSupported = $false; JohnSupported = $false
+            EncryptionType = 'Unsupported RAR record'; Method = ''
+        }
+    }
+
+    $parts = @($tokenText -split '\*')
+    if ($parts.Count -ge 2 -and [string]$parts[1] -eq '0' -and $parts.Count -eq 4) {
+        return [pscustomobject]@{
+            Token             = $tokenText
+            Subtype           = 'RAR3-hp'
+            HashMode          = 12500
+            JohnFormat        = 'rar'
+            HashcatSupported  = $true
+            JohnSupported     = $true
+            EncryptionType    = 'RAR3 header encryption'
+            Method            = ''
+        }
+    }
+
+    if ($parts.Count -ne 9 -or [string]$parts[1] -ne '1') {
+        return [pscustomobject]@{
+            Token = $tokenText; Subtype = 'UnsupportedRAR'; HashMode = 0
+            JohnFormat = ''; HashcatSupported = $false; JohnSupported = $false
+            EncryptionType = 'Unsupported RAR3 record'; Method = ''
+        }
+    }
+
+    # Hashcat's published RAR3-p modules validate these fields before a
+    # kernel is selected.  Keep the same small validation here so a tiny or
+    # malformed record falls back instead of being sent to the wrong mode.
+    $packSize = 0
+    $unpackSize = 0
+    $isData = 0
+    $method = 0
+    $numericFieldsValid = $true
+    foreach ($field in @($parts[4], $parts[5], $parts[6], $parts[8])) {
+        if ([string]$field -notmatch '^\d+$') { $numericFieldsValid = $false; break }
+    }
+    if ($numericFieldsValid) {
+        try {
+            $packSize = [int]$parts[4]
+            $unpackSize = [int]$parts[5]
+            $isData = [int]$parts[6]
+            $method = [int]$parts[8]
+        }
+        catch { $numericFieldsValid = $false }
+    }
+
+    $commonDataValid = $numericFieldsValid -and
+        $packSize -ge 1 -and $packSize -le 327680 -and
+        ($packSize % 16) -eq 0 -and
+        $unpackSize -ge 1 -and $unpackSize -le 655360 -and
+        $unpackSize -le $packSize -and $isData -eq 1 -and
+        [string]$parts[7] -match '^[0-9a-fA-F]+$' -and
+        ([string]$parts[7]).Length -eq ($packSize * 2)
+    if ($commonDataValid -and $method -eq 30) {
+        return [pscustomobject]@{
+            Token             = $tokenText
+            Subtype           = 'RAR3-p-uncompressed'
+            HashMode          = 23700
+            JohnFormat        = ''
+            HashcatSupported  = $true
+            JohnSupported     = $false
+            EncryptionType    = 'RAR3 data encryption (uncompressed)'
+            Method            = [string]$method
+        }
+    }
+    if ($commonDataValid -and $method -ge 31 -and $method -le 35) {
+        return [pscustomobject]@{
+            Token             = $tokenText
+            Subtype           = 'RAR3-p-compressed'
+            HashMode          = 23800
+            JohnFormat        = ''
+            HashcatSupported  = $true
+            JohnSupported     = $false
+            EncryptionType    = 'RAR3 data encryption (compressed)'
+            Method            = [string]$method
+        }
+    }
+
+    return [pscustomobject]@{
+        Token             = $tokenText
+        Subtype           = if ($numericFieldsValid -and $method -eq 30) { 'RAR3-p-uncompressed' } elseif ($numericFieldsValid -and $method -ge 31 -and $method -le 35) { 'RAR3-p-compressed' } else { 'UnsupportedRAR' }
+        HashMode          = 0
+        JohnFormat        = ''
+        HashcatSupported  = $false
+        JohnSupported     = $false
+        EncryptionType    = 'Unsupported RAR3 data record'
+        Method            = if ($numericFieldsValid) { [string]$method } else { '' }
+    }
+}
+
+function Get-RarExtractorRecords {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][string]$ArchivePath,
+        [Parameter(Mandatory = $true)][string]$ProjectRoot
+    )
+
+    $rar2JohnPath = Resolve-LocalRar2John -ProjectRoot $ProjectRoot
+    if ([string]::IsNullOrWhiteSpace($rar2JohnPath)) {
+        return [pscustomobject]@{
+            Supported = $false
+            ExtractorPath = ''
+            ExitCode = -1
+            Records = @()
+            Message = 'The local rar2john extractor was not found.'
+        }
+    }
+
+    $extracted = Invoke-LocalNativeProcess -FilePath $rar2JohnPath -WorkingDirectory (Split-Path $rar2JohnPath -Parent) -Arguments @($ArchivePath)
+    $records = New-Object 'System.Collections.Generic.List[object]'
+    foreach ($line in @([string]$extracted.StdOut -split '\r?\n')) {
+        $lineText = [string]$line.Trim()
+        if ([string]::IsNullOrWhiteSpace($lineText)) { continue }
+        $tokenMatches = [regex]::Matches($lineText, '(?i)\$rar5\$[^\s\r\n]+|\$RAR3\$[^:\s\r\n]+')
+        foreach ($match in $tokenMatches) {
+            $token = [string]$match.Value.Trim()
+            if ([string]::IsNullOrWhiteSpace($token) -or @($records | Where-Object { [string]$_.Token -ceq $token }).Count -gt 0) { continue }
+            [void]$records.Add((Get-RarRecordDetails -Token $token))
+        }
+    }
+
+    if ($extracted.ExitCode -ne 0 -or $records.Count -eq 0) {
+        return [pscustomobject]@{
+            Supported = $false
+            ExtractorPath = [string]$rar2JohnPath
+            ExitCode = $extracted.ExitCode
+            Records = @($records.ToArray())
+            Message = if ($records.Count -eq 0) {
+                'The local rar2john extractor did not produce a RAR recovery record.'
+            }
+            else {
+                'The local rar2john extractor did not complete successfully.'
+            }
+        }
+    }
+
+    return [pscustomobject]@{
+        Supported = $true
+        ExtractorPath = [string]$rar2JohnPath
+        ExitCode = $extracted.ExitCode
+        Records = @($records.ToArray())
+        Message = 'RAR recovery records were extracted locally.'
+    }
+}
+
+function New-RarHashcatArtifact {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][string]$ArchivePath,
+        [Parameter(Mandatory = $true)][string]$JobDirectory,
+        [Parameter(Mandatory = $true)][string]$ProjectRoot
+    )
+
+    $extracted = Get-RarExtractorRecords -ArchivePath $ArchivePath -ProjectRoot $ProjectRoot
+    if (-not $extracted.Supported) {
+        return [pscustomobject]@{
+            Supported = $false
+            Message = ([string]$extracted.Message + ' The task will use the CPU path.')
+        }
+    }
+
+    $records = @($extracted.Records)
+    $hashcatRecords = @($records | Where-Object { [bool]$_.HashcatSupported })
+    if ($hashcatRecords.Count -eq 0) {
+        return [pscustomobject]@{
+            Supported = $false
+            Message = 'The local RAR records are not within the supported Hashcat RAR parser range. The task will use the CPU path.'
+        }
+    }
+
+    $modes = @($hashcatRecords | ForEach-Object { [int]$_.HashMode } | Select-Object -Unique)
+    if ($hashcatRecords.Count -ne $records.Count -or $modes.Count -ne 1) {
+        return [pscustomobject]@{
+            Supported = $false
+            Message = 'The local RAR archive produced mixed or unsupported Hashcat record modes. The task will use the CPU path.'
+        }
+    }
+
+    $hashLines = @($hashcatRecords | ForEach-Object { [string]$_.Token })
+    $hashPath = Join-Path $JobDirectory 'hashcat-input.hash'
+    [System.IO.File]::WriteAllLines($hashPath, [string[]]$hashLines, (New-Object System.Text.UTF8Encoding($false)))
+    $subtypes = @($hashcatRecords | ForEach-Object { [string]$_.Subtype } | Select-Object -Unique)
+    return [pscustomobject]@{
+        Supported      = $true
+        Message        = 'RAR recovery data was extracted locally for Hashcat.'
+        HashPath       = $hashPath
+        HashRecords    = $hashLines
+        HashMode       = [int]$modes[0]
+        RarSubtype     = if ($subtypes.Count -eq 1) { [string]$subtypes[0] } else { 'Mixed RAR records' }
+        EncryptionType = if ($subtypes.Count -eq 1) { [string]$hashcatRecords[0].EncryptionType } else { 'Mixed RAR records' }
+        ExtractorPath  = [string]$extracted.ExtractorPath
+    }
+}
+
 function New-ArchiveHashcatArtifact {
     [CmdletBinding()]
     param(
@@ -1339,6 +1649,9 @@ function New-ArchiveHashcatArtifact {
         }
         '7Z' {
             return New-SevenZipHashcatArtifact -ArchivePath $ArchivePath -JobDirectory $JobDirectory -ProjectRoot $ProjectRoot
+        }
+        'RAR' {
+            return New-RarHashcatArtifact -ArchivePath $ArchivePath -JobDirectory $JobDirectory -ProjectRoot $ProjectRoot
         }
         default {
             return [pscustomobject]@{
@@ -1514,6 +1827,83 @@ function New-SevenZipJohnArtifact {
     }
 }
 
+function New-RarJohnArtifact {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][string]$ArchivePath,
+        [Parameter(Mandatory = $true)][string]$JobDirectory,
+        [Parameter(Mandatory = $true)][string]$ProjectRoot
+    )
+
+    $extracted = Get-RarExtractorRecords -ArchivePath $ArchivePath -ProjectRoot $ProjectRoot
+    if (-not $extracted.Supported) {
+        return [pscustomobject]@{
+            Supported = $false
+            Message = ([string]$extracted.Message + ' NanaZip CPU verification remains the fallback.')
+        }
+    }
+
+    $johnRecords = @($extracted.Records | Where-Object {
+            [bool]$_.JohnSupported -and -not [string]::IsNullOrWhiteSpace([string]$_.JohnFormat)
+        })
+    if ($johnRecords.Count -eq 0) {
+        return [pscustomobject]@{
+            Supported = $false
+            Message = 'The local RAR record is not accepted by the bundled John Jumbo build. NanaZip CPU verification remains the fallback.'
+        }
+    }
+
+    $formatOrder = New-Object 'System.Collections.Generic.List[string]'
+    $recordsByFormat = @{}
+    foreach ($record in $johnRecords) {
+        $format = [string]$record.JohnFormat
+        if (-not $recordsByFormat.ContainsKey($format)) {
+            $recordsByFormat[$format] = New-Object 'System.Collections.Generic.List[string]'
+            [void]$formatOrder.Add($format)
+        }
+        [void]$recordsByFormat[$format].Add([string]$record.Token)
+    }
+
+    $hashPath = Join-Path $JobDirectory 'john-input.hash'
+    $groupArtifacts = New-Object 'System.Collections.Generic.List[object]'
+    foreach ($format in $formatOrder) {
+        $formatRecords = $recordsByFormat[$format].ToArray()
+        $groupHashPath = if ($formatOrder.Count -eq 1) {
+            $hashPath
+        }
+        else {
+            Join-Path $JobDirectory ('john-input-rar-{0}.hash' -f $format)
+        }
+        [System.IO.File]::WriteAllLines($groupHashPath, [string[]]$formatRecords, (New-Object System.Text.UTF8Encoding($false)))
+        $encryptionType = if ([string]$format -eq 'RAR5') { 'RAR5' } else { 'RAR3 header encryption' }
+        [void]$groupArtifacts.Add([pscustomobject]@{
+                Format = $format
+                HashPath = $groupHashPath
+                HashRecords = @($formatRecords)
+                EncryptionType = $encryptionType
+            })
+    }
+
+    $primary = $groupArtifacts[0]
+    $isMixed = $groupArtifacts.Count -gt 1
+    return [pscustomobject]@{
+        Supported = $true
+        Message = if ($isMixed) {
+            'RAR recovery data was extracted locally for John Jumbo and grouped by RAR record format.'
+        }
+        else {
+            '{0} recovery data was extracted locally for John Jumbo.' -f [string]$primary.EncryptionType
+        }
+        HashPath = [string]$primary.HashPath
+        HashRecords = @($johnRecords | ForEach-Object { [string]$_.Token })
+        Format = [string]$primary.Format
+        EncryptionType = if ($isMixed) { 'Mixed RAR record formats' } else { [string]$primary.EncryptionType }
+        RarSubtype = @($extracted.Records | Where-Object { $_.JohnSupported } | ForEach-Object { [string]$_.Subtype } | Select-Object -Unique) -join ', '
+        Groups = $groupArtifacts.ToArray()
+        ExtractorPath = [string]$extracted.ExtractorPath
+    }
+}
+
 function New-ArchiveJohnArtifact {
     [CmdletBinding()]
     param(
@@ -1526,6 +1916,7 @@ function New-ArchiveJohnArtifact {
     switch (([string]$ArchiveFormat).ToUpperInvariant()) {
         'ZIP' { return New-ZipJohnArtifact -ArchivePath $ArchivePath -JobDirectory $JobDirectory -ProjectRoot $ProjectRoot }
         '7Z' { return New-SevenZipJohnArtifact -ArchivePath $ArchivePath -JobDirectory $JobDirectory -ProjectRoot $ProjectRoot }
+        'RAR' { return New-RarJohnArtifact -ArchivePath $ArchivePath -JobDirectory $JobDirectory -ProjectRoot $ProjectRoot }
         default {
             return [pscustomobject]@{
                 Supported = $false
@@ -2165,14 +2556,14 @@ function Get-RecoveryRuntimeActivity {
     )
 
     if ([string]::IsNullOrWhiteSpace($JobId)) {
-        return [pscustomobject]@{ Known = $false; Active = $false; Reason = 'A local JobId is required.'; WorkerProcessIds = @(); HashcatProcessIds = @() }
+        return [pscustomobject]@{ Known = $false; Active = $false; Reason = 'A local JobId is required.'; WorkerProcessIds = @(); HashcatProcessIds = @(); JohnProcessIds = @() }
     }
     try {
-        $processes = @(Get-CimInstance -ClassName Win32_Process -Filter "Name = 'powershell.exe' OR Name = 'pwsh.exe' OR Name = 'hashcat.exe'" -ErrorAction Stop)
+        $processes = @(Get-CimInstance -ClassName Win32_Process -Filter "Name = 'powershell.exe' OR Name = 'pwsh.exe' OR Name = 'hashcat.exe' OR Name = 'john.exe' OR Name = 'john-avx.exe' OR Name = 'john-avx2.exe' OR Name = 'john-avx512bw.exe' OR Name = 'john-avx-omp.exe' OR Name = 'john-avx2-omp.exe' OR Name = 'john-avx512bw-omp.exe'" -ErrorAction Stop)
     }
     catch {
         # A failed process query is not safe grounds for deleting a Runtime.
-        return [pscustomobject]@{ Known = $false; Active = $false; Reason = $_.Exception.Message; WorkerProcessIds = @(); HashcatProcessIds = @() }
+        return [pscustomobject]@{ Known = $false; Active = $false; Reason = $_.Exception.Message; WorkerProcessIds = @(); HashcatProcessIds = @(); JohnProcessIds = @() }
     }
 
     $jobPattern = [regex]::Escape($JobId)
@@ -2185,6 +2576,7 @@ function Get-RecoveryRuntimeActivity {
     try { $runtimeJobPattern = [regex]::Escape(([System.IO.Path]::GetFullPath((Join-Path $RuntimeRoot $JobId))).TrimEnd('\')) } catch { $runtimeJobPattern = '' }
     $workerProcessIds = New-Object 'System.Collections.Generic.List[int]'
     $hashcatProcessIds = New-Object 'System.Collections.Generic.List[int]'
+    $johnProcessIds = New-Object 'System.Collections.Generic.List[int]'
     foreach ($process in $processes) {
         $name = [string]$process.Name
         $commandLine = [string]$process.CommandLine
@@ -2207,14 +2599,27 @@ function Get-RecoveryRuntimeActivity {
                 [void]$hashcatProcessIds.Add([int]$process.ProcessId)
             }
         }
+        elseif ($name -match '(?i)^john(?:-avx(?:512bw|2)?(?:-omp)?)?\.exe$') {
+            $johnMatches = $commandLine -match ('ArchivePasswordRecovery-' + $jobPattern) -or
+                $commandLine -match ('Runtime[\\/]' + $jobPattern)
+            if (-not $johnMatches -and -not [string]::IsNullOrWhiteSpace($runtimeJobPattern)) {
+                $johnMatches = $commandLine -match $runtimeJobPattern
+            }
+            if ($johnMatches) {
+                [void]$johnProcessIds.Add([int]$process.ProcessId)
+            }
+        }
     }
 
-    $active = $workerProcessIds.Count -gt 0 -or $hashcatProcessIds.Count -gt 0
+    $active = $workerProcessIds.Count -gt 0 -or $hashcatProcessIds.Count -gt 0 -or $johnProcessIds.Count -gt 0
     $reason = if ($workerProcessIds.Count -gt 0) {
         'RecoveryWorker process matches this local Runtime job.'
     }
     elseif ($hashcatProcessIds.Count -gt 0) {
         'Hashcat process matches this local Runtime job.'
+    }
+    elseif ($johnProcessIds.Count -gt 0) {
+        'John Jumbo process matches this local Runtime job.'
     }
     else {
         ''
@@ -2225,6 +2630,7 @@ function Get-RecoveryRuntimeActivity {
         Reason = $reason
         WorkerProcessIds = $workerProcessIds.ToArray()
         HashcatProcessIds = $hashcatProcessIds.ToArray()
+        JohnProcessIds = $johnProcessIds.ToArray()
     }
 }
 
@@ -4864,6 +5270,7 @@ Export-ModuleMember -Function @(
     'Get-LocalComputeDevices',
     'Resolve-LocalHashcat',
     'Resolve-LocalZip2John',
+    'Resolve-LocalRar2John',
     'Resolve-Local7z2Hashcat',
     'Resolve-LocalJohn',
     'ConvertTo-WindowsCommandLineArgument',
@@ -4873,11 +5280,15 @@ Export-ModuleMember -Function @(
     'Get-LocalGpuBackendStatus',
     'New-ZipHashcatArtifact',
     'New-SevenZipHashcatArtifact',
+    'Get-RarRecordDetails',
+    'Get-RarExtractorRecords',
+    'New-RarHashcatArtifact',
     'New-ArchiveHashcatArtifact',
     'New-LocalJohnRuntimeConfig',
     'Get-ZipJohnRecordGroups',
     'New-ZipJohnArtifact',
     'New-SevenZipJohnArtifact',
+    'New-RarJohnArtifact',
     'New-ArchiveJohnArtifact',
     'Clear-AppOwnedHashcatResidue',
     'Get-RecoveryLevel',
