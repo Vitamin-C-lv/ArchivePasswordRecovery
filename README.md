@@ -30,7 +30,7 @@ The bundled John Windows runtime uses `tools\extractors\cygwin1.dll`, whose loca
 | ZIP WinZip AES (`$zip2$`) | ASCII-compatible candidates | Supported; ZIP uses Windows ACP bytes | Supported | Supported; Unicode route is format-aware |
 | ZIP ZipCrypto (`$pkzip$`) | Unsupported | Supported | Supported | Supported |
 | 7z AES (`$7z$`) | ASCII-compatible candidates | Supported when the bundled build accepts the extracted record; Unicode uses explicit UTF-8 | Supported | Supported; Unicode route is format-aware |
-| RAR5（`$rar5$`，Hashcat mode 13000） | Supported | Supported（John format `RAR5`） | Supported | Supported |
+| RAR5（`$rar5$`，Hashcat mode 13000） | Supported（ASCII-compatible） | Supported（John format `RAR5`；UTF-8-safe CPU path；真实 Unicode-password RAR5 E2E 未验证） | Supported | ASCII-compatible 已验证；真实 Unicode-password RAR5 E2E 未验证 |
 | RAR3-hp（`$RAR3$*0*`，Hashcat mode 12500） | Supported | Supported（John format `rar`） | Supported | Supported |
 | RAR3-p compressed（Hashcat mode 23800） | Supported | Bundled John does not accept this record | Supported | GPU verified; CPU/NanaZip fallback |
 | RAR3-p uncompressed（Hashcat mode 23700） | Adapter ready; real fixture not verified | Bundled John does not accept this record | Supported | Not verified; CPU/NanaZip fallback |
@@ -40,6 +40,8 @@ The bundled John Windows runtime uses `tools\extractors\cygwin1.dll`, whose loca
 | RAR modern/old split naming (`name.part1.rar` / `name.rar`, `name.r00`, ...) | Not verified | Not verified | Not verified without a real RAR set | Naming recognition and missing-volume diagnostics only; no local RAR creator |
 | Quick exact candidates | Not used | Not used | Supported | CPU only by design |
 | Hybrid with `?w` in the middle | Unsupported | Unsupported | Supported | CPU fallback only |
+
+RAR5 Unicode password: the code path is designed for UTF-8-safe CPU handling, but a real Unicode-password RAR5 archive end-to-end has not been verified because this machine has no legal local RAR5 creator. The generic RAR5 support row above must not be read as full Unicode verification.
 
 Bundled third-party components and their accompanying license texts are listed in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md). NanaZip / 7-Zip is a locally installed runtime prerequisite and is not bundled in this repository.
 
@@ -63,6 +65,7 @@ Bundled third-party components and their accompanying license texts are listed i
 - 内置字符集由应用统一定义：小写 26、大写 26、数字 10、符号 24、总计 86 个字符；GPU mask 会显式传递 Hashcat custom charset，字面量 `?` 会按 Hashcat 规则转义。
 - Unicode 输入约定：用户字典必须是严格 UTF-8（可带 BOM），无效字节会在准备阶段明确拒绝，不做替换解码；Quick 是精确候选，只过滤真正的空行，ASCII 空格、全角空格和其他 Unicode 空白都会保留。CPU 候选生成按 Unicode 标量处理补充字符。
 - 非 ASCII 字典、Unicode mask 字面量和非 ASCII 自定义字符集会选择 Unicode-safe CPU 路径，不把未经真实端到端验证的 GPU Unicode 结果宣称为成功。7z/RAR 的 John 路径使用显式 UTF-8；当前 NanaZip ZIP 解码器使用 Windows 活动 ANSI 代码页，因此 ZIP John 路径用严格 ACP 字节字典与 John 的 raw `ISO-8859-1` 输入模式，无法由当前 ACP 表示的 ZIP 候选会保留本地 fallback 并给出明确结果。
+- RAR5 的 ASCII-compatible 真实链路已验证；RAR5 Unicode password 的代码路径按 UTF-8-safe CPU 语义设计，但当前没有合法本地 RAR5 creator，真实 Unicode-password RAR5 归档 E2E 尚未验证，不将其写成全格式 Unicode 已支持。
 - L4 的第一个覆盖项是用户自定义 Mask/Hybrid（若填写）；不含 `?w` 时精确计算候选数，含 `?w` 时必须填写本地字典，`?w` 位于首尾可走 GPU，位于中间保持 CPU。其后才是 global/zh 字典覆盖项和首字母大写加 1–4 位数字覆盖项；后者只保留首字母确实发生变化的唯一词，再乘以 1–4 位数字空间。L4/L5 的 ID、数量和累计进度按实际规划计算，重复的年份/混合范围不会重复计数。
 - L4 的日期范围与“字典词 + 常见符号”都使用统一的有限生成集适配器：CPU 流式验证与 GPU 临时字典来自同一个候选顺序。常见符号固定为 `@`、`#`、`$`、`_`、`-`，不再生成 `!`；每个语言的候选总量是 L1 字典条目数的 5 倍。旧版已经完成的 `hybrid:L4-word-symbol-*:v2` 是包含新版 v3 的严格超集，只作显式兼容记账，不会反向把 v3 当成 v2。
 - Stage 3 的 Rules 明确拆成大小写族和追加族，CPU 与 GPU 使用同一组变形语义；Quick 和自定义 Mask 的覆盖修订号会随配置变化递增，避免复用旧断点。
@@ -110,7 +113,7 @@ Bundled third-party components and their accompanying license texts are listed i
 | ZIP 传统 ZipCrypto（`$pkzip$`） | CPU John | 由本地 `zip2john` 提取后交给 John Jumbo；John 报告的候选必须再经 NanaZip `7z t` 验证。 |
 | 7z AES（NanaZip 显示 `7zAES`，`$7z$`，Hashcat mode 11600） | 已支持（ASCII-compatible） | 通过本地 `7z2hashcat` 提取。已实机验收 LZMA2 + 7zAES 且加密文件头的 Dictionary；ASCII-compatible Rules、普通 Mask、`?w` 位于首尾的 Hybrid、BruteForce 共用同一 Hashcat attack-plan 路径，Unicode 候选走显式 UTF-8 的 CPU John/fallback。 |
 | 7z 记录无法被本地 extractor / John/Hashcat 接受 | CPU | Worker 显示真实原因并保留现有 NanaZip 五层 CPU fallback；不会伪装为 bulk 支持。 |
-| RAR5（`$rar5$`，mode 13000） | 已支持 | `rar2john` 提取后走 Hashcat；John 也支持 `RAR5` bulk；两条成功候选都必须经 NanaZip `7z t`。 |
+| RAR5（`$rar5$`，mode 13000） | 已支持（ASCII-compatible；Unicode RAR5 E2E 未验收） | `rar2john` 提取后走 Hashcat；John 也支持 `RAR5` bulk；两条成功候选都必须经 NanaZip `7z t`。UTF-8-safe CPU 路径已设计，但真实 Unicode-password RAR5 归档 E2E 尚未验证。 |
 | RAR3-hp（`$RAR3$*0*`，mode 12500） | 已支持 | `rar2john` 提取后走 Hashcat；John 也支持 `rar` bulk；两条成功候选都必须经 NanaZip `7z t`。 |
 | RAR3-p compressed（mode 23800） | 已支持 | 真实 `p1-comment.rar` 夹具已在 NVIDIA/AMD 上验收；当前 bundled John 不接受该记录，CPU 走 NanaZip fallback。 |
 | RAR3-p uncompressed（mode 23700） | 未验收 | 记录分类与模块门槛已接入，但当前真实夹具集没有有效 uncompressed 样本；不会把 synthetic 记录写成集成通过。 |
