@@ -743,6 +743,7 @@ $script:DeviceProbeError = ''
 $script:DeviceChoicesPopulated = $false
 $script:DeferredStartupScheduled = $false
 $script:DeferredStartupStarted = $false
+$script:LastUiErrorKey = ''
 
 function Write-UiLog {
     param([Parameter(Mandatory = $true)][string]$Message)
@@ -755,8 +756,19 @@ function Write-UiLog {
 function Show-UiError {
     param([Parameter(Mandatory = $true)][string]$Message)
 
-    $localized = Convert-UiMessage -Message $Message
-    Write-UiLog $localized
+    $diagnostic = Get-RecoveryDiagnostic -Message $Message -State 'Failed'
+    $localized = [string]$diagnostic.UserMessage
+    $controls.ProgressDetailBody.Visibility = [System.Windows.Visibility]::Visible
+    $controls.ProgressMessageText.Text = $localized
+    Write-UiLog ('[{0}] {1}' -f [string]$diagnostic.ErrorCode, $localized)
+
+    # Worker fallback warnings and informational outcomes belong in the
+    # inline progress/status area.  Errors may still use a dialog, but the
+    # same diagnostic is shown only once until the selected task is cleared.
+    if ([string]$diagnostic.Severity -ne 'Error') { return }
+    $dialogKey = '{0}|{1}' -f [string]$diagnostic.ErrorCode, $localized
+    if ($script:LastUiErrorKey -eq $dialogKey) { return }
+    $script:LastUiErrorKey = $dialogKey
     [System.Windows.MessageBox]::Show($window, $localized, '压缩包密码恢复', [System.Windows.MessageBoxButton]::OK, [System.Windows.MessageBoxImage]::Error) | Out-Null
 }
 
@@ -777,6 +789,7 @@ function Clear-SelectedArchive {
     $controls.ArchiveFileNameText.Text = ''
     $controls.ArchiveInfoText.Text = ''
     $controls.ProgressDetailBody.Visibility = [System.Windows.Visibility]::Collapsed
+    $script:LastUiErrorKey = ''
     $script:CurrentInspection = $null
     Reset-UiElapsedState
     Set-ArchiveDisplayState -HasValidArchive:$false
@@ -930,6 +943,13 @@ function Convert-UiMessage {
 
     if ([string]::IsNullOrWhiteSpace($Message)) { return '' }
 
+    # New progress files carry a structured diagnostic.  This legacy text
+    # adapter is still used for older snapshots, so recognize stable error
+    # prefixes here as well and never echo their raw detail into the UI.
+    if ($Message -match '^\s*(?:ARCHIVE_|DICTIONARY_|GPU_|JOHN_|HASHCAT_|EXTRACTOR_|JOB_|RECOVERY_RANGE_|INTERNAL_ERROR)') {
+        return [string](Get-RecoveryDiagnostic -Message $Message -State 'Failed').UserMessage
+    }
+
     $exact = @{
         'Testing local candidates.' = '正在测试本地候选密码。'
         'Preparing the local recovery backend.' = '正在准备本地恢复后端。'
@@ -1002,14 +1022,8 @@ function Convert-UiMessage {
         return $exact[$Message]
     }
 
-    if ($Message -match '^ARCHIVE_VOLUME_SET_INCOMPLETE: (.+)$') {
-        return ('压缩包分卷不完整：{0}' -f $Matches[1])
-    }
-    if ($Message -match '^ARCHIVE_VOLUME_IDENTITY_MISSING: (.+)$') {
-        return ('保存的分卷任务缺少完整身份信息：{0}' -f $Matches[1])
-    }
-    if ($Message -match '^ARCHIVE_VOLUME_CHANGED: (.+)$') {
-        return ('压缩包分卷自任务创建后已发生变化，无法继续使用原有恢复进度：{0}' -f $Matches[1])
+    if ($Message -match '^ARCHIVE_VOLUME_SET_INCOMPLETE:|^ARCHIVE_VOLUME_IDENTITY_MISSING:|^ARCHIVE_VOLUME_CHANGED:') {
+        return [string](Get-RecoveryDiagnostic -Message $Message -State 'Failed').UserMessage
     }
 
     if ($Message -match '^Preparing the local backend for coverage: (.+)\.$') {
@@ -1042,7 +1056,7 @@ function Convert-UiMessage {
             'the local dictionary file is missing' { '本地字典文件不存在' }
             'the mask uses ?w but the local dictionary file is missing' { '掩码使用了 ?w，但本地字典文件不存在' }
             'the brute-force length range is invalid' { '穷举长度范围无效' }
-            default { $reason }
+            default { [string](Get-RecoveryDiagnostic -Message $reason -State 'Failed').UserMessage }
         }
         return ('已跳过“{0}”阶段：{1}。' -f $stageName, $reasonText)
     }
@@ -1096,6 +1110,12 @@ function Convert-UiMessage {
     }
     if ($Message -match 'CPU fallback was selected\.') {
         return '当前 GPU 后端或策略不可用，已回退到 CPU 本地验证路径。'
+    }
+    # Keep ordinary progress text intact, but project unknown error-looking
+    # legacy messages to the generic safe diagnostic instead of exposing raw
+    # tool output, file paths, or exception text.
+    if ($Message -match '(?i)error|exception|failed|failure|cannot|could not|not found|unsupported|corrupt|damaged|missing|changed|错误|异常|失败|找不到|不支持|损坏|缺少|发生变化') {
+        return [string](Get-RecoveryDiagnostic -Message $Message -State 'Failed').UserMessage
     }
     return $Message
 }
@@ -2380,7 +2400,7 @@ function Open-SavedJob {
         $controls.MaxLengthBox.Text = [string]$job.MaxLength
         $controls.ArchiveFileNameText.Text = [System.IO.Path]::GetFileName($savedEntryPath)
         Update-StrategyHelp
-        try { $null = Inspect-SelectedArchive } catch { Clear-SelectedArchive; Write-UiLog ('已打开保存的任务；检查将稍后进行：' + (Convert-UiMessage -Message $_.Exception.Message)) }
+        try { $null = Inspect-SelectedArchive } catch { Clear-SelectedArchive; throw }
         Update-TaskControls
         Write-UiLog '已打开保存的本地任务。若 Worker 已停止，请点击“继续”。'
     }
@@ -2438,6 +2458,23 @@ function Update-ProgressFromDisk {
         else {
             [string]$progress.Message
         }
+        $progressDiagnostic = $null
+        if ($progress.PSObject.Properties.Name -contains 'Diagnostic' -and $null -ne $progress.Diagnostic) {
+            $diagnosticCode = ''
+            try {
+                if ($progress.Diagnostic.PSObject.Properties.Name -contains 'ErrorCode') {
+                    $diagnosticCode = [string]$progress.Diagnostic.ErrorCode
+                }
+            }
+            catch { $diagnosticCode = '' }
+            if (-not [string]::IsNullOrWhiteSpace($diagnosticCode)) {
+                try {
+                    $progressDiagnostic = Get-RecoveryDiagnostic -Code $diagnosticCode -State $persistedState
+                }
+                catch { $progressDiagnostic = $null }
+            }
+        }
+        $safeActivityMessage = if ($null -ne $progressDiagnostic) { [string]$progressDiagnostic.UserMessage } else { $activityMessage }
         $currentCoverageName = if ($progress.PSObject.Properties.Name -contains 'CurrentCoverageName' -and -not [string]::IsNullOrWhiteSpace([string]$progress.CurrentCoverageName)) { [string]$progress.CurrentCoverageName } else { '' }
         $preparationCurrent = if ($progress.PSObject.Properties.Name -contains 'PreparationCurrent') { $progress.PreparationCurrent } else { $null }
         $preparationTotal = if ($progress.PSObject.Properties.Name -contains 'PreparationTotal') { $progress.PreparationTotal } else { $null }
@@ -2775,7 +2812,7 @@ function Update-ProgressFromDisk {
         elseif ($isPreparation) {
             $controls.SearchProgressBar.IsIndeterminate = $true
             $controls.SearchProgressBar.Value = 0
-            $controls.ProgressPercentValue.Text = if ($null -ne $preparationCurrent) { Format-PreparationProgress -Current $preparationCurrent -Total $preparationTotal -Unit $preparationUnit } else { Convert-UiMessage -Message $activityMessage }
+            $controls.ProgressPercentValue.Text = if ($null -ne $preparationCurrent) { Format-PreparationProgress -Current $preparationCurrent -Total $preparationTotal -Unit $preparationUnit } else { Convert-UiMessage -Message $safeActivityMessage }
         }
         elseif ($hasProgress) {
             [double]$percent = [double]$progress.ProgressPercent
@@ -2786,7 +2823,7 @@ function Update-ProgressFromDisk {
         else {
             $controls.SearchProgressBar.IsIndeterminate = $true
             $controls.SearchProgressBar.Value = 0
-            $controls.ProgressPercentValue.Text = if ($invariantViolation) { '正在同步当前搜索进度…' } elseif (-not $johnCursorReliable) { 'John 批量搜索中；已测试数量和百分比将在完成后报告。' } elseif ($activity -ne 'RunningCoverage') { Convert-UiMessage -Message $activityMessage } elseif ($hasKnownTotal) { '正在根据当前本地速度估算进度…' } else { '当前搜索空间无法预先计算总量；总量将在执行过程中估算。' }
+            $controls.ProgressPercentValue.Text = if ($invariantViolation) { '正在同步当前搜索进度…' } elseif (-not $johnCursorReliable) { 'John 批量搜索中；已测试数量和百分比将在完成后报告。' } elseif ($activity -ne 'RunningCoverage') { Convert-UiMessage -Message $safeActivityMessage } elseif ($hasKnownTotal) { '正在根据当前本地速度估算进度…' } else { '当前搜索空间无法预先计算总量；总量将在执行过程中估算。' }
         }
 
         $estimated = if ($progress.PSObject.Properties.Name -contains 'EstimatedRemainingSeconds') { $progress.EstimatedRemainingSeconds } else { $null }
@@ -2845,7 +2882,7 @@ function Update-ProgressFromDisk {
             $controls.EstimatedRemainingValue.Text = '当前范围暂无法可靠估算'
             $controls.WorstCaseValue.Text = '当前范围暂无法可靠估算'
         }
-        $displayActivityMessage = Convert-UiMessage -Message $activityMessage
+        $displayActivityMessage = if ($null -ne $progressDiagnostic) { [string]$progressDiagnostic.UserMessage } else { Convert-UiMessage -Message $activityMessage }
         if ($activity -like 'Preparing*' -or $activity -eq 'RunningCoverage') {
             $lastProgressUtc = $null
             if ($progress.PSObject.Properties.Name -contains 'LastProgressUtc' -and -not [string]::IsNullOrWhiteSpace([string]$progress.LastProgressUtc)) {
@@ -2877,7 +2914,8 @@ function Update-ProgressFromDisk {
         if ($script:LastProgressUpdated -ne [string]$progress.UpdatedUtc) {
             $script:LastProgressUpdated = [string]$progress.UpdatedUtc
             if ($displayState -in @('Recovered', 'Exhausted', 'Stopped', 'Failed', 'BackendUnavailable', 'NotEncrypted')) {
-                Write-UiLog ('本地任务状态：{0}。{1}' -f (Convert-StateName -Value $displayState), (Convert-UiMessage -Message ([string]$progress.Message)))
+                $terminalMessage = if ($null -ne $progressDiagnostic) { [string]$progressDiagnostic.UserMessage } else { Convert-UiMessage -Message ([string]$progress.Message) }
+                Write-UiLog ('本地任务状态：{0}。{1}' -f (Convert-StateName -Value $displayState), $terminalMessage)
             }
         }
     }
@@ -2905,7 +2943,7 @@ $controls.DeviceInfoText.Text = '可用：Auto（推荐） · 仅使用 CPU · �
 $controls.AdvancedDeviceInfoText.Text = '正在检测本机 GPU；窗口已就绪。'
 Update-StrategyHelp
 $controls.ArchiveFileNameText.Text = '尚未选择压缩包'
-$controls.ArchiveInfoText.Text = '支持拖入单个本地 ZIP、7z、RAR 文件。'
+$controls.ArchiveInfoText.Text = '支持拖入单个或分卷本地 ZIP、7z、RAR 文件。'
 $controls.ArchiveInfoText.ToolTip = $null
 $controls.StateValue.Text = '空闲'
 $controls.ProgressDetailBody.Visibility = [System.Windows.Visibility]::Collapsed

@@ -56,8 +56,23 @@ $script:IsCumulativeJob = $job.PSObject.Properties.Name -contains 'RecoveryLevel
 $jobId = ''
 if ($job.PSObject.Properties.Name -contains 'JobId') { $jobId = [string]$job.JobId }
 $script:RuntimeJobId = if ([string]::IsNullOrWhiteSpace($jobId)) { [System.IO.Path]::GetFileName(([System.IO.Path]::GetFullPath($JobDirectory).TrimEnd('\'))) } else { $jobId }
-$script:JobOwnershipMutex = Enter-WorkerJobOwnership -JobId $script:RuntimeJobId
-$script:JobOwnershipAcquired = $true
+$script:JobOwnershipMutex = $null
+$script:JobOwnershipAcquired = $false
+try {
+    $script:JobOwnershipMutex = Enter-WorkerJobOwnership -JobId $script:RuntimeJobId
+    $script:JobOwnershipAcquired = $true
+}
+catch {
+    if ([string]$_.Exception.Message -match '^JOB_ALREADY_ACTIVE:') {
+        # The active Worker owns the progress file, so never overwrite its
+        # live snapshot.  Emit the stable code and safe user message for the
+        # caller; the normal UI preflight surfaces the same diagnostic inline.
+        $activeDiagnostic = Get-RecoveryDiagnostic -Code 'JOB_ALREADY_ACTIVE' -Function 'Enter-WorkerJobOwnership' -ArtifactType 'job mutex'
+        [Console]::Error.WriteLine(('JOB_ALREADY_ACTIVE: ' + [string]$activeDiagnostic.UserMessage))
+        exit 1
+    }
+    throw
+}
 $script:RunId = [guid]::NewGuid().ToString('N')
 $script:RunStartedUtc = [datetime]::UtcNow
 $script:RuntimeDirectory = Get-RecoveryRuntimeDirectory -JobDirectory $JobDirectory -JobId $jobId -RunId $script:RunId
@@ -269,6 +284,8 @@ $script:ResumeCoverageBase = 0L
 $script:ErrorCode = $null
 $script:ErrorFunction = $null
 $script:ErrorArtifactType = $null
+$script:Diagnostic = $null
+$script:GpuFallbackRequested = $false
 $script:TotalCandidates = $null
 $script:RecoveryLevel = Get-RecoveryLevel -Job $job
 $script:RecoveryPlanYear = Get-PlanYear -Job $job
@@ -487,6 +504,9 @@ function Set-WorkerActivity {
 
     $script:Activity = $Activity
     $script:ActivityMessage = $Message
+    if ($Activity -notin @('Failed', 'Exhausted', 'NotEncrypted')) {
+        $script:Diagnostic = $null
+    }
     if ($Activity -eq 'RunningCoverage' -and $null -eq $script:CurrentCoverageRunningStartedUtc) {
         $script:CurrentCoverageRunningStartedUtc = [datetime]::UtcNow
     }
@@ -1597,12 +1617,87 @@ function Set-WorkerErrorContext {
     param(
         [Parameter(Mandatory = $true)][string]$Code,
         [Parameter(Mandatory = $true)][string]$Function,
-        [Parameter(Mandatory = $true)][string]$ArtifactType
+        [Parameter(Mandatory = $true)][string]$ArtifactType,
+        [AllowEmptyString()][string]$Message = ''
     )
 
     $script:ErrorCode = $Code
     $script:ErrorFunction = $Function
     $script:ErrorArtifactType = $ArtifactType
+    $diagnosticMessage = if ([string]::IsNullOrWhiteSpace($Message)) { [string]$script:ActivityMessage } else { $Message }
+    $script:Diagnostic = Get-RecoveryDiagnostic -Code $Code -Message $diagnosticMessage -Function $Function -ArtifactType $ArtifactType -State 'Failed'
+}
+
+function Set-WorkerDiagnostic {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][string]$Code,
+        [AllowEmptyString()][string]$Message = '',
+        [string]$Function = '',
+        [string]$ArtifactType = '',
+        [AllowEmptyString()][string]$TechnicalDetail = '',
+        [int]$ExitCode = [int]::MinValue,
+        [ValidateSet('Starting', 'Running', 'Paused', 'Pausing', 'Stopping', 'Stopped', 'Recovered', 'Exhausted', 'Failed', 'NotEncrypted', '')][string]$State = ''
+    )
+
+    $diagnosticState = if ([string]::IsNullOrWhiteSpace($State)) {
+        if ([string]$Code -eq 'RECOVERY_RANGE_EXHAUSTED') { 'Exhausted' } elseif ([string]$Code -eq 'ARCHIVE_NOT_ENCRYPTED') { 'NotEncrypted' } else { '' }
+    }
+    else { $State }
+    $script:Diagnostic = Get-RecoveryDiagnostic -Code $Code -Message $Message -Function $Function -ArtifactType $ArtifactType -TechnicalDetail $TechnicalDetail -ExitCode $ExitCode -State $diagnosticState
+}
+
+function Set-WorkerFallbackDiagnostic {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][ValidateSet('GPU_NOT_AVAILABLE', 'GPU_DEVICE_DISAPPEARED', 'GPU_BACKEND_INIT_FAILED', 'GPU_FORMAT_UNSUPPORTED', 'JOHN_FORMAT_UNSUPPORTED', 'HASHCAT_ARTIFACT_UNSUPPORTED', 'EXTRACTOR_FAILED')][string]$Code,
+        [AllowEmptyString()][string]$Message = '',
+        [string]$Function = 'RecoveryWorker',
+        [string]$ArtifactType = 'local recovery backend'
+    )
+
+    Set-WorkerDiagnostic -Code $Code -Message $Message -Function $Function -ArtifactType $ArtifactType
+}
+
+function Set-WorkerCpuFallbackEngine {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][ValidateSet('GPU_NOT_AVAILABLE', 'GPU_DEVICE_DISAPPEARED', 'GPU_BACKEND_INIT_FAILED', 'GPU_FORMAT_UNSUPPORTED', 'JOHN_FORMAT_UNSUPPORTED', 'HASHCAT_ARTIFACT_UNSUPPORTED', 'EXTRACTOR_FAILED')][string]$Code,
+        [AllowEmptyString()][string]$Message = '',
+        [string]$Function = 'RecoveryWorker',
+        [string]$ArtifactType = 'local recovery backend',
+        [string]$CoverageName = ''
+    )
+
+    $diagnostic = Get-RecoveryDiagnostic -Code $Code -Message $Message -Function $Function -ArtifactType $ArtifactType
+    $engine = New-CpuEngine -Label 'CPU / NanaZip fallback' -Message ([string]$diagnostic.UserMessage)
+    Set-WorkerEngineSelection -Engine $engine
+    $activityMessage = if ([string]::IsNullOrWhiteSpace($CoverageName)) {
+        [string]$diagnostic.UserMessage
+    }
+    else {
+        '{0} Coverage: {1}' -f [string]$diagnostic.UserMessage, $CoverageName
+    }
+    Set-WorkerActivity -Activity 'RunningCoverage' -Message $activityMessage
+    Set-WorkerDiagnostic -Code $Code -Message $Message -Function $Function -ArtifactType $ArtifactType
+    Publish-Progress -State 'Running' -Message $activityMessage -Result $null -Force
+    return $engine
+}
+
+function Get-WorkerGpuFallbackCode {
+    [CmdletBinding()]
+    param([AllowEmptyString()][string]$Message = '')
+
+    # The selection layer intentionally returns a human-readable reason. Keep
+    # this small classifier beside the fallback transition so missing tools,
+    # failed extractors, absent devices, and backend initialization failures
+    # remain distinguishable without persisting the raw reason.
+    if ($Message -match '(?i)extractor.*(?:failed|did not complete|could not)') { return 'EXTRACTOR_FAILED' }
+    if ($Message -match '(?i)extractor.*(?:not found|unavailable)') { return 'HASHCAT_ARTIFACT_UNSUPPORTED' }
+    if ($Message -match '(?i)GPU recovery is not implemented|GPU.*unsupported|RAR.*mode modules.*incomplete|不支持 GPU') { return 'GPU_FORMAT_UNSUPPORTED' }
+    if ($Message -match '(?i)OpenCL.*(?:initializ|failed)|backend.*(?:initializ|failed)') { return 'GPU_BACKEND_INIT_FAILED' }
+    if ($Message -match '(?i)device.*(?:lost|removed|disappear|unavailable)|GPU.*(?:lost|removed|disappear)') { return 'GPU_DEVICE_DISAPPEARED' }
+    return 'GPU_NOT_AVAILABLE'
 }
 
 function Update-EffectiveSpeed {
@@ -1878,6 +1973,16 @@ function Publish-ProgressCore {
         [switch]$InitialSnapshot,
         [switch]$Force
     )
+
+    if ($State -eq 'NotEncrypted') {
+        $script:Diagnostic = Get-RecoveryDiagnostic -Code 'ARCHIVE_NOT_ENCRYPTED' -Message $Message -Function 'Publish-ProgressCore' -ArtifactType 'archive' -State 'NotEncrypted'
+    }
+    elseif ($State -eq 'Exhausted') {
+        $script:Diagnostic = Get-RecoveryDiagnostic -Code 'RECOVERY_RANGE_EXHAUSTED' -Message $Message -Function 'Publish-ProgressCore' -ArtifactType 'recovery range' -State 'Exhausted'
+    }
+    elseif ($State -eq 'Failed' -and $null -eq $script:Diagnostic) {
+        $script:Diagnostic = Get-RecoveryDiagnostic -Message $Message -Function ([string]$script:ErrorFunction) -ArtifactType ([string]$script:ErrorArtifactType) -State 'Failed'
+    }
 
     if ([string]::IsNullOrWhiteSpace($Activity)) {
         $Activity = [string]$script:Activity
@@ -2159,6 +2264,7 @@ function Publish-ProgressCore {
         ErrorCode         = $script:ErrorCode
         ErrorFunction     = $script:ErrorFunction
         ErrorArtifactType = $script:ErrorArtifactType
+        Diagnostic        = $script:Diagnostic
         Strategy          = $script:Strategy
         RecoveryLevel     = $script:RecoveryLevel
         StageNumber       = $script:StageNumber
@@ -2656,7 +2762,35 @@ function Invoke-WorkerNanaZipVerification {
     $verificationOperationStartedUtc = [datetime]::UtcNow
     $stopwatch = [System.Diagnostics.Stopwatch]::StartNew()
     try {
-        return (Test-ArchivePassword -ArchivePath ([string]$job.ArchivePath) -Password $Candidate -SevenZip $SevenZip)
+        $attempt = Test-ArchivePassword -ArchivePath ([string]$job.ArchivePath) -Password $Candidate -SevenZip $SevenZip
+        if ($attempt.PSObject.Properties.Name -contains 'FailureCategory' -and [string]$attempt.FailureCategory -eq 'ArchiveDamaged') {
+            $volumeSet = $null
+            try { $volumeSet = Resolve-ArchiveVolumeSet -Path ([string]$job.ArchivePath) } catch { }
+            $failureCode = if ($null -ne $volumeSet -and [bool]$volumeSet.IsMultiVolume) { 'ARCHIVE_VOLUME_INCOMPLETE_OR_DAMAGED' } else { 'ARCHIVE_DAMAGED' }
+            Set-WorkerErrorContext -Code $failureCode -Function 'Invoke-WorkerNanaZipVerification' -ArtifactType 'NanaZip archive verification'
+            throw ('{0}: NanaZip could not read the archive during local verification.' -f $failureCode)
+        }
+        if ($attempt.PSObject.Properties.Name -contains 'FailureCategory' -and [string]$attempt.FailureCategory -eq 'VerifierFailed') {
+            Set-WorkerErrorContext -Code 'INTERNAL_ERROR' -Function 'Invoke-WorkerNanaZipVerification' -ArtifactType 'NanaZip password verification'
+            throw 'INTERNAL_ERROR: NanaZip could not complete local password verification.'
+        }
+        return $attempt
+    }
+    catch {
+        $errorText = [string]$_.Exception.Message
+        if ($errorText -match '^ARCHIVE_VOLUME_SET_INCOMPLETE:') {
+            Set-WorkerErrorContext -Code 'ARCHIVE_VOLUME_SET_INCOMPLETE' -Function 'Invoke-WorkerNanaZipVerification' -ArtifactType 'archive volume set'
+        }
+        elseif ($errorText -match '^(?<knownCode>ARCHIVE_VOLUME_INCOMPLETE_OR_DAMAGED|ARCHIVE_DAMAGED|INTERNAL_ERROR):') {
+            Set-WorkerErrorContext -Code ([string]$Matches['knownCode']) -Function 'Invoke-WorkerNanaZipVerification' -ArtifactType 'NanaZip password verification'
+        }
+        else {
+            $volumeSet = $null
+            try { $volumeSet = Resolve-ArchiveVolumeSet -Path ([string]$job.ArchivePath) } catch { }
+            $failureCode = if ($null -ne $volumeSet -and [bool]$volumeSet.IsMultiVolume) { 'ARCHIVE_VOLUME_INCOMPLETE_OR_DAMAGED' } else { 'ARCHIVE_DAMAGED' }
+            Set-WorkerErrorContext -Code $failureCode -Function 'Invoke-WorkerNanaZipVerification' -ArtifactType 'NanaZip archive verification'
+        }
+        throw
     }
     finally {
         $stopwatch.Stop()
@@ -2899,7 +3033,7 @@ function New-JohnCandidateWordlist {
         catch {
             return [pscustomobject]@{
                 Supported = $false
-                Message = ('John finite candidate preparation was unavailable: ' + $_.Exception.Message)
+                Message = 'John finite candidate preparation was unavailable; NanaZip CPU verification remains the fallback.'
             }
         }
         finally {
@@ -3002,10 +3136,9 @@ function New-JohnCandidateWordlist {
         }
     }
     catch {
-        $positionText = if ($null -ne $_.InvocationInfo) { [string]$_.InvocationInfo.PositionMessage } else { '' }
         return [pscustomobject]@{
             Supported = $false
-            Message = ('John CPU wordlist preparation was unavailable: ' + $_.Exception.Message + ' ' + $positionText)
+            Message = 'John CPU wordlist preparation was unavailable; NanaZip CPU verification remains the fallback.'
         }
     }
     finally {
@@ -3677,10 +3810,11 @@ function Get-RunArchiveHashcatArtifact {
     }
     catch {
         $script:ArchiveArtifactState = 'Unavailable'
-        $script:ArchiveArtifactMessage = $_.Exception.Message
+        $script:ArchiveArtifactMessage = 'Local archive artifact extraction failed; CPU fallback was selected.'
         $script:ArchiveHashcatArtifact = [pscustomobject]@{
-            Supported = $false
-            Message = ('Local archive artifact extraction failed; CPU fallback was selected. ' + $_.Exception.Message)
+            Supported       = $false
+            FailureCategory = 'ExtractorFailed'
+            Message         = 'Local archive artifact extraction failed; CPU fallback was selected.'
         }
         return $script:ArchiveHashcatArtifact
     }
@@ -3707,10 +3841,11 @@ function Get-RunArchiveJohnArtifact {
     }
     catch {
         $script:JohnArtifactState = 'Unavailable'
-        $script:JohnArtifactMessage = $_.Exception.Message
+        $script:JohnArtifactMessage = 'Local John archive artifact extraction failed; NanaZip CPU fallback remains available.'
         $script:ArchiveJohnArtifact = [pscustomobject]@{
-            Supported = $false
-            Message = ('Local John archive artifact extraction failed; NanaZip CPU fallback remains available. ' + $_.Exception.Message)
+            Supported       = $false
+            FailureCategory = 'ExtractorFailed'
+            Message         = 'Local John archive artifact extraction failed; NanaZip CPU fallback remains available.'
         }
         return $script:ArchiveJohnArtifact
     }
@@ -3732,7 +3867,11 @@ function Invoke-JohnCpuRecovery {
     $artifact = Get-RunArchiveJohnArtifact -ArchivePath ([string]$job.ArchivePath) -ArchiveFormat $ArchiveFormat
     if (-not $artifact.Supported) {
         $script:JohnLastMessage = [string]$artifact.Message
-        return [pscustomobject]@{ Status = 'Unsupported'; Message = [string]$artifact.Message }
+        return [pscustomobject]@{
+            Status          = 'Unsupported'
+            FailureCategory = if ($artifact.PSObject.Properties.Name -contains 'FailureCategory') { [string]$artifact.FailureCategory } else { 'Unsupported' }
+            Message         = [string]$artifact.Message
+        }
     }
 
     $encodingProfile = Get-JohnEncodingProfile -ArchiveFormat $ArchiveFormat
@@ -3740,7 +3879,7 @@ function Invoke-JohnCpuRecovery {
     $wordlist = New-JohnCandidateWordlist -Strategy $Strategy -Item $Item -SkipCount $SkipCount -EncodingProfile $encodingProfile
     if (-not $wordlist.Supported) {
         $script:JohnLastMessage = [string]$wordlist.Message
-        return [pscustomobject]@{ Status = 'Unsupported'; Message = [string]$wordlist.Message }
+        return [pscustomobject]@{ Status = 'Unsupported'; FailureCategory = 'Unsupported'; Message = [string]$wordlist.Message }
     }
     if ([long]$wordlist.RemainingCount -le 0) {
         Complete-JohnCoverage -TotalCount ([long]$wordlist.TotalCount) -StartPosition ([long]$wordlist.StartPosition)
@@ -3750,7 +3889,7 @@ function Invoke-JohnCpuRecovery {
     $johnPath = Resolve-LocalJohn -ProjectRoot $projectRoot
     if ([string]::IsNullOrWhiteSpace($johnPath)) {
         $script:JohnLastMessage = 'The bundled John Jumbo launcher was not found. NanaZip CPU verification remains the fallback.'
-        return [pscustomobject]@{ Status = 'Unsupported'; Message = 'The bundled John Jumbo launcher was not found. NanaZip CPU verification remains the fallback.' }
+        return [pscustomobject]@{ Status = 'Unsupported'; FailureCategory = 'Unsupported'; Message = 'The bundled John Jumbo launcher was not found. NanaZip CPU verification remains the fallback.' }
     }
 
     $artifactGroups = @(
@@ -3840,8 +3979,8 @@ function Invoke-JohnCpuRecovery {
         }
         catch {
             $process.Dispose()
-            $script:JohnLastMessage = ('John Jumbo could not be started; NanaZip CPU verification remains the fallback. ' + $_.Exception.Message)
-            return [pscustomobject]@{ Status = 'Unsupported'; Message = ('John Jumbo could not be started; NanaZip CPU verification remains the fallback. ' + $_.Exception.Message) }
+            $script:JohnLastMessage = 'John Jumbo could not be started; NanaZip CPU verification remains the fallback.'
+            return [pscustomobject]@{ Status = 'Unsupported'; Message = [string]$script:JohnLastMessage }
         }
 
         $script:JohnBinaryUsed = [string]$johnPath
@@ -3900,8 +4039,11 @@ function Invoke-JohnCpuRecovery {
                     catch {
                         if (-not $process.HasExited) { $process.Kill() }
                         $script:TerminalState = 'Failed'
-                        Publish-Progress -State 'Failed' -Message ('John Jumbo could not stop for a local pause: ' + $_.Exception.Message) -Result $null
-                        return [pscustomobject]@{ Status = 'Failed'; Message = $_.Exception.Message }
+                        Set-WorkerErrorContext -Code 'INTERNAL_ERROR' -Function 'Invoke-JohnCpuRecovery' -ArtifactType 'John pause control'
+                        $pauseFailureMessage = 'John Jumbo could not stop for a local pause; the task could not continue.'
+                        Set-WorkerActivity -Activity 'Failed' -Message $pauseFailureMessage
+                        Publish-Progress -State 'Failed' -Message $pauseFailureMessage -Result $null
+                        return [pscustomobject]@{ Status = 'Failed'; Message = $pauseFailureMessage }
                     }
                 }
             }
@@ -4116,6 +4258,7 @@ function Invoke-HashcatRecovery {
         [switch]$ResumeStage
     )
 
+    $script:GpuFallbackRequested = $false
     $temporaryDirectory = $script:RuntimeDirectory
     if (-not (Test-Path -LiteralPath $temporaryDirectory -PathType Container)) {
         New-Item -ItemType Directory -Path $temporaryDirectory -ErrorAction Stop | Out-Null
@@ -4319,7 +4462,9 @@ function Invoke-HashcatRecovery {
                     }
                     $script:TerminalState = 'Failed'
                     Set-WorkerErrorContext -Code 'RUNTIME_ARTIFACT_CREATE_FAILED' -Function 'Invoke-HashcatRecovery' -ArtifactType 'Hashcat pause checkpoint'
-                    Publish-Progress -State 'Failed' -Message ('Hashcat could not save the local pause checkpoint: ' + $_.Exception.Message) -Result $null
+                    $pauseFailureMessage = 'Hashcat could not save the local pause checkpoint; the task could not continue.'
+                    Set-WorkerActivity -Activity 'Failed' -Message $pauseFailureMessage
+                    Publish-Progress -State 'Failed' -Message $pauseFailureMessage -Result $null
                     return
                 }
             }
@@ -4365,6 +4510,56 @@ function Invoke-HashcatRecovery {
     $script:ExecutorShutdownMs += [long]$executorShutdownStopwatch.ElapsedMilliseconds
     $script:LastGpuExecutorEndedUtc = [datetime]::UtcNow
     Start-WorkerTransitionWindow
+
+    $hashcatErrorSignal = ''
+    if (Test-Path -LiteralPath $stderrPath -PathType Leaf) {
+        try { $hashcatErrorSignal = [System.IO.File]::ReadAllText($stderrPath) } catch { $hashcatErrorSignal = '' }
+    }
+    $hashcatArchiveSignal = $hashcatErrorSignal -match '(?i)archive|data error|unexpected end|corrupt|cannot open.*(?:archive|file)'
+    $hashcatGpuSignal = $hashcatErrorSignal -match '(?i)device.*(?:lost|removed|disappear)|CL_DEVICE_NOT_FOUND|DEVICE_UNAVAILABLE|GPU.*(?:unavailable|lost)'
+    $hashcatNoDeviceSignal = $hashcatErrorSignal -match '(?i)no devices found|no.*OpenCL.*GPU|did not report.*GPU'
+    $hashcatArtifactSignal = $hashcatErrorSignal -match '(?i)hash.*(?:unsupported|unknown|invalid)|no password hashes loaded|hash-mode'
+    # A user-requested pause/stop intentionally ends Hashcat with a non-zero
+    # control result on some builds.  Handle that terminal control state before
+    # interpreting stderr as a backend failure; otherwise the CPU fallback can
+    # re-enter Wait-For-Controls and leave the Worker alive on pause.
+    if (-not $stopSent -and -not $pauseSent -and
+        ($processExitCode -notin @(0, 1) -or $hashcatArchiveSignal -or $hashcatGpuSignal -or $hashcatNoDeviceSignal -or $hashcatArtifactSignal)) {
+        $volumeSetForFailure = $null
+        try { $volumeSetForFailure = Resolve-ArchiveVolumeSet -Path ([string]$job.ArchivePath) } catch { }
+        $isMultiVolumeFailure = $null -ne $volumeSetForFailure -and [bool]$volumeSetForFailure.IsMultiVolume
+        $hashcatFailureCode = if ($hashcatArchiveSignal) {
+            if ($isMultiVolumeFailure) { 'ARCHIVE_VOLUME_INCOMPLETE_OR_DAMAGED' } else { 'ARCHIVE_DAMAGED' }
+        }
+        elseif ($hashcatGpuSignal) {
+            'GPU_DEVICE_DISAPPEARED'
+        }
+        elseif ($hashcatNoDeviceSignal) {
+            'GPU_NOT_AVAILABLE'
+        }
+        elseif ($hashcatArtifactSignal) {
+            'HASHCAT_ARTIFACT_UNSUPPORTED'
+        }
+        else {
+            'GPU_BACKEND_INIT_FAILED'
+        }
+
+        if ($hashcatFailureCode -in @('GPU_DEVICE_DISAPPEARED', 'GPU_NOT_AVAILABLE', 'GPU_BACKEND_INIT_FAILED', 'HASHCAT_ARTIFACT_UNSUPPORTED')) {
+            $script:GpuFallbackRequested = $true
+            $fallbackMessage = (Get-RecoveryDiagnostic -Code $hashcatFailureCode -Message '' -Function 'Invoke-HashcatRecovery' -ArtifactType 'Hashcat GPU backend' -ExitCode $processExitCode).UserMessage
+            Set-WorkerActivity -Activity 'RunningCoverage' -Message $fallbackMessage
+            Set-WorkerFallbackDiagnostic -Code $hashcatFailureCode -Message '' -Function 'Invoke-HashcatRecovery' -ArtifactType 'Hashcat GPU backend'
+            Publish-Progress -State 'Running' -Message $fallbackMessage -Result $null -Force
+            return
+        }
+
+        $script:TerminalState = 'Failed'
+        Set-WorkerErrorContext -Code $hashcatFailureCode -Function 'Invoke-HashcatRecovery' -ArtifactType 'Hashcat GPU backend'
+        $archiveFailureMessage = (Get-RecoveryDiagnostic -Code $hashcatFailureCode -Message '' -Function 'Invoke-HashcatRecovery' -ArtifactType 'Hashcat GPU backend' -State 'Failed').UserMessage
+        Set-WorkerActivity -Activity 'Failed' -Message $archiveFailureMessage
+        Publish-Progress -State 'Failed' -Message $archiveFailureMessage -Result $null
+        return
+    }
 
     if ($stopSent) {
         $hasRestore = (Copy-HashcatRestoreCheckpoint -SourcePath $runtimeRestorePath -DestinationPath $persistentRestorePath -OverwriteDestination) -or (Test-Path -LiteralPath $persistentRestorePath -PathType Leaf)
@@ -4590,6 +4785,104 @@ function Invoke-WorkerTimedCumulativePlanCpu {
     }
 }
 
+function Invoke-WorkerCumulativeCpuFallback {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]$Item,
+        [Parameter(Mandatory = $true)][string]$SevenZip,
+        [Parameter(Mandatory = $true)][ValidateSet('GPU_NOT_AVAILABLE', 'GPU_DEVICE_DISAPPEARED', 'GPU_BACKEND_INIT_FAILED', 'GPU_FORMAT_UNSUPPORTED', 'HASHCAT_ARTIFACT_UNSUPPORTED', 'EXTRACTOR_FAILED')][string]$Code,
+        [AllowEmptyString()][string]$Message = '',
+        [Parameter(Mandatory = $true)][int]$StageNumber
+    )
+
+    # A GPU batch can cover more than the current foreach item.  Once the GPU
+    # path has stopped, abandon the batch metadata and replay every unfinished
+    # segment through the existing ordered CPU plan.  This keeps the cursor
+    # and coverage bookkeeping truthful without introducing a second state
+    # machine.
+    $batch = $script:ActiveGpuBatch
+    $fallbackItems = if ($null -ne $batch -and $batch.PSObject.Properties.Name -contains 'Items') {
+        @($batch.Items)
+    }
+    else {
+        @($Item)
+    }
+    $currentCoverageId = [string]$script:CurrentCoverageId
+    $currentPosition = [long]$script:CoveragePosition
+    if ([string]::IsNullOrWhiteSpace($currentCoverageId) -and $null -ne $script:ActivePlanItem) {
+        $currentCoverageId = [string](Get-ObjectPropertyValue -Object $script:ActivePlanItem -Name 'CoverageId' -Default '')
+    }
+    $script:ActiveGpuBatch = $null
+    $script:GpuBatchSelectedCoverageIds = @()
+    $script:ActiveGpuBatchCurrentCoverageId = ''
+    $script:BatchBaseCandidates = 0L
+    $script:BatchResumeBase = 0L
+    $script:CoverageResult = ''
+
+    foreach ($fallbackItem in $fallbackItems) {
+        if ($null -eq $fallbackItem -or (Test-CumulativeCoverageCompleted -Item $fallbackItem)) { continue }
+        $coverageId = [string](Get-ObjectPropertyValue -Object $fallbackItem -Name 'CoverageId' -Default '')
+        $isCurrent = -not [string]::IsNullOrWhiteSpace($currentCoverageId) -and
+            [string]::Equals($coverageId, $currentCoverageId, [System.StringComparison]::Ordinal)
+        if ($isCurrent) {
+            $script:CoveragePosition = [math]::Max(0L, $currentPosition)
+        }
+        else {
+            $script:CoveragePosition = 0L
+        }
+        Set-CumulativeCoverage -Item $fallbackItem -ResumeCoverage:$isCurrent
+        $script:StageCoverageBaseCandidates = Get-WorkerCompletedCandidateCountBeforeCoverage -StageNumber $StageNumber -CoverageId $coverageId
+        $script:StageCandidatesTested = [long]$script:StageCoverageBaseCandidates + [long]$script:CoveragePosition
+        [void](Set-WorkerCpuFallbackEngine -Code $Code -Message $Message -Function 'Invoke-CumulativeRecovery' -ArtifactType 'Hashcat GPU backend' -CoverageName ([string]$fallbackItem.DisplayName))
+        $completed = Invoke-WorkerTimedCumulativePlanCpu -Item $fallbackItem -SevenZip $SevenZip
+        if ($script:TerminalState -in @('Recovered', 'Paused', 'Stopped', 'Failed')) { return $false }
+        if (-not [bool]$completed) {
+            $script:TerminalState = 'Failed'
+            Set-WorkerErrorContext -Code 'WORKER_FAILED' -Function 'Invoke-CumulativeRecovery' -ArtifactType 'CPU fallback'
+            Set-WorkerActivity -Activity 'Failed' -Message ([string](Get-RecoveryDiagnostic -Code 'INTERNAL_ERROR' -Message '' -Function 'Invoke-CumulativeRecovery' -ArtifactType 'CPU fallback' -State 'Failed').UserMessage)
+            Publish-Progress -State 'Failed' -Message ([string]$script:Diagnostic.UserMessage) -Result $null
+            return $false
+        }
+        Complete-CoverageItem -Item $fallbackItem
+    }
+    return $true
+}
+
+function Invoke-WorkerSingleCpuFallback {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][string]$SevenZip,
+        [Parameter(Mandatory = $true)][string]$ArchiveFormat,
+        [Parameter(Mandatory = $true)][ValidateSet('Quick', 'Dictionary', 'Rules', 'Mask', 'BruteForce')][string]$Strategy,
+        [Parameter(Mandatory = $true)][long]$SkipCount,
+        [Parameter(Mandatory = $true)][ValidateSet('GPU_NOT_AVAILABLE', 'GPU_DEVICE_DISAPPEARED', 'GPU_BACKEND_INIT_FAILED', 'GPU_FORMAT_UNSUPPORTED', 'HASHCAT_ARTIFACT_UNSUPPORTED', 'EXTRACTOR_FAILED')][string]$Code,
+        [AllowEmptyString()][string]$Message = ''
+    )
+
+    [void](Set-WorkerCpuFallbackEngine -Code $Code -Message $Message -Function 'RecoveryWorker' -ArtifactType 'Hashcat GPU backend')
+    $johnResult = $null
+    if ($Strategy -in @('Dictionary', 'Rules')) {
+        $johnResult = Invoke-JohnCpuRecovery -SevenZip $SevenZip -ArchiveFormat $ArchiveFormat -Strategy $Strategy -SkipCount $SkipCount
+    }
+    if ($null -ne $johnResult -and [string]$johnResult.Status -in @('Completed', 'Recovered', 'Paused', 'Stopped', 'Failed')) {
+        return
+    }
+    if ($null -ne $johnResult -and [string]$johnResult.Status -eq 'Unsupported') {
+        $fallbackEngine = New-CpuEngine -Label 'CPU / NanaZip fallback' -Message ([string](Get-RecoveryDiagnostic -Code 'JOHN_FORMAT_UNSUPPORTED' -Message ([string]$johnResult.Message) -Function 'RecoveryWorker' -ArtifactType 'John CPU backend').UserMessage)
+        Set-WorkerEngineSelection -Engine $fallbackEngine
+        Set-WorkerActivity -Activity 'RunningCoverage' -Message ([string]$fallbackEngine.Message)
+        Set-WorkerFallbackDiagnostic -Code 'JOHN_FORMAT_UNSUPPORTED' -Message ([string]$johnResult.Message) -Function 'RecoveryWorker' -ArtifactType 'John CPU backend'
+        Publish-Progress -State 'Running' -Message ([string]$fallbackEngine.Message) -Result $null -Force
+    }
+    switch ($Strategy) {
+        'Quick' { Invoke-QuickRecovery -SevenZip $SevenZip -SkipCount $SkipCount }
+        'Dictionary' { Invoke-DictionaryRecovery -SevenZip $SevenZip -SkipCount $SkipCount }
+        'Rules' { Invoke-DictionaryRecovery -SevenZip $SevenZip -SkipCount $SkipCount -UseRules }
+        'Mask' { Invoke-MaskRecovery -SevenZip $SevenZip -SkipCount $SkipCount }
+        'BruteForce' { Invoke-BruteForceRecovery -SevenZip $SevenZip -SkipCount $SkipCount }
+    }
+}
+
 function Get-PlanJob {
     [CmdletBinding()]
     param(
@@ -4769,6 +5062,30 @@ function Get-PlanDictionaryPaths {
     return $paths.ToArray()
 }
 
+function Test-WorkerDictionaryHasEntry {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][string]$Path
+    )
+
+    $reader = $null
+    try {
+        $reader = New-WorkerUtf8Reader -Path $Path
+        while ($null -ne ($line = $reader.ReadLine())) {
+            if ($line.Length -gt 0) { return $true }
+        }
+    }
+    catch {
+        # Encoding and existence are checked by the caller.  A read race is
+        # handled by the normal worker catch rather than guessed as empty.
+        return $false
+    }
+    finally {
+        if ($null -ne $reader) { $reader.Dispose() }
+    }
+    return $false
+}
+
 function Test-PlanReadiness {
     [CmdletBinding()]
     param(
@@ -4776,20 +5093,27 @@ function Test-PlanReadiness {
     )
 
     try {
+        $dictionarySourceCount = 0
+        $hasDictionaryEntry = $false
         $dictionaryKinds = @('BuiltinDictionary', 'Dictionary', 'CustomDictionary', 'RulesDictionary', 'CustomRules', 'RuleCaseVariants', 'RuleAppendVariants', 'CapitalInitialDigits', 'HybridDictionary', 'CommonSymbols', 'CustomMask')
         if ($dictionaryKinds -contains [string]$Item.Kind) {
             foreach ($source in @(Get-PlanItemDictionarySources -PlanItem $Item -Job $job)) {
+                $dictionarySourceCount++
                 if ([string]$source.SourceType -eq 'Custom') {
                     if (-not (Test-Path -LiteralPath ([string]$source.Path) -PathType Leaf)) {
-                        return [pscustomobject]@{ Ready = $false; Message = 'the local dictionary file is missing' }
+                        return [pscustomobject]@{ Ready = $false; Code = 'DICTIONARY_NOT_FOUND'; Message = 'the local dictionary file is missing' }
                     }
                     if (-not (Test-TextFileUtf8 -Path ([string]$source.Path))) {
-                        return [pscustomobject]@{ Ready = $false; Message = 'the local dictionary file must be valid UTF-8 (BOM optional)' }
+                        return [pscustomobject]@{ Ready = $false; Code = 'DICTIONARY_ENCODING_UNSUPPORTED'; Message = 'the local dictionary file must be valid UTF-8 (BOM optional)' }
                     }
                 }
                 elseif (-not (Test-Path -LiteralPath ([string]$source.Path) -PathType Leaf)) {
-                    return [pscustomobject]@{ Ready = $false; Message = 'the built-in dictionary resource is missing' }
+                    return [pscustomobject]@{ Ready = $false; Code = 'DICTIONARY_NOT_FOUND'; Message = 'the built-in dictionary resource is missing' }
                 }
+                if (Test-WorkerDictionaryHasEntry -Path ([string]$source.Path)) { $hasDictionaryEntry = $true }
+            }
+            if ($dictionarySourceCount -gt 0 -and -not $hasDictionaryEntry) {
+                return [pscustomobject]@{ Ready = $false; Code = 'DICTIONARY_EMPTY'; Message = 'the local dictionary is empty' }
             }
         }
 
@@ -4799,7 +5123,7 @@ function Test-PlanReadiness {
             'MaskRange' {
                 if ([int](Get-ObjectPropertyValue -Object $Item -Name 'MinimumLength' -Default 0) -lt 1 -or
                     [int](Get-ObjectPropertyValue -Object $Item -Name 'MaximumLength' -Default 0) -lt [int](Get-ObjectPropertyValue -Object $Item -Name 'MinimumLength' -Default 0)) {
-                    return [pscustomobject]@{ Ready = $false; Message = 'the generated mask range is invalid' }
+                    return [pscustomobject]@{ Ready = $false; Code = 'INTERNAL_ERROR'; Message = 'the generated mask range is invalid' }
                 }
                 [void](Get-CharsetCharacters -Kind ([string](Get-ObjectPropertyValue -Object $Item -Name 'CharacterSet' -Default '')) -CustomCharacters '')
             }
@@ -4807,23 +5131,24 @@ function Test-PlanReadiness {
                 [int]$startYear = Get-ObjectPropertyValue -Object $Item -Name 'StartYear' -Default 0
                 [int]$endYear = Get-ObjectPropertyValue -Object $Item -Name 'EndYear' -Default 0
                 if ($startYear -lt 1 -or $endYear -lt $startYear -or $endYear -gt 9999) {
-                    return [pscustomobject]@{ Ready = $false; Message = 'the generated date range is invalid' }
+                    return [pscustomobject]@{ Ready = $false; Code = 'INTERNAL_ERROR'; Message = 'the generated date range is invalid' }
                 }
             }
             'ConfiguredBruteForce' {
                 if ([int](Get-ObjectPropertyValue -Object $Item -Name 'MinimumLength' -Default 0) -lt 1 -or
                     [int](Get-ObjectPropertyValue -Object $Item -Name 'MaximumLength' -Default 0) -lt [int](Get-ObjectPropertyValue -Object $Item -Name 'MinimumLength' -Default 0) -or
                     [int](Get-ObjectPropertyValue -Object $Item -Name 'MaximumLength' -Default 0) -gt 32) {
-                    return [pscustomobject]@{ Ready = $false; Message = 'the brute-force length range is invalid' }
+                    return [pscustomobject]@{ Ready = $false; Code = 'INTERNAL_ERROR'; Message = 'the brute-force length range is invalid' }
                 }
                 [void](Get-CharsetCharacters -Kind ([string](Get-ObjectPropertyValue -Object $Item -Name 'CharacterSet' -Default '')) -CustomCharacters ([string](Get-ObjectPropertyValue -Object $job -Name 'CustomCharacters' -Default '')))
             }
         }
     }
     catch {
-        return [pscustomobject]@{ Ready = $false; Message = $_.Exception.Message }
+        $diagnostic = Get-RecoveryDiagnostic -Message ([string]$_.Exception.Message) -Function 'Test-PlanReadiness' -ArtifactType 'recovery plan'
+        return [pscustomobject]@{ Ready = $false; Code = [string]$diagnostic.ErrorCode; Message = $_.Exception.Message }
     }
-    return [pscustomobject]@{ Ready = $true; Message = '' }
+    return [pscustomobject]@{ Ready = $true; Code = ''; Message = '' }
 }
 
 function Get-CachedStageCandidateCount {
@@ -5503,17 +5828,26 @@ function Publish-PlanSkipped {
     [CmdletBinding()]
     param(
         [Parameter(Mandatory = $true)]$Item,
-        [Parameter(Mandatory = $true)][string]$Reason
+        [Parameter(Mandatory = $true)][string]$Reason,
+        [string]$Code = ''
     )
+
+    $diagnostic = $null
+    $safeReason = $Reason
+    if (-not [string]::IsNullOrWhiteSpace($Code)) {
+        $diagnostic = Get-RecoveryDiagnostic -Code $Code -Message $Reason -Function 'Publish-PlanSkipped' -ArtifactType 'recovery plan'
+        $safeReason = [string]$diagnostic.UserMessage
+    }
 
     [void]$script:SkippedStages.Add([pscustomobject]@{
             StageNumber = [int]$script:StageNumber
             StageName = [string]$Item.DisplayName
             CoverageId = [string]$Item.CoverageId
-            Reason = $Reason
+            Code = if ($null -ne $diagnostic) { [string]$diagnostic.ErrorCode } else { '' }
+            Reason = $safeReason
         })
     Set-WorkerOverallPlanStructureDirty
-    $script:StageMessage = $Reason
+    $script:StageMessage = $safeReason
     $script:CurrentCoverageId = ''
     $script:CurrentCoverageName = ''
     $script:CurrentCheckpoint = $null
@@ -5525,7 +5859,8 @@ function Publish-PlanSkipped {
     Reset-PreparationProgress
     Save-CoverageState
     Set-WorkerActivity -Activity 'AdvancingCoverage' -Message ('Coverage {0} was skipped; advancing to the next local coverage.' -f $Item.DisplayName)
-    Publish-Progress -State 'Running' -Message ('Coverage {0} skipped: {1}' -f $Item.DisplayName, $Reason) -Result $null -Force
+    if ($null -ne $diagnostic) { $script:Diagnostic = $diagnostic }
+    Publish-Progress -State 'Running' -Message ('Coverage {0} skipped: {1}' -f $Item.DisplayName, $safeReason) -Result $null -Force
 }
 
 function Publish-PlanAlreadyCompleted {
@@ -5912,7 +6247,7 @@ function Invoke-CumulativeRecovery {
             Set-CumulativeCoverage -Item $item -ResumeCoverage:$resumeThisCoverage
             $readiness = Test-PlanReadiness -Item $item
             if (-not $readiness.Ready) {
-                Publish-PlanSkipped -Item $item -Reason ([string]$readiness.Message)
+                Publish-PlanSkipped -Item $item -Reason ([string]$readiness.Message) -Code ([string](Get-ObjectPropertyValue -Object $readiness -Name 'Code' -Default ''))
                 continue
             }
 
@@ -5944,6 +6279,8 @@ function Invoke-CumulativeRecovery {
             $attackPlan = $null
             $planJob = $null
             $gpuBatch = $null
+            $coverageFallbackCode = ''
+            $coverageFallbackMessage = ''
             $archiveGpuBatchEligible = Test-WorkerArchiveGpuBatchEligible -Inspection $inspection
             $batchEligible = [bool]($engine.UseGpu -and $archiveGpuBatchEligible -and (Test-BuiltinGpuBatchItem -Item $item))
             $maskBatchEligible = [bool]($engine.UseGpu -and $archiveGpuBatchEligible -and (Test-BuiltinGpuMaskBatchItem -Item $item))
@@ -5962,6 +6299,8 @@ function Invoke-CumulativeRecovery {
                 $artifact = Get-WorkerTimedHashcatArtifact -ArchivePath ([string]$job.ArchivePath) -ArchiveFormat ([string]$inspection.Format)
                 if (-not $artifact.Supported) {
                     $engine = New-CpuEngine -Message ($artifact.Message + ' CPU fallback was selected.')
+                    $coverageFallbackCode = if ($artifact.PSObject.Properties.Name -contains 'FailureCategory' -and [string]$artifact.FailureCategory -eq 'ExtractorFailed') { 'EXTRACTOR_FAILED' } else { 'HASHCAT_ARTIFACT_UNSUPPORTED' }
+                    $coverageFallbackMessage = [string]$artifact.Message
                     Set-WorkerEngineSelection -Engine $engine
                     $batchEligible = $false
                 }
@@ -5984,6 +6323,8 @@ function Invoke-CumulativeRecovery {
                     $attackPlan = New-WorkerTimedHashcatAttackPlan -PlanJob $planJob -HashPath $artifact.HashPath -JobDirectory $script:RuntimeDirectory -RecoveryPlanYear $script:RecoveryPlanYear -Strategy ([string]$item.EngineStrategy)
                     if (-not $attackPlan.Supported) {
                         $engine = New-CpuEngine -Message ($attackPlan.Message + ' CPU fallback was selected.')
+                        $coverageFallbackCode = 'GPU_FORMAT_UNSUPPORTED'
+                        $coverageFallbackMessage = [string]$attackPlan.Message
                         Set-WorkerEngineSelection -Engine $engine
                     }
                     else {
@@ -5998,6 +6339,8 @@ function Invoke-CumulativeRecovery {
                     }
                     if ($item.Kind -in @('BuiltinDictionary', 'CustomDictionary', 'RulesDictionary', 'CustomRules', 'HybridDictionary', 'CommonSymbols') -and $dictionaryPaths.Count -ne 1) {
                         $engine = New-CpuEngine -Message 'This coverage has multiple local dictionary streams; CPU streaming was selected.'
+                        $coverageFallbackCode = 'GPU_FORMAT_UNSUPPORTED'
+                        $coverageFallbackMessage = 'The selected coverage requires multiple local dictionary streams.'
                         Set-WorkerEngineSelection -Engine $engine
                     }
                     else {
@@ -6007,6 +6350,8 @@ function Invoke-CumulativeRecovery {
                         $attackPlan = New-WorkerTimedHashcatAttackPlan -PlanJob $planJob -HashPath $artifact.HashPath -JobDirectory $script:RuntimeDirectory -RecoveryPlanYear $script:RecoveryPlanYear -Strategy ([string]$item.EngineStrategy)
                         if (-not $attackPlan.Supported) {
                             $engine = New-CpuEngine -Message ($attackPlan.Message + ' CPU fallback was selected.')
+                            $coverageFallbackCode = 'GPU_FORMAT_UNSUPPORTED'
+                            $coverageFallbackMessage = [string]$attackPlan.Message
                             Set-WorkerEngineSelection -Engine $engine
                         }
                     }
@@ -6076,7 +6421,14 @@ function Invoke-CumulativeRecovery {
                     $planJob = Get-PlanJob -Item $item -DictionaryPath ([string]$gpuBatch.CandidatePath)
                     $planJob.Strategy = 'Dictionary'
                     $attackPlan = New-WorkerTimedHashcatAttackPlan -PlanJob $planJob -HashPath $artifact.HashPath -JobDirectory $script:RuntimeDirectory -RecoveryPlanYear $script:RecoveryPlanYear -Strategy 'Dictionary'
-                    if (-not $attackPlan.Supported) { $engine = New-CpuEngine -Message ($attackPlan.Message + ' CPU fallback was selected.'); Set-WorkerEngineSelection -Engine $engine; $script:ActiveGpuBatch = $null; $gpuBatch = $null }
+                    if (-not $attackPlan.Supported) {
+                        $engine = New-CpuEngine -Message ($attackPlan.Message + ' CPU fallback was selected.')
+                        $coverageFallbackCode = 'GPU_FORMAT_UNSUPPORTED'
+                        $coverageFallbackMessage = [string]$attackPlan.Message
+                        Set-WorkerEngineSelection -Engine $engine
+                        $script:ActiveGpuBatch = $null
+                        $gpuBatch = $null
+                    }
                 }
             }
 
@@ -6139,6 +6491,8 @@ function Invoke-CumulativeRecovery {
                     $attackPlan = New-WorkerTimedHashcatAttackPlan -PlanJob $planJob -HashPath $artifact.HashPath -JobDirectory $script:RuntimeDirectory -RecoveryPlanYear $script:RecoveryPlanYear -Strategy ([string]$item.EngineStrategy)
                     if (-not $attackPlan.Supported) {
                         $engine = New-CpuEngine -Message ($attackPlan.Message + ' CPU fallback was selected.')
+                        $coverageFallbackCode = 'GPU_FORMAT_UNSUPPORTED'
+                        $coverageFallbackMessage = [string]$attackPlan.Message
                         Set-WorkerEngineSelection -Engine $engine
                         $script:ActiveGpuBatch = $null
                         $gpuBatch = $null
@@ -6162,9 +6516,40 @@ function Invoke-CumulativeRecovery {
             Set-WorkerEngineSelection -Engine $engine
             Reset-PreparationProgress
             Set-WorkerActivity -Activity 'RunningCoverage' -Message ($engine.Message + ' Coverage: ' + [string]$item.DisplayName)
+            if (-not $engine.UseGpu -and [string]::IsNullOrWhiteSpace($coverageFallbackCode) -and
+                [string](Get-ObjectPropertyValue -Object $job -Name 'DevicePreference' -Default 'Auto') -ne 'CPU' -and
+                [string]$engine.Label -like '*fallback*') {
+                $selectionMessage = [string]$engine.Message
+                $selectionCode = Get-WorkerGpuFallbackCode -Message $selectionMessage
+                $coverageFallbackCode = $selectionCode
+                $coverageFallbackMessage = $selectionMessage
+            }
+            if (-not [string]::IsNullOrWhiteSpace($coverageFallbackCode)) {
+                Set-WorkerFallbackDiagnostic -Code $coverageFallbackCode -Message $coverageFallbackMessage -Function 'Invoke-CumulativeRecovery'
+            }
             Publish-Progress -State 'Running' -Message ($engine.Message + ' Coverage: ' + [string]$item.DisplayName) -Result $null -Force
             if ($engine.UseGpu) {
                 Invoke-HashcatRecovery -SevenZip $sevenZip -Engine $engine -Artifact $artifact -AttackPlan $attackPlan -StageNumber $stageNumber -ExecutionId $(if ($null -ne $gpuBatch) { [string]$gpuBatch.BatchId } else { '' }) -ResumeStage:$resumeThisCoverage
+                if ($script:GpuFallbackRequested -and $null -eq $script:TerminalState) {
+                    $script:GpuFallbackRequested = $false
+                    $fallbackCode = if ($null -ne $script:Diagnostic -and $script:Diagnostic.PSObject.Properties.Name -contains 'ErrorCode') {
+                        [string]$script:Diagnostic.ErrorCode
+                    }
+                    if ($fallbackCode -notin @('GPU_NOT_AVAILABLE', 'GPU_DEVICE_DISAPPEARED', 'GPU_BACKEND_INIT_FAILED', 'GPU_FORMAT_UNSUPPORTED', 'HASHCAT_ARTIFACT_UNSUPPORTED', 'EXTRACTOR_FAILED')) {
+                        $fallbackCode = 'GPU_BACKEND_INIT_FAILED'
+                    }
+                    $fallbackMessage = if ($null -ne $script:Diagnostic -and $script:Diagnostic.PSObject.Properties.Name -contains 'UserMessage') {
+                        [string]$script:Diagnostic.UserMessage
+                    }
+                    else { '' }
+                    $handled = Invoke-WorkerCumulativeCpuFallback -Item $item -SevenZip $sevenZip -Code $fallbackCode -Message $fallbackMessage -StageNumber $stageNumber
+                    if (-not $handled) { return }
+                    # The helper completed every unfinished item in the
+                    # former batch.  The outer loop can safely skip those
+                    # items by their CompletedCoverageIds bookkeeping.
+                    $script:CoverageResult = ''
+                    continue
+                }
             }
             else {
                 $johnResult = $null
@@ -6192,6 +6577,7 @@ function Invoke-CumulativeRecovery {
                         $fallbackEngine = New-CpuEngine -Label 'CPU / NanaZip fallback' -Message ([string]$johnResult.Message + ' CPU fallback was selected.')
                         [void](Set-WorkerCoverageSpeedClass -Item $item -Engine $fallbackEngine -Artifact $artifact)
                         Set-WorkerActivity -Activity 'RunningCoverage' -Message ([string]$johnResult.Message + ' CPU fallback was selected.')
+                        Set-WorkerFallbackDiagnostic -Code 'JOHN_FORMAT_UNSUPPORTED' -Message ([string]$johnResult.Message) -Function 'Invoke-CumulativeRecovery' -ArtifactType 'John CPU backend'
                         Publish-Progress -State 'Running' -Message ([string]$johnResult.Message + ' CPU fallback was selected.') -Result $null -Force
                     }
                     Invoke-WorkerTimedCumulativePlanCpu -Item $item -SevenZip $sevenZip | Out-Null
@@ -6305,23 +6691,29 @@ function Get-StageReadiness {
             else { @() }
             $hasQuickCandidate = $quickCandidates.Count -gt 0
             if (-not [bool]$job.TryEmptyPassword -and -not $hasQuickCandidate) {
-                return [pscustomobject]@{ Ready = $false; Message = 'no Quick candidates were provided' }
+                return [pscustomobject]@{ Ready = $false; Code = ''; Message = 'no Quick candidates were provided' }
             }
         }
         'Dictionary' {
             if (-not (Test-Path -LiteralPath ([string]$job.DictionaryPath) -PathType Leaf)) {
-                return [pscustomobject]@{ Ready = $false; Message = 'the local dictionary file is missing' }
+                return [pscustomobject]@{ Ready = $false; Code = 'DICTIONARY_NOT_FOUND'; Message = 'the local dictionary file is missing' }
             }
             if (-not (Test-TextFileUtf8 -Path ([string]$job.DictionaryPath))) {
-                return [pscustomobject]@{ Ready = $false; Message = 'the local dictionary file must be valid UTF-8 (BOM optional)' }
+                return [pscustomobject]@{ Ready = $false; Code = 'DICTIONARY_ENCODING_UNSUPPORTED'; Message = 'the local dictionary file must be valid UTF-8 (BOM optional)' }
+            }
+            if (-not (Test-WorkerDictionaryHasEntry -Path ([string]$job.DictionaryPath))) {
+                return [pscustomobject]@{ Ready = $false; Code = 'DICTIONARY_EMPTY'; Message = 'the local dictionary is empty' }
             }
         }
         'Rules' {
             if (-not (Test-Path -LiteralPath ([string]$job.DictionaryPath) -PathType Leaf)) {
-                return [pscustomobject]@{ Ready = $false; Message = 'the local dictionary file is missing' }
+                return [pscustomobject]@{ Ready = $false; Code = 'DICTIONARY_NOT_FOUND'; Message = 'the local dictionary file is missing' }
             }
             if (-not (Test-TextFileUtf8 -Path ([string]$job.DictionaryPath))) {
-                return [pscustomobject]@{ Ready = $false; Message = 'the local dictionary file must be valid UTF-8 (BOM optional)' }
+                return [pscustomobject]@{ Ready = $false; Code = 'DICTIONARY_ENCODING_UNSUPPORTED'; Message = 'the local dictionary file must be valid UTF-8 (BOM optional)' }
+            }
+            if (-not (Test-WorkerDictionaryHasEntry -Path ([string]$job.DictionaryPath))) {
+                return [pscustomobject]@{ Ready = $false; Code = 'DICTIONARY_EMPTY'; Message = 'the local dictionary is empty' }
             }
         }
         'Mask' {
@@ -6329,15 +6721,20 @@ function Get-StageReadiness {
                 $tokens = @(Get-MaskTokens -Mask ([string]$job.Mask))
                 if (@($tokens | Where-Object { $_.Kind -eq 'Word' }).Count -gt 0 -and
                     -not (Test-Path -LiteralPath ([string]$job.DictionaryPath) -PathType Leaf)) {
-                    return [pscustomobject]@{ Ready = $false; Message = 'the mask uses ?w but the local dictionary file is missing' }
+                    return [pscustomobject]@{ Ready = $false; Code = 'DICTIONARY_NOT_FOUND'; Message = 'the mask uses ?w but the local dictionary file is missing' }
                 }
                 if (@($tokens | Where-Object { $_.Kind -eq 'Word' }).Count -gt 0 -and
                     -not (Test-TextFileUtf8 -Path ([string]$job.DictionaryPath))) {
-                    return [pscustomobject]@{ Ready = $false; Message = 'the local dictionary file must be valid UTF-8 (BOM optional)' }
+                    return [pscustomobject]@{ Ready = $false; Code = 'DICTIONARY_ENCODING_UNSUPPORTED'; Message = 'the local dictionary file must be valid UTF-8 (BOM optional)' }
+                }
+                if (@($tokens | Where-Object { $_.Kind -eq 'Word' }).Count -gt 0 -and
+                    -not (Test-WorkerDictionaryHasEntry -Path ([string]$job.DictionaryPath))) {
+                    return [pscustomobject]@{ Ready = $false; Code = 'DICTIONARY_EMPTY'; Message = 'the local dictionary is empty' }
                 }
             }
             catch {
-                return [pscustomobject]@{ Ready = $false; Message = $_.Exception.Message }
+                $diagnostic = Get-RecoveryDiagnostic -Message ([string]$_.Exception.Message) -Function 'Get-StageReadiness' -ArtifactType 'recovery plan'
+                return [pscustomobject]@{ Ready = $false; Code = [string]$diagnostic.ErrorCode; Message = $_.Exception.Message }
             }
         }
         'BruteForce' {
@@ -6345,36 +6742,46 @@ function Get-StageReadiness {
                 [int]$minimumLength = $job.MinLength
                 [int]$maximumLength = $job.MaxLength
                 if ($minimumLength -lt 1 -or $maximumLength -lt $minimumLength -or $maximumLength -gt 32) {
-                    return [pscustomobject]@{ Ready = $false; Message = 'the brute-force length range is invalid' }
+                    return [pscustomobject]@{ Ready = $false; Code = 'INTERNAL_ERROR'; Message = 'the brute-force length range is invalid' }
                 }
                 [void](Get-CharsetCharacters -Kind ([string]$job.CharacterSet) -CustomCharacters ([string]$job.CustomCharacters))
             }
             catch {
-                return [pscustomobject]@{ Ready = $false; Message = $_.Exception.Message }
+                $diagnostic = Get-RecoveryDiagnostic -Message ([string]$_.Exception.Message) -Function 'Get-StageReadiness' -ArtifactType 'recovery plan'
+                return [pscustomobject]@{ Ready = $false; Code = [string]$diagnostic.ErrorCode; Message = $_.Exception.Message }
             }
         }
     }
 
-    return [pscustomobject]@{ Ready = $true; Message = '' }
+    return [pscustomobject]@{ Ready = $true; Code = ''; Message = '' }
 }
 
 function Publish-StageSkipped {
     [CmdletBinding()]
     param(
         [Parameter(Mandatory = $true)]$Stage,
-        [Parameter(Mandatory = $true)][string]$Reason
+        [Parameter(Mandatory = $true)][string]$Reason,
+        [string]$Code = ''
     )
 
+    $diagnostic = $null
+    $safeReason = $Reason
+    if (-not [string]::IsNullOrWhiteSpace($Code)) {
+        $diagnostic = Get-RecoveryDiagnostic -Code $Code -Message $Reason -Function 'Publish-StageSkipped' -ArtifactType 'recovery plan'
+        $safeReason = [string]$diagnostic.UserMessage
+    }
     $script:StageStatus = 'Skipped'
-    $script:StageMessage = $Reason
+    $script:StageMessage = $safeReason
     [void]$script:SkippedStages.Add([pscustomobject]@{
             StageNumber = [int]$Stage.StageNumber
             StageName   = [string]$Stage.DisplayName
-            Reason      = $Reason
+            Code        = if ($null -ne $diagnostic) { [string]$diagnostic.ErrorCode } else { '' }
+            Reason      = $safeReason
         })
     Set-WorkerOverallPlanStructureDirty
     Set-WorkerActivity -Activity 'AdvancingCoverage' -Message ('Stage {0} was skipped; advancing to the next local stage.' -f $Stage.DisplayName)
-    Publish-Progress -State 'Running' -Message ('Stage {0} skipped: {1}' -f $Stage.DisplayName, $Reason) -Result $null -Force
+    if ($null -ne $diagnostic) { $script:Diagnostic = $diagnostic }
+    Publish-Progress -State 'Running' -Message ('Stage {0} skipped: {1}' -f $Stage.DisplayName, $safeReason) -Result $null -Force
 }
 
 try {
@@ -6404,7 +6811,7 @@ try {
 
         $readiness = Get-StageReadiness -Stage $stage
         if (-not $readiness.Ready) {
-            Publish-StageSkipped -Stage $stage -Reason ([string]$readiness.Message)
+            Publish-StageSkipped -Stage $stage -Reason ([string]$readiness.Message) -Code ([string](Get-ObjectPropertyValue -Object $readiness -Name 'Code' -Default ''))
             $script:ResumeStage = $false
             continue
         }
@@ -6418,6 +6825,8 @@ try {
 
         $artifact = $null
         $attackPlan = $null
+        $coverageFallbackCode = ''
+        $coverageFallbackMessage = ''
         if ($engine.UseGpu) {
             $projectRoot = Split-Path $PSScriptRoot -Parent
             Set-WorkerActivity -Activity 'PreparingDictionary' -Message ('Preparing local attack data for stage {0}.' -f $stage.DisplayName)
@@ -6428,6 +6837,8 @@ try {
             $artifact = Get-WorkerTimedHashcatArtifact -ArchivePath ([string]$job.ArchivePath) -ArchiveFormat ([string]$inspection.Format)
             if (-not $artifact.Supported) {
                 $engine = New-CpuEngine -Label 'CPU / NanaZip fallback' -Message ($artifact.Message + ' CPU fallback was selected.')
+                $coverageFallbackCode = if ($artifact.PSObject.Properties.Name -contains 'FailureCategory' -and [string]$artifact.FailureCategory -eq 'ExtractorFailed') { 'EXTRACTOR_FAILED' } else { 'HASHCAT_ARTIFACT_UNSUPPORTED' }
+                $coverageFallbackMessage = [string]$artifact.Message
                 $script:EngineLabel = $engine.Label
                 $script:BackendName = $engine.Backend
                 $script:ComputeDevice = $engine.ComputeDevice
@@ -6436,6 +6847,8 @@ try {
                 $attackPlan = New-WorkerTimedHashcatAttackPlan -PlanJob $job -HashPath $artifact.HashPath -JobDirectory $script:RuntimeDirectory -RecoveryPlanYear $script:RecoveryPlanYear -Strategy ([string]$stage.Strategy)
                 if (-not $attackPlan.Supported) {
                     $engine = New-CpuEngine -Label 'CPU / NanaZip fallback' -Message ($attackPlan.Message + ' CPU fallback was selected.')
+                    $coverageFallbackCode = 'GPU_FORMAT_UNSUPPORTED'
+                    $coverageFallbackMessage = [string]$attackPlan.Message
                     $script:EngineLabel = $engine.Label
                     $script:BackendName = $engine.Backend
                     $script:ComputeDevice = $engine.ComputeDevice
@@ -6447,9 +6860,33 @@ try {
             Set-WorkerActivity -Activity 'RunningCoverage' -Message ($engine.Message + ' ' + $artifact.Message)
             Publish-Progress -State 'Running' -Message ($engine.Message + ' ' + $artifact.Message) -Result $null -Force
             Invoke-HashcatRecovery -SevenZip $sevenZip -Engine $engine -Artifact $artifact -AttackPlan $attackPlan -StageNumber ([int]$stage.StageNumber) -ResumeStage:$resumeThisStage
+            if ($script:GpuFallbackRequested -and $null -eq $script:TerminalState) {
+                $script:GpuFallbackRequested = $false
+                $fallbackCode = if ($null -ne $script:Diagnostic -and $script:Diagnostic.PSObject.Properties.Name -contains 'ErrorCode') {
+                    [string]$script:Diagnostic.ErrorCode
+                }
+                if ($fallbackCode -notin @('GPU_NOT_AVAILABLE', 'GPU_DEVICE_DISAPPEARED', 'GPU_BACKEND_INIT_FAILED', 'GPU_FORMAT_UNSUPPORTED', 'HASHCAT_ARTIFACT_UNSUPPORTED', 'EXTRACTOR_FAILED')) {
+                    $fallbackCode = 'GPU_BACKEND_INIT_FAILED'
+                }
+                $fallbackMessage = if ($null -ne $script:Diagnostic -and $script:Diagnostic.PSObject.Properties.Name -contains 'UserMessage') {
+                    [string]$script:Diagnostic.UserMessage
+                }
+                else { '' }
+                Invoke-WorkerSingleCpuFallback -SevenZip $sevenZip -ArchiveFormat ([string]$inspection.Format) -Strategy ([string]$stage.Strategy) -SkipCount ([long]$script:StageCandidatesTested) -Code $fallbackCode -Message $fallbackMessage
+            }
         }
         else {
             Set-WorkerActivity -Activity 'RunningCoverage' -Message $engine.Message
+            if ([string]::IsNullOrWhiteSpace($coverageFallbackCode) -and
+                [string](Get-ObjectPropertyValue -Object $job -Name 'DevicePreference' -Default 'Auto') -ne 'CPU' -and
+                [string]$engine.Label -like '*fallback*') {
+                $selectionMessage = [string]$engine.Message
+                $coverageFallbackCode = Get-WorkerGpuFallbackCode -Message $selectionMessage
+                $coverageFallbackMessage = $selectionMessage
+            }
+            if (-not [string]::IsNullOrWhiteSpace($coverageFallbackCode)) {
+                Set-WorkerFallbackDiagnostic -Code $coverageFallbackCode -Message $coverageFallbackMessage -Function 'RecoveryWorker'
+            }
             Publish-Progress -State 'Running' -Message $engine.Message -Result $null -Force
             $skipCount = $script:StageCandidatesTested
 
@@ -6469,6 +6906,7 @@ try {
                     $script:BackendName = $engine.Backend
                     $script:ComputeDevice = $engine.ComputeDevice
                     Set-WorkerActivity -Activity 'RunningCoverage' -Message $engine.Message
+                    Set-WorkerFallbackDiagnostic -Code 'JOHN_FORMAT_UNSUPPORTED' -Message ([string]$johnResult.Message) -Function 'RecoveryWorker' -ArtifactType 'John CPU backend'
                     Publish-Progress -State 'Running' -Message $engine.Message -Result $null -Force
                 }
                 switch ([string]$stage.Strategy) {
@@ -6511,23 +6949,23 @@ catch {
     Stop-ActiveJohnProcess
     $script:TerminalState = 'Failed'
     $rawErrorMessage = [string]$_.Exception.Message
-    if ($null -ne $_.InvocationInfo -and -not [string]::IsNullOrWhiteSpace([string]$_.InvocationInfo.PositionMessage)) {
-        $rawErrorMessage += ' ' + [string]$_.InvocationInfo.PositionMessage
-    }
-    if ([string]::IsNullOrWhiteSpace([string]$script:ErrorCode)) {
+    # Keep the exception message in memory only for classification.  The
+    # diagnostic projection deliberately omits paths, candidates, passwords,
+    # hashes, salts, and PowerShell source-position text.
+    $inferredDiagnostic = Get-RecoveryDiagnostic -Message $rawErrorMessage -Function 'RecoveryWorker' -ArtifactType 'local recovery task' -State 'Failed'
+    if ([string]::IsNullOrWhiteSpace([string]$script:ErrorCode) -or [string]$script:ErrorCode -eq 'WORKER_FAILED') {
         if ($rawErrorMessage -match '(?i)already exists|file exists|cannot create the file|文件已存在|无法创建该文件') {
-            Set-WorkerErrorContext -Code 'RUNTIME_ARTIFACT_CREATE_FAILED' -Function 'RecoveryWorker' -ArtifactType 'local Runtime artifact'
+            Set-WorkerErrorContext -Code 'RUNTIME_ARTIFACT_CREATE_FAILED' -Function 'RecoveryWorker' -ArtifactType 'local Runtime artifact' -Message $rawErrorMessage
+        }
+        elseif ([string]$inferredDiagnostic.ErrorCode -ne 'INTERNAL_ERROR') {
+            Set-WorkerErrorContext -Code ([string]$inferredDiagnostic.ErrorCode) -Function 'RecoveryWorker' -ArtifactType 'local recovery task' -Message $rawErrorMessage
         }
         else {
-            Set-WorkerErrorContext -Code 'WORKER_FAILED' -Function 'RecoveryWorker' -ArtifactType 'local recovery task'
+            Set-WorkerErrorContext -Code 'WORKER_FAILED' -Function 'RecoveryWorker' -ArtifactType 'local recovery task' -Message $rawErrorMessage
         }
     }
-    $friendlyErrorMessage = if ([string]$script:ErrorCode -eq 'RUNTIME_ARTIFACT_CREATE_FAILED') {
-        'The local recovery runtime artifact could not be created. The task was not marked as recovered.'
-    }
-    else {
-        $rawErrorMessage
-    }
+    $script:Diagnostic = Get-RecoveryDiagnostic -Code ([string]$script:ErrorCode) -Message $rawErrorMessage -Function ([string]$script:ErrorFunction) -ArtifactType ([string]$script:ErrorArtifactType) -State 'Failed'
+    $friendlyErrorMessage = [string]$script:Diagnostic.UserMessage
     Set-WorkerActivity -Activity 'Failed' -Message $friendlyErrorMessage
     try {
         Publish-Progress -State 'Failed' -Message $friendlyErrorMessage -Result $null

@@ -71,6 +71,8 @@ function Invoke-SevenZipCommand {
     return [pscustomobject]@{
         ExitCode = [int]$native.ExitCode
         Output   = $output.ToArray()
+        StdOut   = [string]$native.StdOut
+        StdErr   = [string]$native.StdErr
     }
 }
 
@@ -111,6 +113,204 @@ function Get-ArchiveFormat {
     }
 
     return $extension
+}
+
+function Get-RecoveryDiagnosticCatalog {
+    [CmdletBinding()]
+    param()
+
+    # Keep this catalog deliberately small.  The worker may still retain its
+    # historical ErrorCode values for compatibility, while this object is the
+    # stable contract consumed by the UI and persisted progress snapshots.
+    return [ordered]@{
+        'ARCHIVE_NOT_FOUND' = [pscustomobject]@{ Severity = 'Error'; UserMessage = '找不到所选压缩包，请重新选择文件。'; FallbackAction = 'SelectArchive' }
+        'ARCHIVE_NOT_ENCRYPTED' = [pscustomobject]@{ Severity = 'Info'; UserMessage = '该压缩包未设置密码，无需恢复。'; FallbackAction = 'None' }
+        'ARCHIVE_DAMAGED' = [pscustomobject]@{ Severity = 'Error'; UserMessage = '无法读取该压缩包，文件可能已损坏。请重试或选择其他文件。'; FallbackAction = 'Retry' }
+        'ARCHIVE_UNSUPPORTED' = [pscustomobject]@{ Severity = 'Error'; UserMessage = '暂不支持此压缩包格式，请选择其他压缩包。'; FallbackAction = 'SelectArchive' }
+        'ARCHIVE_VOLUME_MISSING' = [pscustomobject]@{ Severity = 'Error'; UserMessage = '分卷压缩包缺少必要分卷，请补齐分卷后重试。'; FallbackAction = 'SelectArchive' }
+        'ARCHIVE_VOLUME_CHANGED' = [pscustomobject]@{ Severity = 'Error'; UserMessage = '压缩包分卷在任务创建后发生变化，无法安全继续。请重新选择并创建任务。'; FallbackAction = 'SelectArchive' }
+        'ARCHIVE_VOLUME_INCOMPLETE_OR_DAMAGED' = [pscustomobject]@{ Severity = 'Error'; UserMessage = '无法完整读取这个分卷压缩包。文件可能损坏，或缺少未能从文件名判断出的后续分卷。'; FallbackAction = 'Retry' }
+        'DICTIONARY_NOT_FOUND' = [pscustomobject]@{ Severity = 'Error'; UserMessage = '找不到字典文件，请重新选择字典。'; FallbackAction = 'SelectDictionary' }
+        'DICTIONARY_EMPTY' = [pscustomobject]@{ Severity = 'Error'; UserMessage = '字典文件为空，没有可搜索的候选。请选择非空字典。'; FallbackAction = 'SelectDictionary' }
+        'DICTIONARY_ENCODING_UNSUPPORTED' = [pscustomobject]@{ Severity = 'Error'; UserMessage = '字典文件不是受支持的 UTF-8 编码，请另存为 UTF-8 后重试。'; FallbackAction = 'SelectDictionary' }
+        'GPU_NOT_AVAILABLE' = [pscustomobject]@{ Severity = 'Warning'; UserMessage = '未找到可用的 GPU，已自动切换到 CPU。'; FallbackAction = 'CPU' }
+        'GPU_DEVICE_DISAPPEARED' = [pscustomobject]@{ Severity = 'Warning'; UserMessage = 'GPU 在恢复过程中不可用，已安全切换到 CPU。'; FallbackAction = 'CPU' }
+        'GPU_BACKEND_INIT_FAILED' = [pscustomobject]@{ Severity = 'Warning'; UserMessage = 'GPU 后端初始化失败，已自动切换到 CPU。'; FallbackAction = 'CPU' }
+        'GPU_FORMAT_UNSUPPORTED' = [pscustomobject]@{ Severity = 'Warning'; UserMessage = '当前压缩包或恢复方式不支持 GPU，已自动切换到 CPU。'; FallbackAction = 'CPU' }
+        'JOHN_FORMAT_UNSUPPORTED' = [pscustomobject]@{ Severity = 'Warning'; UserMessage = '当前压缩包格式不支持 John CPU 批量恢复，已切换到 NanaZip CPU 验证。'; FallbackAction = 'CPU' }
+        'HASHCAT_ARTIFACT_UNSUPPORTED' = [pscustomobject]@{ Severity = 'Warning'; UserMessage = '当前压缩包无法生成 GPU 恢复数据，已自动切换到 CPU。'; FallbackAction = 'CPU' }
+        'EXTRACTOR_FAILED' = [pscustomobject]@{ Severity = 'Warning'; UserMessage = '本地恢复数据提取失败，已切换到 CPU。'; FallbackAction = 'CPU' }
+        'JOB_ALREADY_ACTIVE' = [pscustomobject]@{ Severity = 'Error'; UserMessage = '该任务已有恢复进程在运行，请先等待或停止现有任务。'; FallbackAction = 'Retry' }
+        'JOB_ARCHIVE_CHANGED' = [pscustomobject]@{ Severity = 'Error'; UserMessage = '任务对应的压缩包已变化，无法安全继续。请重新选择并创建任务。'; FallbackAction = 'SelectArchive' }
+        'JOB_VOLUME_CHANGED' = [pscustomobject]@{ Severity = 'Error'; UserMessage = '任务对应的分卷文件已变化，无法安全继续。请重新选择并创建任务。'; FallbackAction = 'SelectArchive' }
+        'RECOVERY_RANGE_EXHAUSTED' = [pscustomobject]@{ Severity = 'Info'; UserMessage = "已完成当前恢复级别的全部搜索范围，但没有找到密码。`r`n可以提高恢复级别，或调整字典、Mask/密码线索后再次尝试。"; FallbackAction = 'None' }
+        'INTERNAL_ERROR' = [pscustomobject]@{ Severity = 'Error'; UserMessage = '本地恢复遇到未分类错误，请查看日志后重试。'; FallbackAction = 'Retry' }
+    }
+}
+
+function Get-RecoveryDiagnosticVolumeNames {
+    [CmdletBinding()]
+    param(
+        [AllowEmptyString()][string]$Message
+    )
+
+    if ([string]::IsNullOrWhiteSpace($Message)) { return @() }
+    $value = ''
+    if ($Message -match '(?is)\bmissing\s*:\s*(?<value>.+?)(?:\.\s*$|;\s*duplicate)') {
+        $value = [string]$Matches['value']
+    }
+    elseif ($Message -match '(?is)\bmissing(?:\s+volume)?\s*[:=]\s*(?<value>[^\r\n;]+)') {
+        $value = [string]$Matches['value']
+    }
+    if ([string]::IsNullOrWhiteSpace($value)) { return @() }
+
+    $names = New-Object 'System.Collections.Generic.List[string]'
+    foreach ($part in @($value -split '\s*,\s*')) {
+        $name = ([string]$part).Trim().TrimEnd('.')
+        if ([string]::IsNullOrWhiteSpace($name) -or $name -match '[\\/:<>|"?\x00-\x1F]' -or $name.Length -gt 180) { continue }
+        if ($name -notmatch '\.') { continue }
+        if (-not $names.Contains($name)) { [void]$names.Add($name) }
+        if ($names.Count -ge 5) { break }
+    }
+    return $names.ToArray()
+}
+
+function Get-RecoveryDiagnostic {
+    [CmdletBinding()]
+    param(
+        [AllowEmptyString()][string]$Code = '',
+        [AllowEmptyString()][string]$Message = '',
+        [string]$Function = '',
+        [string]$ArtifactType = '',
+        [AllowEmptyString()][string]$TechnicalDetail = '',
+        [int]$ExitCode = [int]::MinValue,
+        [ValidateSet('Starting', 'Running', 'Paused', 'Pausing', 'Stopping', 'Stopped', 'Recovered', 'Exhausted', 'Failed', 'NotEncrypted', '')][string]$State = ''
+    )
+
+    $catalog = Get-RecoveryDiagnosticCatalog
+    $codeToken = if ([string]::IsNullOrWhiteSpace($Code)) { '' } else { (($Code -split ':', 2)[0]).Trim().ToUpperInvariant() }
+    $messageText = if ($null -eq $Message) { '' } else { [string]$Message }
+    if ([string]::IsNullOrWhiteSpace($codeToken) -and
+        $messageText -match '(?im)^\s*(?<embedded>[A-Z][A-Z0-9_]{2,})\s*:') {
+        # Worker exceptions carry a stable prefix before the human detail.
+        # Reuse that prefix without persisting the raw exception text.
+        $codeToken = [string]$Matches['embedded']
+    }
+    $canonicalCode = ''
+
+    if (-not [string]::IsNullOrWhiteSpace($codeToken) -and $catalog.Contains($codeToken)) {
+        $canonicalCode = $codeToken
+    }
+    else {
+        switch -Regex ($codeToken) {
+            '^ARCHIVE_VOLUME_SET_INCOMPLETE$' {
+                $canonicalCode = if (@(Get-RecoveryDiagnosticVolumeNames -Message $messageText).Count -gt 0) { 'ARCHIVE_VOLUME_MISSING' } else { 'ARCHIVE_VOLUME_INCOMPLETE_OR_DAMAGED' }
+                break
+            }
+            '^ARCHIVE_VOLUME_IDENTITY_MISSING$' { $canonicalCode = 'JOB_VOLUME_CHANGED'; break }
+            '^ARCHIVE_CHANGED$|^ARCHIVE_IDENTITY_MISSING$' { $canonicalCode = 'JOB_ARCHIVE_CHANGED'; break }
+            '^ARCHIVER_NOT_AVAILABLE$|^WINDOWS_POWERSHELL_NOT_AVAILABLE$|^RUNTIME_ARTIFACT_CREATE_FAILED$|^WORKER_FAILED$' { $canonicalCode = 'INTERNAL_ERROR'; break }
+        }
+    }
+
+    if ([string]::IsNullOrWhiteSpace($canonicalCode)) {
+        if ($State -eq 'NotEncrypted' -or $messageText -match '(?i)no password (?:is )?required|does not require a password|未检测到密码保护|不需要密码') {
+            $canonicalCode = 'ARCHIVE_NOT_ENCRYPTED'
+        }
+        elseif ($State -eq 'Exhausted' -or $messageText -match '(?i)completed without (?:recovering|a verified) password|no verified password was found|没有找到.*密码|未恢复出密码') {
+            $canonicalCode = 'RECOVERY_RANGE_EXHAUSTED'
+        }
+        elseif ($messageText -match '(?i)archive not found|selected archive no longer exists|压缩包.*不存在|找不到.*压缩包') {
+            $canonicalCode = 'ARCHIVE_NOT_FOUND'
+        }
+        elseif ($messageText -match '(?i)missing\s*(?:required\s*)?volume|volume.*missing|missing\s*:\s*[^\r\n;]+|分卷.*缺少|分卷.*不存在') {
+            $canonicalCode = 'ARCHIVE_VOLUME_MISSING'
+        }
+        elseif ($messageText -match '(?i)volume.*changed|分卷.*发生变化') {
+            $canonicalCode = 'JOB_VOLUME_CHANGED'
+        }
+        elseif ($messageText -match '(?i)archive.*changed|压缩包.*发生变化') {
+            $canonicalCode = 'JOB_ARCHIVE_CHANGED'
+        }
+        elseif ($messageText -match '(?i)dictionary.*(?:missing|not found)|local dictionary file is missing|字典.*(?:不存在|找不到)') {
+            $canonicalCode = 'DICTIONARY_NOT_FOUND'
+        }
+        elseif ($messageText -match '(?i)dictionary.*empty|empty dictionary|字典.*为空') {
+            $canonicalCode = 'DICTIONARY_EMPTY'
+        }
+        elseif ($messageText -match '(?i)must be valid UTF-?8|UTF-32|UTF-16|not valid UTF-?8|字典.*UTF-8') {
+            $canonicalCode = 'DICTIONARY_ENCODING_UNSUPPORTED'
+        }
+        elseif ($messageText -match '(?i)device.*(?:disappeared|lost|removed|unavailable)|GPU.*(?:disappeared|lost|removed)|显卡.*(?:消失|丢失|移除)') {
+            $canonicalCode = 'GPU_DEVICE_DISAPPEARED'
+        }
+        elseif ($messageText -match '(?i)GPU recovery is not implemented|no GPU adapter|not yet represented by the GPU backend|不支持 GPU') {
+            $canonicalCode = 'GPU_FORMAT_UNSUPPORTED'
+        }
+        elseif ($messageText -match '(?i)John.*(?:not implemented|not accepted|did not accept|could not be started|launcher was not found|unsupported)|John.*format.*unsupported|John.*不支持') {
+            $canonicalCode = 'JOHN_FORMAT_UNSUPPORTED'
+        }
+        elseif ($messageText -match '(?i)Hashcat.*(?:artifact|record).*(?:not found|unsupported|failed)|GPU recovery data|Hashcat.*提取') {
+            $canonicalCode = 'HASHCAT_ARTIFACT_UNSUPPORTED'
+        }
+        elseif ($messageText -match '(?i)extractor.*(?:failed|did not produce|did not complete|could not)|提取器.*(?:失败|未完成)') {
+            $canonicalCode = 'EXTRACTOR_FAILED'
+        }
+        elseif ($messageText -match '(?i)extractor.*(?:not found|unavailable)|提取器.*(?:不存在|不可用)') {
+            $canonicalCode = 'HASHCAT_ARTIFACT_UNSUPPORTED'
+        }
+        elseif ($messageText -match '(?i)no (?:initialized )?(?:local )?Hashcat.*GPU|no usable local Hashcat GPU|no.*GPU.*found|did not report.*(?:available )?(?:OpenCL )?GPU|available OpenCL GPU device|没有.*GPU') {
+            $canonicalCode = 'GPU_NOT_AVAILABLE'
+        }
+        elseif ($messageText -match '(?i)OpenCL.*(?:initialize|initialization failed)|GPU backend.*(?:failed|unavailable)|GPU 后端.*失败') {
+            $canonicalCode = 'GPU_BACKEND_INIT_FAILED'
+        }
+        elseif ($messageText -match '(?i)already active|already owns|Worker(?:\s+or\s+Hashcat)?(?: is)? running|Hashcat.*(?:is )?running|已有.*(?:Worker|恢复进程|恢复任务)|第二个 Worker') {
+            $canonicalCode = 'JOB_ALREADY_ACTIVE'
+        }
+        elseif ($messageText -match '(?i)data error|headers error|unexpected end|archive.*(?:damaged|corrupt)|cannot read.*archive|NanaZip.*(?:failed|error)|压缩包.*(?:损坏|无法读取)') {
+            $canonicalCode = 'ARCHIVE_DAMAGED'
+        }
+        elseif ($messageText -match '(?i)unsupported.*archive|unsupported archive format|archive.*not supported|not supported.*archive|not implemented for|无法识别.*压缩包') {
+            $canonicalCode = 'ARCHIVE_UNSUPPORTED'
+        }
+        else {
+            $canonicalCode = 'INTERNAL_ERROR'
+        }
+    }
+
+    if (-not $catalog.Contains($canonicalCode)) { $canonicalCode = 'INTERNAL_ERROR' }
+    $definition = $catalog[$canonicalCode]
+    $userMessage = [string]$definition.UserMessage
+    if ($canonicalCode -eq 'ARCHIVE_VOLUME_MISSING') {
+        $missingNames = @(Get-RecoveryDiagnosticVolumeNames -Message $messageText)
+        if ($missingNames.Count -gt 0) {
+            $userMessage = '分卷压缩包缺少必要分卷：{0}。请补齐分卷后重试。' -f ($missingNames -join '、')
+        }
+    }
+
+    # Do not persist raw exception text here: archive paths, candidates,
+    # passwords, hashes, salts, and tool output can all appear in it.  The
+    # advanced detail is intentionally a small, non-secret breadcrumb.
+    $detailParts = New-Object 'System.Collections.Generic.List[string]'
+    [void]$detailParts.Add('Code=' + $canonicalCode)
+    if (-not [string]::IsNullOrWhiteSpace($Function)) { [void]$detailParts.Add('Function=' + ([regex]::Replace($Function, '[^A-Za-z0-9_.-]', '_'))) }
+    if (-not [string]::IsNullOrWhiteSpace($ArtifactType)) { [void]$detailParts.Add('Artifact=' + ([regex]::Replace($ArtifactType, '[^A-Za-z0-9_. -]', '_'))) }
+    if ($ExitCode -ne [int]::MinValue) { [void]$detailParts.Add('ExitCode=' + $ExitCode) }
+    if (-not [string]::IsNullOrWhiteSpace($TechnicalDetail)) {
+        $detailKind = if ($TechnicalDetail -match '(?i)disappear|device|OpenCL') { 'backend-signal' } elseif ($TechnicalDetail -match '(?i)extract|artifact|record') { 'extractor-signal' } else { 'local-signal' }
+        [void]$detailParts.Add('DetailKind=' + $detailKind)
+    }
+
+    # The returned object intentionally has exactly the five public fields in
+    # the diagnostics contract.
+    return [pscustomobject][ordered]@{
+        ErrorCode       = $canonicalCode
+        Severity        = [string]$definition.Severity
+        UserMessage     = $userMessage
+        TechnicalDetail = ($detailParts -join '; ')
+        FallbackAction  = [string]$definition.FallbackAction
+    }
 }
 
 function Get-ArchiveVolumeNameDescriptor {
@@ -409,6 +609,16 @@ function Get-ArchiveInspection {
         $format = if ($toolType -match '(?i)^RAR') { 'RAR' } else { $toolType }
     }
 
+    if ($listing.ExitCode -ne 0 -and $encrypted -eq 'Unknown') {
+        if ([string]$format -notin @('7z', 'ZIP', 'RAR')) {
+            throw 'ARCHIVE_UNSUPPORTED: The selected archive format is not supported.'
+        }
+        if ([bool]$volumeSet.IsMultiVolume) {
+            throw 'ARCHIVE_VOLUME_INCOMPLETE_OR_DAMAGED: Unable to fully read this archive volume set; the archive may be damaged or a later volume not inferable from its filename may be missing.'
+        }
+        throw 'ARCHIVE_DAMAGED: The archive metadata could not be read locally.'
+    }
+
     return [pscustomobject]@{
         Path            = $ArchivePath
         Name            = [System.IO.Path]::GetFileName($ArchivePath)
@@ -441,9 +651,26 @@ function Test-ArchivePassword {
     $passwordSwitch = '-p' + $Password
     $test = Invoke-SevenZipCommand -SevenZip $SevenZip -Arguments @('t', '-bd', '-y', $passwordSwitch, $ArchivePath)
 
+    $testOutput = [string]::Join("`n", @($test.Output))
+    $failureCategory = if ($test.ExitCode -eq 0) {
+        'Success'
+    }
+    elseif ($testOutput -match '(?i)wrong password|cannot open encrypted archive|password is incorrect') {
+        'WrongPassword'
+    }
+    elseif ($testOutput -match '(?i)data error|headers error|unexpected end|unexpected end of archive|cannot open the file as|is not supported|is corrupt|corrupt') {
+        'ArchiveDamaged'
+    }
+    else {
+        # A non-zero verifier result without a known wrong-password or archive
+        # damage signature is an execution failure, not an exhausted
+        # candidate.  The worker turns this into a safe terminal diagnostic.
+        'VerifierFailed'
+    }
     return [pscustomobject]@{
-        IsValid  = ($test.ExitCode -eq 0)
-        ExitCode = $test.ExitCode
+        IsValid        = ($test.ExitCode -eq 0)
+        ExitCode       = $test.ExitCode
+        FailureCategory = $failureCategory
     }
 }
 
@@ -720,6 +947,27 @@ function Get-ArchiveVolumeSetIdentity {
     }
 }
 
+function Convert-ArchiveIdentityTimestamp {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]$Value
+    )
+
+    # Windows PowerShell ConvertFrom-Json materializes ISO-8601 UTC strings
+    # as DateTime values.  Normalize both the in-memory identity and the
+    # deserialized identity back to the same invariant UTC representation
+    # before comparing them.
+    if ($Value -is [datetime]) {
+        return $Value.ToUniversalTime().ToString('o', [System.Globalization.CultureInfo]::InvariantCulture)
+    }
+    $text = [string]$Value
+    [datetime]$parsed = [datetime]::MinValue
+    if ([datetime]::TryParse($text, [System.Globalization.CultureInfo]::InvariantCulture, [System.Globalization.DateTimeStyles]::RoundtripKind, [ref]$parsed)) {
+        return $parsed.ToUniversalTime().ToString('o', [System.Globalization.CultureInfo]::InvariantCulture)
+    }
+    return $text
+}
+
 function Test-ArchiveVolumeSetIdentityMatch {
     [CmdletBinding()]
     param(
@@ -756,7 +1004,9 @@ function Test-ArchiveVolumeSetIdentityMatch {
         catch {
             return $false
         }
-        if (-not [string]::Equals([string]$expectedVolume.LastWriteTimeUtc, [string]$actualVolume.LastWriteTimeUtc, [System.StringComparison]::Ordinal)) { return $false }
+        $expectedTimestamp = Convert-ArchiveIdentityTimestamp -Value $expectedVolume.LastWriteTimeUtc
+        $actualTimestamp = Convert-ArchiveIdentityTimestamp -Value $actualVolume.LastWriteTimeUtc
+        if (-not [string]::Equals($expectedTimestamp, $actualTimestamp, [System.StringComparison]::Ordinal)) { return $false }
     }
     return $true
 }
@@ -1449,7 +1699,7 @@ function Get-HashcatOpenClDevices {
             HashcatPath = $hashcatPath
             Devices     = @()
             Ready       = $false
-            Message     = ('Hashcat OpenCL initialization failed locally: ' + $_.Exception.Message)
+            Message     = 'Hashcat OpenCL initialization failed locally.'
         }
     }
 
@@ -1724,18 +1974,27 @@ function New-ZipHashcatArtifact {
     $zip2JohnPath = Resolve-LocalZip2John -ProjectRoot $ProjectRoot
     if ([string]::IsNullOrWhiteSpace($zip2JohnPath)) {
         return [pscustomobject]@{
-            Supported = $false
-            Message   = 'ZIP GPU extraction is unavailable because the local zip2john executable was not found.'
+            Supported       = $false
+            FailureCategory = 'Unsupported'
+            Message         = 'ZIP GPU extraction is unavailable because the local zip2john executable was not found.'
         }
     }
 
     $extracted = Invoke-LocalNativeProcess -FilePath $zip2JohnPath -WorkingDirectory (Split-Path $zip2JohnPath -Parent) -Arguments @($ArchivePath)
+    if ($extracted.ExitCode -ne 0) {
+        return [pscustomobject]@{
+            Supported       = $false
+            FailureCategory = 'ExtractorFailed'
+            Message         = 'The local ZIP extractor did not complete successfully.'
+        }
+    }
     $match = [regex]::Match($extracted.StdOut, '\$zip2\$\*.+?\*\$/zip2\$')
     if (-not $match.Success) {
         $legacy = [regex]::IsMatch($extracted.StdOut, '\$pkzip\$')
         return [pscustomobject]@{
-            Supported = $false
-            Message   = if ($legacy) {
+            Supported       = $false
+            FailureCategory = 'Unsupported'
+            Message         = if ($legacy) {
                 'This ZIP uses legacy ZipCrypto data. The current GPU implementation supports WinZip AES only, so the task will use the CPU path.'
             }
             else {
@@ -1748,6 +2007,7 @@ function New-ZipHashcatArtifact {
     [System.IO.File]::WriteAllText($hashPath, $match.Value + [Environment]::NewLine, (New-Object System.Text.UTF8Encoding($false)))
     return [pscustomobject]@{
         Supported      = $true
+        FailureCategory = 'Success'
         Message        = 'WinZip AES recovery data was extracted locally for Hashcat.'
         HashPath       = $hashPath
         HashMode       = 13600
@@ -1766,8 +2026,9 @@ function New-SevenZipHashcatArtifact {
     $extractorPath = Resolve-Local7z2Hashcat -ProjectRoot $ProjectRoot
     if ([string]::IsNullOrWhiteSpace($extractorPath)) {
         return [pscustomobject]@{
-            Supported = $false
-            Message   = '7z GPU extraction is unavailable because the local 7z2hashcat executable was not found.'
+            Supported       = $false
+            FailureCategory = 'Unsupported'
+            Message         = '7z GPU extraction is unavailable because the local 7z2hashcat executable was not found.'
         }
     }
 
@@ -1775,10 +2036,18 @@ function New-SevenZipHashcatArtifact {
     # The Windows extractor may prefix the record with the local archive name.
     # Hashcat needs the $7z$ record itself, not that display prefix.
     $records = [regex]::Matches($extracted.StdOut, '(?m)\$7z\$[^\r\n]+(?=\r?$)')
-    if ($extracted.ExitCode -ne 0 -or $records.Count -eq 0) {
+    if ($extracted.ExitCode -ne 0) {
         return [pscustomobject]@{
-            Supported = $false
-            Message   = 'The local 7z2hashcat extractor did not produce a supported 7-Zip AES recovery record. The task will use the CPU path.'
+            Supported       = $false
+            FailureCategory = 'ExtractorFailed'
+            Message         = 'The local 7z2hashcat extractor did not complete successfully.'
+        }
+    }
+    if ($records.Count -eq 0) {
+        return [pscustomobject]@{
+            Supported       = $false
+            FailureCategory = 'Unsupported'
+            Message         = 'The local 7z2hashcat extractor did not produce a supported 7-Zip AES recovery record. The task will use the CPU path.'
         }
     }
 
@@ -1786,8 +2055,9 @@ function New-SevenZipHashcatArtifact {
     $hashLine = $records[0].Value.Trim()
     [System.IO.File]::WriteAllText($hashPath, $hashLine + [Environment]::NewLine, (New-Object System.Text.UTF8Encoding($false)))
     return [pscustomobject]@{
-        Supported      = $true
-        Message        = '7-Zip AES recovery data was extracted locally for Hashcat.'
+        Supported       = $true
+        FailureCategory = 'Success'
+        Message         = '7-Zip AES recovery data was extracted locally for Hashcat.'
         HashPath       = $hashPath
         HashMode       = 11600
         EncryptionType = '7-Zip AES'
@@ -1919,11 +2189,12 @@ function Get-RarExtractorRecords {
     $rar2JohnPath = Resolve-LocalRar2John -ProjectRoot $ProjectRoot
     if ([string]::IsNullOrWhiteSpace($rar2JohnPath)) {
         return [pscustomobject]@{
-            Supported = $false
-            ExtractorPath = ''
-            ExitCode = -1
-            Records = @()
-            Message = 'The local rar2john extractor was not found.'
+            Supported       = $false
+            FailureCategory = 'Unsupported'
+            ExtractorPath   = ''
+            ExitCode        = -1
+            Records         = @()
+            Message         = 'The local rar2john extractor was not found.'
         }
     }
 
@@ -1940,27 +2211,34 @@ function Get-RarExtractorRecords {
         }
     }
 
-    if ($extracted.ExitCode -ne 0 -or $records.Count -eq 0) {
+    if ($extracted.ExitCode -ne 0) {
         return [pscustomobject]@{
-            Supported = $false
-            ExtractorPath = [string]$rar2JohnPath
-            ExitCode = $extracted.ExitCode
-            Records = @($records.ToArray())
-            Message = if ($records.Count -eq 0) {
-                'The local rar2john extractor did not produce a RAR recovery record.'
-            }
-            else {
-                'The local rar2john extractor did not complete successfully.'
-            }
+            Supported       = $false
+            FailureCategory = 'ExtractorFailed'
+            ExtractorPath   = [string]$rar2JohnPath
+            ExitCode        = $extracted.ExitCode
+            Records         = @($records.ToArray())
+            Message         = 'The local rar2john extractor did not complete successfully.'
+        }
+    }
+    if ($records.Count -eq 0) {
+        return [pscustomobject]@{
+            Supported       = $false
+            FailureCategory = 'Unsupported'
+            ExtractorPath   = [string]$rar2JohnPath
+            ExitCode        = $extracted.ExitCode
+            Records         = @($records.ToArray())
+            Message         = 'The local rar2john extractor did not produce a RAR recovery record.'
         }
     }
 
     return [pscustomobject]@{
-        Supported = $true
-        ExtractorPath = [string]$rar2JohnPath
-        ExitCode = $extracted.ExitCode
-        Records = @($records.ToArray())
-        Message = 'RAR recovery records were extracted locally.'
+        Supported       = $true
+        FailureCategory = 'Success'
+        ExtractorPath   = [string]$rar2JohnPath
+        ExitCode        = $extracted.ExitCode
+        Records         = @($records.ToArray())
+        Message         = 'RAR recovery records were extracted locally.'
     }
 }
 
@@ -1975,8 +2253,9 @@ function New-RarHashcatArtifact {
     $extracted = Get-RarExtractorRecords -ArchivePath $ArchivePath -ProjectRoot $ProjectRoot
     if (-not $extracted.Supported) {
         return [pscustomobject]@{
-            Supported = $false
-            Message = ([string]$extracted.Message + ' The task will use the CPU path.')
+            Supported       = $false
+            FailureCategory = if ($extracted.PSObject.Properties.Name -contains 'FailureCategory') { [string]$extracted.FailureCategory } else { 'Unsupported' }
+            Message         = ([string]$extracted.Message + ' The task will use the CPU path.')
         }
     }
 
@@ -1984,16 +2263,18 @@ function New-RarHashcatArtifact {
     $hashcatRecords = @($records | Where-Object { [bool]$_.HashcatSupported })
     if ($hashcatRecords.Count -eq 0) {
         return [pscustomobject]@{
-            Supported = $false
-            Message = 'The local RAR records are not within the supported Hashcat RAR parser range. The task will use the CPU path.'
+            Supported       = $false
+            FailureCategory = 'Unsupported'
+            Message         = 'The local RAR records are not within the supported Hashcat RAR parser range. The task will use the CPU path.'
         }
     }
 
     $modes = @($hashcatRecords | ForEach-Object { [int]$_.HashMode } | Select-Object -Unique)
     if ($hashcatRecords.Count -ne $records.Count -or $modes.Count -ne 1) {
         return [pscustomobject]@{
-            Supported = $false
-            Message = 'The local RAR archive produced mixed or unsupported Hashcat record modes. The task will use the CPU path.'
+            Supported       = $false
+            FailureCategory = 'Unsupported'
+            Message         = 'The local RAR archive produced mixed or unsupported Hashcat record modes. The task will use the CPU path.'
         }
     }
 
@@ -2003,6 +2284,7 @@ function New-RarHashcatArtifact {
     $subtypes = @($hashcatRecords | ForEach-Object { [string]$_.Subtype } | Select-Object -Unique)
     return [pscustomobject]@{
         Supported      = $true
+        FailureCategory = 'Success'
         Message        = 'RAR recovery data was extracted locally for Hashcat.'
         HashPath       = $hashPath
         HashRecords    = $hashLines
@@ -2034,8 +2316,9 @@ function New-ArchiveHashcatArtifact {
         }
         default {
             return [pscustomobject]@{
-                Supported = $false
-                Message   = ('GPU recovery is not implemented for {0}. The task will use the CPU path.' -f $ArchiveFormat)
+                Supported       = $false
+                FailureCategory = 'Unsupported'
+                Message         = ('GPU recovery is not implemented for {0}. The task will use the CPU path.' -f $ArchiveFormat)
             }
         }
     }
@@ -2103,8 +2386,9 @@ function New-ZipJohnArtifact {
     $zip2JohnPath = Resolve-LocalZip2John -ProjectRoot $ProjectRoot
     if ([string]::IsNullOrWhiteSpace($zip2JohnPath)) {
         return [pscustomobject]@{
-            Supported = $false
-            Message = 'CPU bulk recovery is unavailable because the local zip2john executable was not found.'
+            Supported       = $false
+            FailureCategory = 'Unsupported'
+            Message         = 'CPU bulk recovery is unavailable because the local zip2john executable was not found.'
         }
     }
 
@@ -2116,10 +2400,18 @@ function New-ZipJohnArtifact {
             [void]$records.Add($trimmed)
         }
     }
-    if ($extracted.ExitCode -ne 0 -or $records.Count -eq 0) {
+    if ($extracted.ExitCode -ne 0) {
         return [pscustomobject]@{
-            Supported = $false
-            Message = 'The local zip2john extractor did not produce a John-supported ZIP recovery record. NanaZip CPU verification remains the fallback.'
+            Supported       = $false
+            FailureCategory = 'ExtractorFailed'
+            Message         = 'The local zip2john extractor did not complete successfully. NanaZip CPU verification remains the fallback.'
+        }
+    }
+    if ($records.Count -eq 0) {
+        return [pscustomobject]@{
+            Supported       = $false
+            FailureCategory = 'Unsupported'
+            Message         = 'The local zip2john extractor did not produce a John-supported ZIP recovery record. NanaZip CPU verification remains the fallback.'
         }
     }
 
@@ -2152,7 +2444,8 @@ function New-ZipJohnArtifact {
     if ($null -eq $primary) { $primary = $groupArtifacts[0] }
     $isMixed = $groupArtifacts.Count -gt 1
     return [pscustomobject]@{
-        Supported = $true
+        Supported       = $true
+        FailureCategory = 'Success'
         Message = if ($isMixed) { 'ZIP recovery data was extracted locally for John Jumbo and grouped by John record format.' } else { '{0} recovery data was extracted locally for John Jumbo.' -f [string]$primary.EncryptionType }
         HashPath = [string]$primary.HashPath
         HashRecords = @($records.ToArray())
@@ -2173,17 +2466,26 @@ function New-SevenZipJohnArtifact {
     $extractorPath = Resolve-Local7z2Hashcat -ProjectRoot $ProjectRoot
     if ([string]::IsNullOrWhiteSpace($extractorPath)) {
         return [pscustomobject]@{
-            Supported = $false
-            Message = 'CPU bulk recovery is unavailable because the local 7z2hashcat executable was not found.'
+            Supported       = $false
+            FailureCategory = 'Unsupported'
+            Message         = 'CPU bulk recovery is unavailable because the local 7z2hashcat executable was not found.'
         }
     }
 
     $extracted = Invoke-LocalNativeProcess -FilePath $extractorPath -WorkingDirectory (Split-Path $extractorPath -Parent) -Arguments @($ArchivePath)
     $match = [regex]::Match($extracted.StdOut, '(?m)(\$7z\$[^\r\n]+)')
-    if ($extracted.ExitCode -ne 0 -or -not $match.Success) {
+    if ($extracted.ExitCode -ne 0) {
         return [pscustomobject]@{
-            Supported = $false
-            Message = 'The local 7z2hashcat extractor did not produce a John-supported 7-Zip AES recovery record. NanaZip CPU verification remains the fallback.'
+            Supported       = $false
+            FailureCategory = 'ExtractorFailed'
+            Message         = 'The local 7z2hashcat extractor did not complete successfully. NanaZip CPU verification remains the fallback.'
+        }
+    }
+    if (-not $match.Success) {
+        return [pscustomobject]@{
+            Supported       = $false
+            FailureCategory = 'Unsupported'
+            Message         = 'The local 7z2hashcat extractor did not produce a John-supported 7-Zip AES recovery record. NanaZip CPU verification remains the fallback.'
         }
     }
 
@@ -2191,7 +2493,8 @@ function New-SevenZipJohnArtifact {
     $hashLine = $match.Groups[1].Value.Trim()
     [System.IO.File]::WriteAllText($hashPath, $hashLine + [Environment]::NewLine, (New-Object System.Text.UTF8Encoding($false)))
     return [pscustomobject]@{
-        Supported = $true
+        Supported       = $true
+        FailureCategory = 'Success'
         Message = '7-Zip AES recovery data was extracted locally for John Jumbo.'
         HashPath = $hashPath
         HashRecords = @($hashLine)
@@ -2217,8 +2520,9 @@ function New-RarJohnArtifact {
     $extracted = Get-RarExtractorRecords -ArchivePath $ArchivePath -ProjectRoot $ProjectRoot
     if (-not $extracted.Supported) {
         return [pscustomobject]@{
-            Supported = $false
-            Message = ([string]$extracted.Message + ' NanaZip CPU verification remains the fallback.')
+            Supported       = $false
+            FailureCategory = if ($extracted.PSObject.Properties.Name -contains 'FailureCategory') { [string]$extracted.FailureCategory } else { 'Unsupported' }
+            Message         = ([string]$extracted.Message + ' NanaZip CPU verification remains the fallback.')
         }
     }
 
@@ -2227,8 +2531,9 @@ function New-RarJohnArtifact {
         })
     if ($johnRecords.Count -eq 0) {
         return [pscustomobject]@{
-            Supported = $false
-            Message = 'The local RAR record is not accepted by the bundled John Jumbo build. NanaZip CPU verification remains the fallback.'
+            Supported       = $false
+            FailureCategory = 'Unsupported'
+            Message         = 'The local RAR record is not accepted by the bundled John Jumbo build. NanaZip CPU verification remains the fallback.'
         }
     }
 
@@ -2266,7 +2571,8 @@ function New-RarJohnArtifact {
     $primary = $groupArtifacts[0]
     $isMixed = $groupArtifacts.Count -gt 1
     return [pscustomobject]@{
-        Supported = $true
+        Supported       = $true
+        FailureCategory = 'Success'
         Message = if ($isMixed) {
             'RAR recovery data was extracted locally for John Jumbo and grouped by RAR record format.'
         }
@@ -2298,8 +2604,9 @@ function New-ArchiveJohnArtifact {
         'RAR' { return New-RarJohnArtifact -ArchivePath $ArchivePath -JobDirectory $JobDirectory -ProjectRoot $ProjectRoot }
         default {
             return [pscustomobject]@{
-                Supported = $false
-                Message = ('John Jumbo CPU bulk recovery is not implemented for {0}. NanaZip CPU verification remains the fallback.' -f $ArchiveFormat)
+                Supported       = $false
+                FailureCategory = 'Unsupported'
+                Message         = ('John Jumbo CPU bulk recovery is not implemented for {0}. NanaZip CPU verification remains the fallback.' -f $ArchiveFormat)
             }
         }
     }
@@ -5853,6 +6160,7 @@ Export-ModuleMember -Function @(
     'Resolve-WindowsPowerShell',
     'Invoke-SevenZipCommand',
     'Get-ArchiveFormat',
+    'Get-RecoveryDiagnostic',
     'Resolve-ArchiveVolumeSet',
     'Get-ArchiveInspection',
     'Test-ArchivePassword',
