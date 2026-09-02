@@ -50,6 +50,7 @@ New-Item -ItemType Directory -Path $runtimeRoot -Force | Out-Null
         <SolidColorBrush x:Key="SurfaceHoverBrush" Color="#F8FBFF" />
         <SolidColorBrush x:Key="SurfacePressedBrush" Color="#EEF5FF" />
         <SolidColorBrush x:Key="PrimaryBrush" Color="#2F75C9" />
+        <SolidColorBrush x:Key="UnavailableProgressBrush" Color="#AAB2BC" />
         <SolidColorBrush x:Key="PrimaryHoverBrush" Color="#2468BA" />
         <SolidColorBrush x:Key="PrimaryPressedBrush" Color="#1E5DAA" />
         <SolidColorBrush x:Key="PrimarySoftBrush" Color="#EDF5FF" />
@@ -729,9 +730,12 @@ if (Test-Path -LiteralPath $primaryIconPath -PathType Leaf) {
 $script:CurrentJobDirectory = $null
 $script:CurrentJobId = ''
 $script:CurrentWorker = $null
+$script:CurrentWorkerJobId = ''
 $script:CurrentInspection = $null
 $script:LastProgressUpdated = $null
 $script:LastProgressSnapshot = $null
+$script:LastUiRenderedProgressUpdatedUtc = ''
+$script:LastUiElapsedRenderUtc = $null
 $script:DeviceSelectionWarning = ''
 $script:UiElapsedRunId = ''
 $script:UiElapsedRunStartedUtc = $null
@@ -744,6 +748,8 @@ $script:DeviceChoicesPopulated = $false
 $script:DeferredStartupScheduled = $false
 $script:DeferredStartupStarted = $false
 $script:LastUiErrorKey = ''
+$script:PrimaryProgressBrush = $window.Resources['PrimaryBrush']
+$script:UnavailableProgressBrush = $window.Resources['UnavailableProgressBrush']
 
 function Write-UiLog {
     param([Parameter(Mandatory = $true)][string]$Message)
@@ -1212,6 +1218,8 @@ function Format-LocalDuration {
 
 function Reset-UiElapsedState {
     $script:LastProgressSnapshot = $null
+    $script:LastUiRenderedProgressUpdatedUtc = ''
+    $script:LastUiElapsedRenderUtc = $null
     $script:UiElapsedRunId = ''
     $script:UiElapsedRunStartedUtc = $null
     $script:UiElapsedFrozenSeconds = $null
@@ -1278,6 +1286,49 @@ function Update-UiElapsedFromProgress {
     }
     $script:UiElapsedLastSeconds = [math]::Max([double]$script:UiElapsedLastSeconds, $currentSeconds)
     $controls.ElapsedValue.Text = Format-LocalDuration -Seconds $script:UiElapsedLastSeconds
+}
+
+function Update-UiElapsedIfDue {
+    param(
+        $Progress = $null,
+        [string]$DisplayState = '',
+        [switch]$Force
+    )
+
+    $now = [datetime]::UtcNow
+    if (-not $Force -and $null -ne $script:LastUiElapsedRenderUtc -and
+        ($now - $script:LastUiElapsedRenderUtc).TotalMilliseconds -lt 1000) {
+        return
+    }
+    Update-UiElapsedFromProgress -Progress $Progress -DisplayState $DisplayState
+    $script:LastUiElapsedRenderUtc = $now
+}
+
+function Update-UiProgressActivityMessage {
+    param(
+        [Parameter(Mandatory = $true)]$Progress,
+        [string]$Activity = '',
+        [string]$ActivityMessage = '',
+        $Diagnostic = $null
+    )
+
+    $displayActivityMessage = if ($null -ne $Diagnostic) { [string]$Diagnostic.UserMessage } else { Convert-UiMessage -Message $ActivityMessage }
+    if ($Activity -like 'Preparing*' -or $Activity -eq 'RunningCoverage') {
+        $lastProgressUtc = $null
+        if ($Progress.PSObject.Properties.Name -contains 'LastProgressUtc' -and -not [string]::IsNullOrWhiteSpace([string]$Progress.LastProgressUtc)) {
+            try { $lastProgressUtc = [datetime]::Parse([string]$Progress.LastProgressUtc, [System.Globalization.CultureInfo]::InvariantCulture, [System.Globalization.DateTimeStyles]::RoundtripKind) } catch { $lastProgressUtc = $null }
+        }
+        if ($null -ne $lastProgressUtc) {
+            $progressAge = ([datetime]::UtcNow - $lastProgressUtc.ToUniversalTime()).TotalSeconds
+            if ($progressAge -gt 30) {
+                $displayActivityMessage += ' 当前步骤仍在处理中，暂未收到新的进度更新。'
+            }
+            elseif ($progressAge -gt 10) {
+                $displayActivityMessage += (' 正在处理当前本地任务，最近 {0:N0} 秒暂无新的进度采样…' -f $progressAge)
+            }
+        }
+    }
+    $controls.ProgressMessageText.Text = $displayActivityMessage
 }
 
 function Format-LocalEta {
@@ -1778,6 +1829,35 @@ function Get-CurrentJobRuntimeActivity {
     }
 }
 
+function Test-CurrentWorkerBoundToCurrentJob {
+    if ($null -eq $script:CurrentWorker -or
+        [string]::IsNullOrWhiteSpace($script:CurrentWorkerJobId) -or
+        [string]::IsNullOrWhiteSpace($script:CurrentJobId)) {
+        return $false
+    }
+    return [string]::Equals($script:CurrentWorkerJobId, $script:CurrentJobId, [System.StringComparison]::Ordinal)
+}
+
+function Get-UiRuntimeActivity {
+    if ([string]::IsNullOrWhiteSpace($script:CurrentJobDirectory)) {
+        return [pscustomobject]@{ Known = $true; Active = $false; Reason = ''; WorkerProcessIds = @(); HashcatProcessIds = @(); JohnProcessIds = @() }
+    }
+
+    if (Test-CurrentWorkerBoundToCurrentJob) {
+        try {
+            if (-not $script:CurrentWorker.HasExited) {
+                return [pscustomobject]@{ Known = $true; Active = $true; Reason = 'CurrentWorker handle'; WorkerProcessIds = @(); HashcatProcessIds = @(); JohnProcessIds = @() }
+            }
+        }
+        catch { }
+    }
+
+    # The DispatcherTimer must remain a cheap UI projection path. A stopped or
+    # unbound handle is deliberately left Unknown here; user actions perform
+    # the authoritative Job-scoped CIM check before changing task state.
+    return [pscustomobject]@{ Known = $false; Active = $false; Reason = 'UI refresh defers runtime discovery to the next user action.'; WorkerProcessIds = @(); HashcatProcessIds = @(); JohnProcessIds = @() }
+}
+
 function Wait-CurrentJobRuntimeInactive {
     param([int]$TimeoutSeconds = 5)
 
@@ -1792,7 +1872,7 @@ function Wait-CurrentJobRuntimeInactive {
 }
 
 function Get-WorkerIsRunning {
-    if ($null -ne $script:CurrentWorker) {
+    if (Test-CurrentWorkerBoundToCurrentJob) {
         try {
             if (-not $script:CurrentWorker.HasExited) { return $true }
         }
@@ -1852,7 +1932,10 @@ function Test-IsFinalCumulativeExhausted {
 }
 
 function Update-TaskControls {
-    param([string]$State = '')
+    param(
+        [string]$State = '',
+        $RuntimeActivity = $null
+    )
 
     if ([string]::IsNullOrWhiteSpace($State) -and -not [string]::IsNullOrWhiteSpace($script:CurrentJobDirectory)) {
         $progressPath = Join-Path $script:CurrentJobDirectory 'progress.json'
@@ -1861,7 +1944,9 @@ function Update-TaskControls {
         }
     }
 
-    $runtimeActivity = Get-CurrentJobRuntimeActivity
+    if ($null -eq $RuntimeActivity) {
+        $RuntimeActivity = Get-CurrentJobRuntimeActivity
+    }
     if ($State -in @('Starting', 'Running', 'Pausing', 'Stopping') -and $runtimeActivity.Known -and -not $runtimeActivity.Active) {
         $State = 'Interrupted'
     }
@@ -1871,7 +1956,7 @@ function Update-TaskControls {
     $isStopped = $State -eq 'Stopped'
     $isRuntimeActive = [bool]($runtimeActivity.Known -and $runtimeActivity.Active)
     $isCurrentWorkerActive = $false
-    if ($null -ne $script:CurrentWorker) {
+    if (Test-CurrentWorkerBoundToCurrentJob) {
         try { $isCurrentWorkerActive = -not $script:CurrentWorker.HasExited } catch { $isCurrentWorkerActive = $false }
     }
     $isActive = $State -in @('Starting', 'Running', 'Pausing', 'Stopping') -or $isRuntimeActive -or $isCurrentWorkerActive
@@ -2015,6 +2100,7 @@ function Start-WorkerProcess {
     )
     if ($ResumeJob) { $arguments += '-Resume' }
     $script:CurrentWorker = Start-Process -FilePath (Resolve-WindowsPowerShell) -ArgumentList $arguments -WindowStyle Hidden -PassThru
+    $script:CurrentWorkerJobId = [string]$script:CurrentJobId
 }
 
 function Reset-LiveTaskDisplay {
@@ -2040,7 +2126,7 @@ function Reset-LiveTaskDisplay {
     $controls.ProgressMessageText.Text = '正在准备本地恢复任务。压缩包数据不会离开此电脑。'
     $controls.OverallProgressBar.IsIndeterminate = $false
     $controls.OverallProgressBar.Value = 0
-    $controls.OverallProgressBar.Foreground = New-Object System.Windows.Media.SolidColorBrush([System.Windows.Media.Color]::FromRgb(170, 178, 188))
+    $controls.OverallProgressBar.Foreground = $script:UnavailableProgressBrush
     $controls.OverallProgressPercent.Text = '—'
     $controls.OverallCandidatesTestedLabel.Text = '已累计测试'
     $controls.OverallCandidatesTestedValue.Text = '等待开始'
@@ -2285,6 +2371,7 @@ function Reset-CurrentArchiveInitialization {
         $script:CurrentJobDirectory = $null
         $script:CurrentJobId = ''
         $script:CurrentWorker = $null
+        $script:CurrentWorkerJobId = ''
         Reset-LiveTaskDisplay
         $controls.ProgressDetailBody.Visibility = [System.Windows.Visibility]::Collapsed
         $controls.StateValue.Text = '空闲'
@@ -2414,26 +2501,44 @@ function Update-ProgressFromDisk {
     $controls.ProgressDetailBody.Visibility = [System.Windows.Visibility]::Visible
     $progressPath = Join-Path $script:CurrentJobDirectory 'progress.json'
     if (-not (Test-Path -LiteralPath $progressPath -PathType Leaf)) {
-        Update-UiElapsedFromProgress
+        Update-UiElapsedIfDue
         return
     }
 
     try {
         $progress = Read-LocalJson -Path $progressPath
         $script:LastProgressSnapshot = $progress
+        $progressUpdatedUtc = if ($progress.PSObject.Properties.Name -contains 'UpdatedUtc') { [string]$progress.UpdatedUtc } else { '' }
+        $isNewProgressSnapshot = [string]::IsNullOrWhiteSpace($progressUpdatedUtc) -or
+            -not [string]::Equals($progressUpdatedUtc, $script:LastUiRenderedProgressUpdatedUtc, [System.StringComparison]::Ordinal)
         $persistedState = [string]$progress.State
-        $runtimeActivity = Get-CurrentJobRuntimeActivity
+        $runtimeActivity = Get-UiRuntimeActivity
         $displayState = $persistedState
         $staleRunning = $persistedState -in @('Starting', 'Running', 'Pausing', 'Stopping') -and
             $runtimeActivity.Known -and -not $runtimeActivity.Active
         if ($staleRunning) {
             $displayState = 'Interrupted'
         }
-        elseif ($displayState -eq 'Exhausted' -and -not (Test-IsFinalCumulativeExhausted -Progress $progress) -and
+        $finalCumulativeExhausted = $true
+        if ($displayState -eq 'Exhausted' -and $progress.PSObject.Properties.Name -contains 'RequestedCoverage') {
+            $requestedCoverage = @($progress.RequestedCoverage | ForEach-Object { [string]$_ } | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+            if ($requestedCoverage.Count -eq 0) {
+                $finalCumulativeExhausted = $runtimeActivity.Known -and -not $runtimeActivity.Active
+            }
+            else {
+                $finalCumulativeExhausted = Test-IsFinalCumulativeExhausted -Progress $progress
+            }
+        }
+        if ($displayState -eq 'Exhausted' -and -not $finalCumulativeExhausted -and
             $runtimeActivity.Known -and $runtimeActivity.Active) {
             $displayState = 'Running'
         }
-        Update-UiElapsedFromProgress -Progress $progress -DisplayState $displayState
+        if ($isNewProgressSnapshot) {
+            Update-UiElapsedIfDue -Progress $progress -DisplayState $displayState -Force
+        }
+        else {
+            Update-UiElapsedIfDue -Progress $progress -DisplayState $displayState
+        }
         $controls.StateValue.Text = Convert-StateName -Value $displayState
         $stageText = if ($progress.PSObject.Properties.Name -contains 'StageNumber' -and $progress.StageNumber -gt 0) {
             $displayName = if ($progress.PSObject.Properties.Name -contains 'StageName' -and -not [string]::IsNullOrWhiteSpace([string]$progress.StageName)) {
@@ -2475,6 +2580,11 @@ function Update-ProgressFromDisk {
             }
         }
         $safeActivityMessage = if ($null -ne $progressDiagnostic) { [string]$progressDiagnostic.UserMessage } else { $activityMessage }
+        if (-not $isNewProgressSnapshot) {
+            Update-UiProgressActivityMessage -Progress $progress -Activity $activity -ActivityMessage $activityMessage -Diagnostic $progressDiagnostic
+            Update-TaskControls -State $displayState -RuntimeActivity $runtimeActivity
+            return
+        }
         $currentCoverageName = if ($progress.PSObject.Properties.Name -contains 'CurrentCoverageName' -and -not [string]::IsNullOrWhiteSpace([string]$progress.CurrentCoverageName)) { [string]$progress.CurrentCoverageName } else { '' }
         $preparationCurrent = if ($progress.PSObject.Properties.Name -contains 'PreparationCurrent') { $progress.PreparationCurrent } else { $null }
         $preparationTotal = if ($progress.PSObject.Properties.Name -contains 'PreparationTotal') { $progress.PreparationTotal } else { $null }
@@ -2610,7 +2720,7 @@ function Update-ProgressFromDisk {
             if ($overallPercent -lt 0) { $overallPercent = 0 }
             if ($overallPercent -gt 100) { $overallPercent = 100 }
             $controls.OverallProgressBar.IsIndeterminate = $false
-            $controls.OverallProgressBar.Foreground = New-Object System.Windows.Media.SolidColorBrush([System.Windows.Media.Color]::FromRgb(47, 117, 201))
+            $controls.OverallProgressBar.Foreground = $script:PrimaryProgressBrush
             $controls.OverallProgressBar.Value = $overallPercent
             $controls.OverallProgressPercent.Text = '{0:N2}%' -f $overallPercent
             $controls.OverallProgressSummary.Text = '{0} / {1}' -f (Format-LocalCount -Value $overallProcessedCount), (Format-LocalCount -Value $overallPlanCount)
@@ -2618,7 +2728,7 @@ function Update-ProgressFromDisk {
         else {
             $controls.OverallProgressBar.IsIndeterminate = $false
             $controls.OverallProgressBar.Value = 0
-            $controls.OverallProgressBar.Foreground = New-Object System.Windows.Media.SolidColorBrush([System.Windows.Media.Color]::FromRgb(170, 178, 188))
+            $controls.OverallProgressBar.Foreground = $script:UnavailableProgressBrush
             $controls.OverallProgressPercent.Text = '—'
             $controls.OverallProgressSummary.Text = '准备后显示'
         }
@@ -2783,9 +2893,6 @@ function Update-ProgressFromDisk {
         if (-not $isPreparation) {
             $controls.SpeedValue.Text = if ($speed -gt 0) { (Format-LocalRate -Value $speed) + ' 候选/秒' } elseif ($activity -in @('Paused', 'Pausing', 'Stopping', 'Stopped')) { '等待继续后的速度采样' } elseif ($activity -in @('StartingHashcat', 'RestoringHashcat')) { '搜索开始后显示' } else { '等待有效速度采样' }
         }
-        $elapsedValue = if ($progress.PSObject.Properties.Name -contains 'ElapsedSeconds') { $progress.ElapsedSeconds } else { $null }
-        $controls.ElapsedValue.Text = Format-LocalDuration -Seconds $elapsedValue
-
         $totalValue = if ($progress.PSObject.Properties.Name -contains 'CoverageTotal' -and $null -ne $progress.CoverageTotal) { $progress.CoverageTotal } elseif ($progress.PSObject.Properties.Name -contains 'CandidateTotal') { $progress.CandidateTotal } else { $null }
         $testedValue = if ($progress.PSObject.Properties.Name -contains 'CoverageTested' -and $null -ne $progress.CoverageTested) {
             $progress.CoverageTested
@@ -2882,23 +2989,7 @@ function Update-ProgressFromDisk {
             $controls.EstimatedRemainingValue.Text = '当前范围暂无法可靠估算'
             $controls.WorstCaseValue.Text = '当前范围暂无法可靠估算'
         }
-        $displayActivityMessage = if ($null -ne $progressDiagnostic) { [string]$progressDiagnostic.UserMessage } else { Convert-UiMessage -Message $activityMessage }
-        if ($activity -like 'Preparing*' -or $activity -eq 'RunningCoverage') {
-            $lastProgressUtc = $null
-            if ($progress.PSObject.Properties.Name -contains 'LastProgressUtc' -and -not [string]::IsNullOrWhiteSpace([string]$progress.LastProgressUtc)) {
-                try { $lastProgressUtc = [datetime]::Parse([string]$progress.LastProgressUtc, [System.Globalization.CultureInfo]::InvariantCulture, [System.Globalization.DateTimeStyles]::RoundtripKind) } catch { $lastProgressUtc = $null }
-            }
-            if ($null -ne $lastProgressUtc) {
-                $progressAge = ([datetime]::UtcNow - $lastProgressUtc.ToUniversalTime()).TotalSeconds
-                if ($progressAge -gt 30) {
-                    $displayActivityMessage += ' 当前步骤仍在处理中，暂未收到新的进度更新。'
-                }
-                elseif ($progressAge -gt 10) {
-                    $displayActivityMessage += (' 正在处理当前本地任务，最近 {0:N0} 秒暂无新的进度采样…' -f $progressAge)
-                }
-            }
-        }
-        $controls.ProgressMessageText.Text = $displayActivityMessage
+        Update-UiProgressActivityMessage -Progress $progress -Activity $activity -ActivityMessage $activityMessage -Diagnostic $progressDiagnostic
 
         $password = ''
         if ($null -ne $progress.Result -and $progress.Result.PSObject.Properties.Name -contains 'Password') {
@@ -2909,7 +3000,7 @@ function Update-ProgressFromDisk {
         if (-not [string]::IsNullOrEmpty($password)) {
             $controls.ResultStatusText.Text = '密码已恢复 · 已通过本机 NanaZip 验证'
         }
-        Update-TaskControls -State $displayState
+        Update-TaskControls -State $displayState -RuntimeActivity $runtimeActivity
 
         if ($script:LastProgressUpdated -ne [string]$progress.UpdatedUtc) {
             $script:LastProgressUpdated = [string]$progress.UpdatedUtc
@@ -2918,10 +3009,13 @@ function Update-ProgressFromDisk {
                 Write-UiLog ('本地任务状态：{0}。{1}' -f (Convert-StateName -Value $displayState), $terminalMessage)
             }
         }
+        if (-not [string]::IsNullOrWhiteSpace($progressUpdatedUtc)) {
+            $script:LastUiRenderedProgressUpdatedUtc = $progressUpdatedUtc
+        }
     }
     catch {
         # A worker replaces this JSON atomically; a short read race is harmless and will be retried by the timer.
-        Update-UiElapsedFromProgress
+        Update-UiElapsedIfDue
     }
 }
 
@@ -2965,7 +3059,7 @@ $controls.ProgressPercentValue.Text = '当前没有本地任务正在运行。'
 $controls.ProgressMessageText.Text = '当前没有本地任务正在运行。'
 $controls.OverallProgressBar.IsIndeterminate = $false
 $controls.OverallProgressBar.Value = 0
-$controls.OverallProgressBar.Foreground = New-Object System.Windows.Media.SolidColorBrush([System.Windows.Media.Color]::FromRgb(170, 178, 188))
+$controls.OverallProgressBar.Foreground = $script:UnavailableProgressBrush
 $controls.OverallProgressPercent.Text = '—'
 $controls.OverallCandidatesTestedLabel.Text = '已累计测试'
 $controls.OverallCandidatesTestedValue.Text = '等待开始'
